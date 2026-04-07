@@ -17,6 +17,7 @@ package models
 import (
 	"context"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
@@ -28,7 +29,6 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
@@ -177,7 +177,7 @@ func (man *SNatSEntryManager) ValidateCreateData(ctx context.Context, userCred m
 		return nil, httperrors.NewInputParameterError("source_cidr and network_id conflict")
 	}
 
-	_nat, err := validators.ValidateModel(userCred, NatGatewayManager, &input.NatgatewayId)
+	_nat, err := validators.ValidateModel(ctx, userCred, NatGatewayManager, &input.NatgatewayId)
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +201,7 @@ func (man *SNatSEntryManager) ValidateCreateData(ctx context.Context, userCred m
 			return nil, httperrors.NewInputParameterError("cidr %s is not in range vpc %s", input.SourceCidr, vpc.CidrBlock)
 		}
 	} else {
-		_network, err := validators.ValidateModel(userCred, NetworkManager, &input.NetworkId)
+		_network, err := validators.ValidateModel(ctx, userCred, NetworkManager, &input.NetworkId)
 		if err != nil {
 			return nil, err
 		}
@@ -215,7 +215,7 @@ func (man *SNatSEntryManager) ValidateCreateData(ctx context.Context, userCred m
 		}
 	}
 
-	_eip, err := validators.ValidateModel(userCred, ElasticipManager, &input.Eip)
+	_eip, err := validators.ValidateModel(ctx, userCred, ElasticipManager, &input.Eip)
 	if err != nil {
 		return nil, err
 	}
@@ -230,11 +230,18 @@ func (man *SNatSEntryManager) ValidateCreateData(ctx context.Context, userCred m
 	return input, nil
 }
 
-func (manager *SNatSEntryManager) SyncNatSTable(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, nat *SNatGateway, extTable []cloudprovider.ICloudNatSEntry) compare.SyncResult {
+func (manager *SNatSEntryManager) SyncNatSTable(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	provider *SCloudprovider,
+	nat *SNatGateway,
+	extTable []cloudprovider.ICloudNatSEntry,
+	xor bool,
+) compare.SyncResult {
 	syncOwnerId := provider.GetOwnerId()
 
-	lockman.LockRawObject(ctx, "stable", nat.Id)
-	defer lockman.ReleaseRawObject(ctx, "stable", nat.Id)
+	lockman.LockRawObject(ctx, manager.Keyword(), nat.Id)
+	defer lockman.ReleaseRawObject(ctx, manager.Keyword(), nat.Id)
 
 	result := compare.SyncResult{}
 	dbNatSTables, err := nat.GetSTable()
@@ -261,23 +268,23 @@ func (manager *SNatSEntryManager) SyncNatSTable(ctx context.Context, userCred mc
 		}
 	}
 
-	for i := 0; i < len(commondb); i += 1 {
-		err := commondb[i].SyncWithCloudNatSTable(ctx, userCred, commonext[i], syncOwnerId, provider.Id)
-		if err != nil {
-			result.UpdateError(err)
-			continue
+	if !xor {
+		for i := 0; i < len(commondb); i += 1 {
+			err := commondb[i].SyncWithCloudNatSTable(ctx, userCred, commonext[i], syncOwnerId, provider)
+			if err != nil {
+				result.UpdateError(err)
+				continue
+			}
+			result.Update()
 		}
-		syncMetadata(ctx, userCred, &commondb[i], commonext[i])
-		result.Update()
 	}
 
 	for i := 0; i < len(added); i += 1 {
-		routeTableNew, err := manager.newFromCloudNatSTable(ctx, userCred, syncOwnerId, nat, added[i], provider.Id)
+		_, err := manager.newFromCloudNatSTable(ctx, userCred, syncOwnerId, nat, added[i], provider.Id)
 		if err != nil {
 			result.AddError(err)
 			continue
 		}
-		syncMetadata(ctx, userCred, routeTableNew, added[i])
 		result.Add()
 	}
 	return result
@@ -289,12 +296,12 @@ func (self *SNatSEntry) syncRemoveCloudNatSTable(ctx context.Context, userCred m
 
 	err := self.ValidateDeleteCondition(ctx, nil)
 	if err != nil { // cannot delete
-		return self.SetStatus(userCred, api.VPC_STATUS_UNKNOWN, "sync to delete")
+		return self.SetStatus(ctx, userCred, api.VPC_STATUS_UNKNOWN, "sync to delete")
 	}
 	return self.RealDelete(ctx, userCred)
 }
 
-func (self *SNatSEntry) SyncWithCloudNatSTable(ctx context.Context, userCred mcclient.TokenCredential, extEntry cloudprovider.ICloudNatSEntry, syncOwnerId mcclient.IIdentityProvider, managerId string) error {
+func (self *SNatSEntry) SyncWithCloudNatSTable(ctx context.Context, userCred mcclient.TokenCredential, extEntry cloudprovider.ICloudNatSEntry, syncOwnerId mcclient.IIdentityProvider, provider *SCloudprovider) error {
 	diff, err := db.UpdateWithLock(ctx, self, func() error {
 		self.Status = extEntry.GetStatus()
 		self.IP = extEntry.GetIP()
@@ -305,10 +312,10 @@ func (self *SNatSEntry) SyncWithCloudNatSTable(ctx context.Context, userCred mcc
 				vpc := VpcManager.Query().SubQuery()
 				return q.Join(wire, sqlchemy.Equals(wire.Field("id"), q.Field("wire_id"))).
 					Join(vpc, sqlchemy.Equals(vpc.Field("id"), wire.Field("vpc_id"))).
-					Filter(sqlchemy.Equals(vpc.Field("manager_id"), managerId))
+					Filter(sqlchemy.Equals(vpc.Field("manager_id"), provider.Id))
 			})
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "search network by externalId: %s", extNetworkId)
 			}
 			self.NetworkId = network.GetId()
 		}
@@ -319,6 +326,9 @@ func (self *SNatSEntry) SyncWithCloudNatSTable(ctx context.Context, userCred mcc
 	}
 
 	SyncCloudDomain(userCred, self, syncOwnerId)
+	if account, _ := provider.GetCloudaccount(); account != nil {
+		syncMetadata(ctx, userCred, self, extEntry, account.ReadOnly)
+	}
 
 	db.OpsLog.LogSyncUpdate(self, diff, userCred)
 	return nil
@@ -366,6 +376,7 @@ func (manager *SNatSEntryManager) newFromCloudNatSTable(ctx context.Context, use
 	}
 
 	SyncCloudDomain(userCred, &table, ownerId)
+	syncMetadata(ctx, userCred, &table, extEntry, false)
 
 	db.OpsLog.LogEvent(&table, db.ACT_CREATE, table.GetShortDesc(ctx), userCred)
 
@@ -422,10 +433,10 @@ func (self *SNatSEntry) PostCreate(ctx context.Context, userCred mcclient.TokenC
 		return task.ScheduleRun(nil)
 	}()
 	if err != nil {
-		self.SetStatus(userCred, api.NAT_STATUS_CREATE_FAILED, err.Error())
+		self.SetStatus(ctx, userCred, api.NAT_STATUS_CREATE_FAILED, err.Error())
 		return
 	}
-	self.SetStatus(userCred, api.NAT_STATUS_ALLOCATE, "")
+	self.SetStatus(ctx, userCred, api.NAT_STATUS_ALLOCATE, "")
 }
 
 func (self *SNatSEntry) CustomizeDelete(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) error {
@@ -441,10 +452,10 @@ func (self *SNatSEntry) StartDeleteSNatTask(ctx context.Context, userCred mcclie
 		return task.ScheduleRun(nil)
 	}()
 	if err != nil {
-		self.SetStatus(userCred, api.NAT_STATUS_DELETE_FAILED, err.Error())
+		self.SetStatus(ctx, userCred, api.NAT_STATUS_DELETE_FAILED, err.Error())
 		return err
 	}
-	self.SetStatus(userCred, api.NAT_STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, api.NAT_STATUS_DELETING, "")
 	return nil
 }
 

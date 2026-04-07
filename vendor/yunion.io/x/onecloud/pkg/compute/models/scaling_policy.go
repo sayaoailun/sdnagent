@@ -210,7 +210,7 @@ func (spm *SScalingPolicyManager) ValidateCreateData(ctx context.Context, userCr
 	if len(input.ScalingGroupId) != 0 {
 		idOrName = input.ScalingGroupId
 	}
-	model, err := ScalingGroupManager.FetchByIdOrName(userCred, idOrName)
+	model, err := ScalingGroupManager.FetchByIdOrName(ctx, userCred, idOrName)
 	if errors.Cause(err) == sql.ErrNoRows {
 		return input, httperrors.NewInputParameterError("no such scaling group %s", idOrName)
 	}
@@ -252,7 +252,7 @@ func (sp *SScalingPolicy) CustomizeCreate(ctx context.Context, userCred mcclient
 
 func (sp *SScalingPolicy) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
 	// do nothing
-	sp.SetStatus(userCred, api.SP_STATUS_DELETING, "")
+	sp.SetStatus(ctx, userCred, api.SP_STATUS_DELETING, "")
 	return nil
 }
 
@@ -276,7 +276,7 @@ func (sp *SScalingPolicy) PostDelete(ctx context.Context, userCred mcclient.Toke
 			if sg != nil {
 				logclient.AddActionLogWithContext(ctx, sg, logclient.ACT_DELETE_SCALING_POLICY, reason, userCred, false)
 			}
-			sp.SetStatus(userCred, api.SP_STATUS_DELETE_FAILED, reason)
+			sp.SetStatus(ctx, userCred, api.SP_STATUS_DELETE_FAILED, reason)
 		}
 		sg, err := sp.ScalingGroup()
 		if err != nil {
@@ -458,11 +458,6 @@ func (sp *SScalingPolicy) CheckCoolTime() bool {
 	return false
 }
 
-func (sp *SScalingPolicy) AllowPerformEnable(ctx context.Context, userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject, input apis.PerformEnableInput) bool {
-	return true
-}
-
 func (sp *SScalingPolicy) PerformEnable(ctx context.Context, userCred mcclient.TokenCredential,
 	query jsonutils.JSONObject, input apis.PerformEnableInput) (jsonutils.JSONObject, error) {
 	err := db.EnabledPerformEnable(sp, ctx, userCred, true)
@@ -470,11 +465,6 @@ func (sp *SScalingPolicy) PerformEnable(ctx context.Context, userCred mcclient.T
 		return nil, errors.Wrap(err, "EnabledPerformEnable")
 	}
 	return nil, nil
-}
-
-func (sp *SScalingPolicy) AllowPerformDisable(ctx context.Context, userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject, input apis.PerformDisableInput) bool {
-	return true
 }
 
 func (sp *SScalingPolicy) PerformDisable(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject,
@@ -488,7 +478,7 @@ func (sp *SScalingPolicy) PerformDisable(ctx context.Context, userCred mcclient.
 
 func (sg *SScalingPolicy) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	sg.SStandaloneResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
-	sg.SetStatus(userCred, api.SP_STATUS_CREATING, "")
+	sg.SetStatus(ctx, userCred, api.SP_STATUS_CREATING, "")
 	go func() {
 		sp, err := sg.ScalingGroup()
 		if err != nil {
@@ -496,7 +486,7 @@ func (sg *SScalingPolicy) PostCreate(ctx context.Context, userCred mcclient.Toke
 		}
 		createFailed := func(reason string) {
 			logclient.AddActionLogWithContext(ctx, sp, logclient.ACT_CREATE_SCALING_POLICY, reason, userCred, false)
-			sg.SetStatus(userCred, api.SP_STATUS_CREATE_FAILED, reason)
+			sg.SetStatus(ctx, userCred, api.SP_STATUS_CREATE_FAILED, reason)
 		}
 		input := api.ScalingPolicyCreateInput{}
 		err = data.Unmarshal(&input)

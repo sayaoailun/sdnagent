@@ -58,11 +58,13 @@ func (sr *SecurityRule) OvsMatches() []string {
 		nwField = "nw_dst="
 		tpField = "tp_dst="
 	}
-	if net := r.IPNet.String(); net != "0.0.0.0/0" {
-		if ones, bits := r.IPNet.Mask.Size(); ones == 32 && bits == 32 {
-			nwMatch = nwField + r.IPNet.IP.String()
-		} else {
-			nwMatch = nwField + net
+	if r.IPNet != nil {
+		if net := r.IPNet.String(); net != "0.0.0.0/0" {
+			if ones, bits := r.IPNet.Mask.Size(); ones == 32 && bits == 32 {
+				nwMatch = nwField + r.IPNet.IP.String()
+			} else {
+				nwMatch = nwField + net
+			}
 		}
 	}
 	switch r.Protocol {

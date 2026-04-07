@@ -24,6 +24,10 @@ import (
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/netutils"
+
+	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
+	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
 )
 
 type guestDesc struct {
@@ -32,9 +36,10 @@ type guestDesc struct {
 	AdminSecurityRules string      `json:"admin_security_rules"`
 	Name               string
 
-	IsMaster bool   `json:"is_master"`
-	HostId   string `json:"host_id"`
-	IsVolatileHost bool `json:"is_volatile_host"`
+	IsMaster       bool   `json:"is_master"`
+	IsSlave        bool   `json:"is_slave"`
+	HostId         string `json:"host_id"`
+	IsVolatileHost bool   `json:"is_volatile_host"`
 
 	SrcIpCheck  bool `json:"src_ip_check"`
 	SrcMacCheck bool `json:"src_mac_check"`
@@ -42,7 +47,8 @@ type guestDesc struct {
 
 func newGuestDesc() *guestDesc {
 	desc := &guestDesc{
-		IsMaster:    true,
+		IsMaster:    false,
+		IsSlave:     false,
 		SrcIpCheck:  true,
 		SrcMacCheck: true,
 	}
@@ -71,11 +77,21 @@ type GuestNIC struct {
 	HostId     string      `json:"host_id"`
 	Vpc        GuestNICVpc `json:"vpc"`
 
+	IP6      string `json:"ip6"`
+	Gateway6 string `json:"gateway6"`
+	Masklen6 int    `json:"masklen6"`
+
 	CtZoneId    uint16 `json:"-"`
 	CtZoneIdSet bool   `json:"-"`
 	PortNo      int    `json:"-"`
 
 	NetworkAddresses []GuestNICNetworkAddress `json:"networkaddresses"`
+
+	PortMappings computeapi.GuestPortMappings `json:"port_mappings"`
+}
+
+func (nic *GuestNIC) EnableIPv6() bool {
+	return len(nic.IP6) > 0
 }
 
 type GuestNICNetworkAddress struct {
@@ -107,6 +123,11 @@ func (n *GuestNIC) Map() map[string]interface{} {
 		"VLAN":    n.VLAN & 0xfff,
 		"CT_ZONE": n.CtZoneId,
 		"PortNo":  n.PortNo,
+	}
+	if len(n.IP6) > 0 {
+		m["IP6"] = n.IP6
+		linkLocal, _ := netutils.Mac2LinkLocal(n.MAC)
+		m["IP6LOCAL"] = linkLocal.String() // "fe80::/64"
 	}
 	vlanTci := n.VLAN & 0xfff
 	if n.VLAN > 1 {
@@ -150,7 +171,7 @@ type Guest struct {
 	srcIpCheck  bool
 	srcMacCheck bool
 
-	isSlave bool
+	isSlave        bool
 	isVolatileHost bool
 }
 
@@ -194,10 +215,10 @@ func (g *Guest) Running() bool {
 }
 
 func (g *Guest) IsVolatileHost() bool {
-	return  g.isVolatileHost || g.isSlave
+	return g.isVolatileHost || g.isSlave
 }
 
-func (g *Guest) GetJSONObjectDesc() (jsonutils.JSONObject, error) {
+func (g *Guest) GetJSONObjectDesc() (*desc.SGuestDesc, error) {
 	descPath := path.Join(g.Path, "desc")
 	data, err := ioutil.ReadFile(descPath)
 	if err != nil {
@@ -207,7 +228,12 @@ func (g *Guest) GetJSONObjectDesc() (jsonutils.JSONObject, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "json.Parse")
 	}
-	return obj, nil
+	desc := desc.SGuestDesc{}
+	err = obj.Unmarshal(&desc)
+	if err != nil {
+		return nil, errors.Wrap(err, "Unmarshal")
+	}
+	return &desc, nil
 }
 
 func (g *Guest) LoadDesc() error {
@@ -235,8 +261,12 @@ func (g *Guest) LoadDesc() error {
 			g.NICs = append(g.NICs[:i], g.NICs[i+1:]...)
 		}
 	}
-	g.isSlave = !desc.IsMaster
 	g.isVolatileHost = desc.IsVolatileHost
+	if !desc.IsMaster && desc.IsSlave {
+		g.isSlave = true
+	} else {
+		g.isSlave = false
+	}
 
 	g.srcIpCheck = desc.SrcIpCheck
 	g.srcMacCheck = desc.SrcMacCheck
@@ -289,6 +319,24 @@ func (g *Guest) FindNicByNetIdIP(netId, ip string) *GuestNIC {
 	}
 	if nic := searchNic(g.VpcNICs); nic != nil {
 		return nic
+	}
+	if nic := searchNic(g.NICs); nic != nil {
+		return nic
+	}
+	return nil
+}
+
+func (g *Guest) FindNicByHostLocalIP(hostLocal *HostLocal, ip string) *GuestNIC {
+	var searchNic = func(nics []*GuestNIC) *GuestNIC {
+		for _, nic := range nics {
+			if nic.Bridge == hostLocal.Bridge {
+				_, fakeIp, _ := hostLocal.fakeMdSrcIpMac(nic.PortNo)
+				if fakeIp == ip {
+					return nic
+				}
+			}
+		}
+		return nil
 	}
 	if nic := searchNic(g.NICs); nic != nil {
 		return nic

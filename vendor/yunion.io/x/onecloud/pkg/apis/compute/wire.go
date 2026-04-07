@@ -37,6 +37,15 @@ type WireCreateInput struct {
 	ZoneResourceInput
 }
 
+type WireUsage struct {
+	// IP子网数量
+	// example: 1
+	Networks int `json:"networks"`
+	// Host数量
+	// example: 1
+	HostCount int `json:"host_count"`
+}
+
 type WireDetails struct {
 	apis.StatusInfrasResourceBaseDetails
 	VpcResourceInfo
@@ -44,12 +53,19 @@ type WireDetails struct {
 
 	SWire
 
-	// IP子网数量
-	// example: 1
-	Networks int `json:"networks"`
-	// Host数量
-	// example: 1
-	HostCount int `json:"host_count"`
+	WireUsage
+}
+
+func (self WireDetails) GetMetricTags() map[string]string {
+	ret := map[string]string{
+		"id":             self.Id,
+		"wire_name":      self.Name,
+		"brand":          self.Brand,
+		"domain_id":      self.DomainId,
+		"project_domain": self.ProjectDomain,
+		"external_id":    self.ExternalId,
+	}
+	return ret
 }
 
 type WireResourceInfoBase struct {
@@ -70,6 +86,11 @@ type WireResourceInfo struct {
 
 	// 可用区
 	Zone string `json:"zone"`
+}
+
+type SSimpleWire struct {
+	Wire   string
+	WireId string
 }
 
 type WireUpdateInput struct {
@@ -95,6 +116,10 @@ type WireListInput struct {
 
 	Bandwidth *int   `json:"bandwidth"`
 	HostType  string `json:"host_type"`
+
+	// 按子网数量排序
+	// pattern:asc|desc
+	OrderByNetworkCount string `json:"order_by_network_count"`
 }
 
 type WireMergeInput struct {

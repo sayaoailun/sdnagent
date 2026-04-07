@@ -22,20 +22,20 @@ import (
 
 	"github.com/serialx/hashring"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/imagetools"
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/imagetools"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -67,6 +67,8 @@ type SStoragecache struct {
 
 	// 镜像存储地址
 	Path string `width:"256" charset:"utf8" nullable:"true" list:"user" update:"admin" create:"admin_optional"` // = Column(VARCHAR(256, charset='utf8'), nullable=True)
+	// master host id
+	MasterHost string `width:"36" charset:"ascii" nullable:"true" list:"user" create:"optional" update:"user" json:"master_host"`
 }
 
 func (self *SStoragecache) getStorages() []SStorage {
@@ -82,10 +84,12 @@ func (self *SStoragecache) getStorages() []SStorage {
 func (self *SStoragecache) getValidStorages() []SStorage {
 	storages := []SStorage{}
 	q := StorageManager.Query()
+	zones := ZoneManager.Query().Equals("status", api.ZONE_ENABLE).SubQuery()
 	q = q.Equals("storagecache_id", self.Id).
 		Filter(sqlchemy.In(q.Field("status"), []string{api.STORAGE_ENABLED, api.STORAGE_ONLINE})).
 		Filter(sqlchemy.IsTrue(q.Field("enabled"))).
 		Filter(sqlchemy.IsFalse(q.Field("deleted")))
+	q = q.Join(zones, sqlchemy.Equals(q.Field("zone_id"), zones.Field("id")))
 	err := db.FetchModelObjects(StorageManager, q, &storages)
 	if err != nil {
 		return nil
@@ -125,7 +129,15 @@ func (self *SStoragecache) GetEsxiAgentHostDesc() (*jsonutils.JSONDict, error) {
 	return ret, nil
 }
 
-func (self *SStoragecache) GetHost() (*SHost, error) {
+func (self *SStoragecache) GetMasterHost() (*SHost, error) {
+	if self.MasterHost != "" {
+		host, err := HostManager.FetchById(self.MasterHost)
+		if err != nil {
+			return nil, errors.Wrap(err, "HostManager.FetchById")
+		}
+		return host.(*SHost), nil
+	}
+
 	hostId, err := self.getHostId()
 	if err != nil {
 		return nil, errors.Wrap(err, "self.getHostId")
@@ -142,7 +154,7 @@ func (self *SStoragecache) GetHost() (*SHost, error) {
 }
 
 func (self *SStoragecache) GetRegion() (*SCloudregion, error) {
-	host, err := self.GetHost()
+	host, err := self.GetMasterHost()
 	if err != nil {
 		return nil, errors.Wrapf(err, "GetHost")
 	}
@@ -197,7 +209,7 @@ func (self *SStoragecache) getHostId() (string, error) {
 	return ret, nil
 }
 
-func (manager *SStoragecacheManager) SyncWithCloudStoragecache(ctx context.Context, userCred mcclient.TokenCredential, cloudCache cloudprovider.ICloudStoragecache, provider *SCloudprovider) (*SStoragecache, bool, error) {
+func (manager *SStoragecacheManager) SyncWithCloudStoragecache(ctx context.Context, userCred mcclient.TokenCredential, cloudCache cloudprovider.ICloudStoragecache, provider *SCloudprovider, xor bool) (*SStoragecache, bool, error) {
 	lockman.LockClass(ctx, manager, db.GetLockClassKey(manager, userCred))
 	defer lockman.ReleaseClass(ctx, manager, db.GetLockClassKey(manager, userCred))
 
@@ -217,7 +229,9 @@ func (manager *SStoragecacheManager) SyncWithCloudStoragecache(ctx context.Conte
 		}
 	} else {
 		localCache := localCacheObj.(*SStoragecache)
-		localCache.syncWithCloudStoragecache(ctx, userCred, cloudCache, provider)
+		if !xor {
+			localCache.syncWithCloudStoragecache(ctx, userCred, cloudCache, provider)
+		}
 		return localCache, false, nil
 	}
 }
@@ -301,7 +315,7 @@ func (self *SStoragecache) getMoreDetails(ctx context.Context, out api.Storageca
 	out.Size = self.getCachedImageSize()
 	out.Count = self.getCachedImageCount()
 
-	host, _ := self.GetHost()
+	host, _ := self.GetMasterHost()
 	if host != nil {
 		out.Host = host.GetShortDesc(ctx)
 	}
@@ -535,7 +549,7 @@ func (self *SStoragecache) PerformUncacheImage(ctx context.Context, userCred mcc
 
 	var imageId string
 
-	imgObj, err := CachedimageManager.FetchByIdOrName(nil, imageStr)
+	imgObj, err := CachedimageManager.FetchByIdOrName(ctx, nil, imageStr)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, httperrors.NewResourceNotFoundError2(CachedimageManager.Keyword(), imageStr)
@@ -600,12 +614,13 @@ func (self *SStoragecache) SyncCloudImages(
 	userCred mcclient.TokenCredential,
 	iStoragecache cloudprovider.ICloudStoragecache,
 	region *SCloudregion,
+	xor bool,
 ) compare.SyncResult {
 	lockman.LockObject(ctx, self)
 	defer lockman.ReleaseObject(ctx, self)
 
-	lockman.LockRawObject(ctx, "cachedimages", self.Id)
-	defer lockman.ReleaseRawObject(ctx, "cachedimages", self.Id)
+	lockman.LockRawObject(ctx, CachedimageManager.Keyword(), self.Id)
+	defer lockman.ReleaseRawObject(ctx, CachedimageManager.Keyword(), self.Id)
 
 	result := compare.SyncResult{}
 
@@ -616,7 +631,7 @@ func (self *SStoragecache) SyncCloudImages(
 	}
 	if driver.IsPublicCloud() {
 		err = func() error {
-			err := region.SyncCloudImages(ctx, userCred, false)
+			err := region.SyncCloudImages(ctx, userCred, false, xor)
 			if err != nil {
 				return errors.Wrapf(err, "SyncCloudImages")
 			}
@@ -642,7 +657,7 @@ func (self *SStoragecache) SyncCloudImages(
 			result.Error(errors.Wrapf(err, "GetICustomizedCloudImages"))
 			return result
 		}
-		result = self.syncCloudImages(ctx, userCred, localCachedImages, remoteImages)
+		result = self.syncCloudImages(ctx, userCred, localCachedImages, remoteImages, xor)
 	} else {
 		log.Debugln("localCachedImages started")
 		localCachedImages, err := self.getCachedImages()
@@ -656,7 +671,7 @@ func (self *SStoragecache) SyncCloudImages(
 			result.Error(errors.Wrapf(err, "GetICloudImages"))
 			return result
 		}
-		result = self.syncCloudImages(ctx, userCred, localCachedImages, remoteImages)
+		result = self.syncCloudImages(ctx, userCred, localCachedImages, remoteImages, xor)
 	}
 
 	return result
@@ -667,6 +682,7 @@ func (cache *SStoragecache) syncCloudImages(
 	userCred mcclient.TokenCredential,
 	localCachedImages []SStoragecachedimage,
 	remoteImages []cloudprovider.ICloudImage,
+	xor bool,
 ) compare.SyncResult {
 	syncResult := compare.SyncResult{}
 
@@ -695,12 +711,14 @@ func (cache *SStoragecache) syncCloudImages(
 			syncResult.Delete()
 		}
 	}
-	for i := 0; i < len(commondb); i += 1 {
-		err = commondb[i].syncWithCloudImage(ctx, userCred, syncOwnerId, commonext[i], cache.ManagerId)
-		if err != nil {
-			syncResult.UpdateError(err)
-		} else {
-			syncResult.Update()
+	if !xor {
+		for i := 0; i < len(commondb); i += 1 {
+			err = commondb[i].syncWithCloudImage(ctx, userCred, syncOwnerId, commonext[i], cache.ManagerId)
+			if err != nil {
+				syncResult.UpdateError(err)
+			} else {
+				syncResult.Update()
+			}
 		}
 	}
 	for i := 0; i < len(added); i += 1 {
@@ -735,8 +753,38 @@ func (self *SStoragecache) IsReachCapacityLimit(imageId string) bool {
 			return false
 		}
 	}
-	host, _ := self.GetHost()
-	return host.GetHostDriver().IsReachStoragecacheCapacityLimit(host, cachedImages)
+	host, _ := self.GetMasterHost()
+	if host == nil {
+		return false
+	}
+	driver, _ := host.GetHostDriver()
+	if driver == nil {
+		return false
+	}
+	return driver.IsReachStoragecacheCapacityLimit(host, cachedImages)
+}
+
+func (self *SStoragecache) GetStoragecachedimages() ([]SStoragecachedimage, error) {
+	q := StoragecachedimageManager.Query().Equals("storagecache_id", self.Id)
+	ret := []SStoragecachedimage{}
+	return ret, db.FetchModelObjects(StoragecachedimageManager, q, &ret)
+}
+
+func (self *SStoragecache) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
+	scis, err := self.GetStoragecachedimages()
+	if err != nil {
+		return errors.Wrapf(err, "GetStoragecachedimages")
+	}
+	for i := range scis {
+		err := scis[i].Delete(ctx, userCred)
+		if err != nil {
+			return errors.Wrapf(err, "delete storagecached images %d", scis[i].RowId)
+		}
+	}
+	if len(self.ManagerId) > 0 {
+		return db.RealDeleteModel(ctx, userCred, self)
+	}
+	return self.SStandaloneResourceBase.Delete(ctx, userCred)
 }
 
 func (self *SStoragecache) StartRelinquishLeastUsedCachedImageTask(ctx context.Context, userCred mcclient.TokenCredential, imageId string, parentTaskId string) error {
@@ -853,8 +901,8 @@ func (self *SStoragecache) getSystemImageCount() (int, error) {
 }
 
 func (self *SStoragecache) CheckCloudimages(ctx context.Context, userCred mcclient.TokenCredential, regionName, regionId string) error {
-	lockman.LockRawObject(ctx, "cachedimages", regionId)
-	defer lockman.ReleaseRawObject(ctx, "cachedimages", regionId)
+	lockman.LockRawObject(ctx, CachedimageManager.Keyword(), regionId)
+	defer lockman.ReleaseRawObject(ctx, CachedimageManager.Keyword(), regionId)
 
 	result := compare.SyncResult{}
 

@@ -46,24 +46,15 @@ func (t1 TTagSetList) Contains(t2 TTagSet) bool {
 }
 
 // Contains of TTagSetList
-//    tagsetlist t1 contains tagsetlist t2 means any tag set of t2 is
-//    contained by one of the tag set of t1
+//
+//	tagsetlist t1 contains tagsetlist t2 means any tag set of t2 is
+//	contained by one of the tag set of t1
 func (t1 TTagSetList) ContainsAll(t2 TTagSetList) bool {
-	if len(t2) == 0 {
+	if len(t1) == 0 {
 		return true
 	}
 	for _, ts2 := range t2 {
-		if len(t1) == 0 {
-			return false
-		}
-		contained := false
-		for _, ts1 := range t1 {
-			if ts1.Contains(ts2) {
-				contained = true
-				break
-			}
-		}
-		if !contained {
+		if !t1.Contains(ts2) {
 			return false
 		}
 	}
@@ -84,6 +75,41 @@ func (tsl TTagSetList) Append(t TTagSet) TTagSetList {
 	}
 	if t != nil {
 		ret = append(ret, t)
+	}
+	return ret
+}
+
+func (tsl TTagSetList) AppendAll(tsl2 TTagSetList) TTagSetList {
+	for i := range tsl2 {
+		tsl = tsl.Append(tsl2[i])
+	}
+	return tsl
+}
+
+func (tsl TTagSetList) Intersect(t TTagSet) TTagSetList {
+	ret := TTagSetList{}
+	for i := 0; i < len(tsl); i++ {
+		ret = ret.Append(tsl[i].Append(t...))
+	}
+	return ret
+}
+
+func (tsl TTagSetList) IntersectList(t TTagSetList) TTagSetList {
+	if len(tsl) == 0 && len(t) == 0 {
+		return TTagSetList{}
+	}
+	if len(tsl) == 0 && len(t) > 0 {
+		return t
+	}
+	if len(tsl) > 0 && len(t) == 0 {
+		return tsl
+	}
+	ret := TTagSetList{}
+	for i := 0; i < len(t); i++ {
+		tmp := tsl.Intersect(t[i])
+		for j := 0; j < len(tmp); j++ {
+			ret = ret.Append(tmp[j])
+		}
 	}
 	return ret
 }
@@ -111,10 +137,25 @@ func (a TTagSetList) Less(i, j int) bool {
 	return false
 }
 
-func (tsl TTagSetList) Flattern() TTagSet {
+func (tsl TTagSetList) Flattern() map[string]TTagSet {
 	if len(tsl) == 0 {
-		return TTagSet{}
+		return nil
 	}
-	sort.Sort(tsl)
-	return tsl[len(tsl)-1]
+
+	splitMap := make(map[string]TTagSetList)
+	for i := range tsl {
+		prefix := tsl[i].KeyPrefix()
+		if ts, ok := splitMap[prefix]; ok {
+			splitMap[prefix] = ts.Append(tsl[i])
+		} else {
+			splitMap[prefix] = TTagSetList{tsl[i]}
+		}
+	}
+	ret := make(map[string]TTagSet)
+	for k := range splitMap {
+		tsl := splitMap[k]
+		sort.Sort(tsl)
+		ret[k] = tsl[len(tsl)-1]
+	}
+	return ret
 }

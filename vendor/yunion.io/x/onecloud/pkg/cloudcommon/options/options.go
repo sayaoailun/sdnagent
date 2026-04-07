@@ -33,6 +33,7 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/log/hooks"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/pkg/util/reflectutils"
 	"yunion.io/x/pkg/util/version"
 	"yunion.io/x/pkg/utils"
@@ -41,7 +42,7 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/util/atexit"
-	"yunion.io/x/onecloud/pkg/util/httputils"
+	"yunion.io/x/onecloud/pkg/util/fileutils2"
 )
 
 const (
@@ -58,15 +59,22 @@ type BaseOptions struct {
 
 	DebugClient bool `help:"Switch on/off mcclient debugs" default:"false"`
 
-	LogLevel        string `help:"log level" default:"info" choices:"debug|info|warn|error"`
-	LogVerboseLevel int    `help:"log verbosity level" default:"0"`
-	LogFilePrefix   string `help:"prefix of log files"`
+	LogLevel           string `help:"log level" default:"info" choices:"debug|info|warn|error"`
+	LogWithTimeZone    string `help:"log time zone" default:"UTC"`
+	LogTimestampFormat string `help:"log time format" default:"2006-01-02 15:04:05"`
+	LogVerboseLevel    int    `help:"log verbosity level" default:"0"`
+	LogFilePrefix      string `help:"prefix of log files"`
 
 	CorsHosts []string `help:"List of hostname that allow CORS"`
 	TempPath  string   `help:"Path for store temp file, at least 40G space" default:"/opt/yunion/tmp"`
 
 	ApplicationID      string `help:"Application ID"`
 	RequestWorkerCount int    `default:"8" help:"Request worker thread count, default is 8"`
+
+	TaskWorkerCount      int `default:"4" help:"Task manager worker thread count, default is 4"`
+	LocalTaskWorkerCount int `default:"4" help:"Worker thread count that runs local tasks, default is 4"`
+
+	DefaultProcessTimeoutSeconds int `default:"60" help:"request process timeout, default is 60 seconds"`
 
 	EnableSsl   bool   `help:"Enable https"`
 	SslCaCerts  string `help:"ssl certificate ca root file, separating ca and cert file is not encouraged" alias:"ca-file"`
@@ -80,6 +88,7 @@ type BaseOptions struct {
 	RbacDebug                        bool `help:"turn on rbac debug log" default:"false"`
 	RbacPolicyRefreshIntervalSeconds int  `help:"policy refresh interval in seconds, default half a minute" default:"30"`
 	// RbacPolicySyncFailedRetrySeconds int  `help:"seconds to wait after a failed sync, default 30 seconds" default:"30"`
+	PolicyWorkerCount int `help:"Policy worker count" default:"1"`
 
 	ConfigSyncPeriodSeconds int `help:"service config sync interval in seconds, default 30 minutes" default:"1800"`
 
@@ -110,6 +119,10 @@ type BaseOptions struct {
 
 	PlatformName  string            `help:"identity name of this platform" default:"Cloudpods"`
 	PlatformNames map[string]string `help:"identity name of this platform by language"`
+
+	EnableAppProfiling bool `help:"enable profiling API" default:"false"`
+
+	EnableChangeOwnerAutoRename bool `help:"Allows renaming when changing names" default:"false"`
 }
 
 const (
@@ -128,7 +141,7 @@ type CommonOptions struct {
 
 	TenantCacheExpireSeconds int `help:"expire seconds of cached tenant/domain info. defailt 15 minutes" default:"900"`
 
-	SessionEndpointType string `help:"Client session end point type"`
+	SessionEndpointType string `help:"Client session end point type" default:"internal"`
 
 	BaseOptions
 }
@@ -140,6 +153,11 @@ type HostCommonOptions struct {
 	DeployServerSocketPath string `help:"Deploy server listen socket path" default:"/var/run/onecloud/deploy.sock"`
 
 	EnableRemoteExecutor bool `help:"Enable remote executor" default:"false"`
+
+	EnableIsolatedDeviceWhitelist bool   `help:"enable isolated device white list" default:"false"`
+	ExecutorConnectTimeoutSeconds int    `help:"executor client connection timeout in seconds, default is 30" default:"30"`
+	ImageDeployDriver             string `help:"Image deploy driver" default:"qemu-kvm" choices:"qemu-kvm|nbd|libguestfs"`
+	DeployConcurrent              int    `help:"qemu-kvm deploy driver concurrent" default:"5"`
 }
 
 type DBOptions struct {
@@ -150,6 +168,8 @@ type DBOptions struct {
 	OpsLogWithClickhouse   bool `help:"store operation logs with clickhouse" default:"false"`
 	EnableDBChecksumTables bool `help:"Enable DB tables with record checksum for consistency"`
 	DBChecksumSkipInit     bool `help:"Skip DB tables with record checksum calculation when init" default:"false"`
+
+	DBChecksumHashAlgorithm string `help:"hash algorithm for db checksum hash" choices:"md5|sha256" default:"sha256"`
 
 	AutoSyncTable   bool `help:"Automatically synchronize table changes if differences are detected"`
 	ExitAfterDBInit bool `help:"Exit program after db initialization" default:"false"`
@@ -255,7 +275,15 @@ func (opt *DBOptions) GetClickhouseConnStr() (string, string, error) {
 	return "clickhouse", opt.Clickhouse, nil
 }
 
+func ParseOptionsIgnoreNoConfigfile(optStruct interface{}, args []string, configFileName string, serviceType string) {
+	parseOptions(optStruct, args, configFileName, serviceType, true)
+}
+
 func ParseOptions(optStruct interface{}, args []string, configFileName string, serviceType string) {
+	parseOptions(optStruct, args, configFileName, serviceType, false)
+}
+
+func parseOptions(optStruct interface{}, args []string, configFileName string, serviceType string, ignoreNoConfigfile bool) {
 	if len(serviceType) == 0 {
 		log.Fatalf("ServiceType must provided!")
 	}
@@ -305,10 +333,14 @@ func ParseOptions(optStruct interface{}, args []string, configFileName string, s
 	}
 
 	if len(optionsRef.Config) > 0 {
-		log.Infof("Use configuration file: %s", optionsRef.Config)
-		err = parser.ParseFile(optionsRef.Config)
-		if err != nil {
-			log.Fatalf("Parse configuration file: %v", err)
+		if !fileutils2.Exists(optionsRef.Config) && !ignoreNoConfigfile {
+			log.Fatalf("Configuration file %s not exist", optionsRef.Config)
+		} else if fileutils2.Exists(optionsRef.Config) {
+			log.Infof("Use configuration file: %s", optionsRef.Config)
+			err = parser.ParseFile(optionsRef.Config)
+			if err != nil {
+				log.Fatalf("Parse configuration file: %v", err)
+			}
 		}
 	}
 
@@ -318,6 +350,9 @@ func ParseOptions(optStruct interface{}, args []string, configFileName string, s
 		optionsRef.ApplicationID = serviceName
 	}
 
+	consts.SetServiceName(optionsRef.ApplicationID)
+	httperrors.SetTimeZone(optionsRef.TimeZone)
+
 	// log configuration
 	log.SetVerboseLevel(int32(optionsRef.LogVerboseLevel))
 	err = log.SetLogLevelByString(log.Logger(), optionsRef.LogLevel)
@@ -326,7 +361,8 @@ func ParseOptions(optStruct interface{}, args []string, configFileName string, s
 	}
 	log.Infof("Set log level to %q", optionsRef.LogLevel)
 	log.Logger().Formatter = &log.TextFormatter{
-		TimestampFormat: "2006-01-02 15:04:05",
+		TimeZone:        optionsRef.LogWithTimeZone,
+		TimestampFormat: optionsRef.LogTimestampFormat,
 	}
 	if optionsRef.LogFilePrefix != "" {
 		dir, name := filepath.Split(optionsRef.LogFilePrefix)
@@ -358,6 +394,9 @@ func ParseOptions(optStruct interface{}, args []string, configFileName string, s
 	}
 
 	consts.SetDomainizedNamespace(optionsRef.DomainizedNamespace)
+
+	consts.SetTaskWorkerCount(optionsRef.TaskWorkerCount)
+	consts.SetLocalTaskWorkerCount(optionsRef.LocalTaskWorkerCount)
 }
 
 func (self *BaseOptions) HttpTransportProxyFunc() httputils.TransportProxyFunc {

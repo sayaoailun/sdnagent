@@ -20,6 +20,7 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/tristate"
+	"yunion.io/x/pkg/util/rbacscope"
 
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
@@ -40,7 +41,7 @@ func init() {
 
 	InfrasUsageManager = &SQuotaManager{
 		SQuotaBaseManager: quotas.NewQuotaUsageManager(InfrasQuota,
-			rbacutils.ScopeDomain,
+			rbacscope.ScopeDomain,
 			"infras_quota_usage_tbl",
 			"infras_quota_usage",
 			"infras_quota_usages",
@@ -48,7 +49,7 @@ func init() {
 	}
 	InfrasPendingUsageManager = &SQuotaManager{
 		SQuotaBaseManager: quotas.NewQuotaUsageManager(InfrasQuota,
-			rbacutils.ScopeDomain,
+			rbacscope.ScopeDomain,
 			"infras_quota_pending_usage_tbl",
 			"infras_quota_pending_usage",
 			"infras_quota_pending_usages",
@@ -56,7 +57,7 @@ func init() {
 	}
 	InfrasQuotaManager = &SQuotaManager{
 		SQuotaBaseManager: quotas.NewQuotaBaseManager(InfrasQuota,
-			rbacutils.ScopeDomain,
+			rbacscope.ScopeDomain,
 			"infras_quota_tbl",
 			InfrasPendingUsageManager,
 			InfrasUsageManager,
@@ -142,9 +143,9 @@ func (self *SInfrasQuota) FetchUsage(ctx context.Context) error {
 		brands = []string{regionKeys.Brand}
 	}
 
-	hostStat := HostManager.TotalCount(ownerId, scope, rangeObjs, "", "", nil, nil, providers, brands, regionKeys.CloudEnv, tristate.None, tristate.None, rbacutils.SPolicyResult{})
+	hostStat := HostManager.TotalCount(ctx, ownerId, scope, rangeObjs, "", "", nil, nil, providers, brands, regionKeys.CloudEnv, tristate.None, tristate.None, rbacutils.SPolicyResult{})
 	self.Host = int(hostStat.Count)
-	self.Vpc = VpcManager.totalCount(ownerId, scope, rangeObjs, providers, brands, regionKeys.CloudEnv)
+	self.Vpc = VpcManager.totalCount(ctx, ownerId, scope, rangeObjs, providers, brands, regionKeys.CloudEnv)
 
 	return nil
 }

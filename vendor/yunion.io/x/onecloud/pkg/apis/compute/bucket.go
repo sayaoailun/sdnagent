@@ -16,13 +16,16 @@ package compute
 
 import (
 	"net/http"
+	"reflect"
 
+	"yunion.io/x/cloudmux/pkg/apis/compute"
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/util/regutils"
 	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/apis"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 )
 
@@ -31,7 +34,7 @@ const (
 
 	BUCKET_STATUS_START_CREATE = "start_create"
 	BUCKET_STATUS_CREATING     = "creating"
-	BUCKET_STATUS_READY        = "ready"
+	BUCKET_STATUS_READY        = compute.BUCKET_STATUS_READY
 	BUCKET_STATUS_CREATE_FAIL  = "create_fail"
 	BUCKET_STATUS_START_DELETE = "start_delete"
 	BUCKET_STATUS_DELETING     = "deleting"
@@ -79,7 +82,7 @@ func (self BucketDetails) GetMetricTags() map[string]string {
 		"tenant_id":      self.ProjectId,
 		"external_id":    self.ExternalId,
 	}
-	return ret
+	return AppendMetricTags(ret, self.MetadataResourceInfo, self.ProjectizedResourceInfo)
 }
 
 func (self BucketDetails) GetMetricPairs() map[string]string {
@@ -358,4 +361,10 @@ type BucketRefererConf struct {
 
 func (input *BucketRefererConf) Validate() error {
 	return nil
+}
+
+func init() {
+	gotypes.RegisterSerializable(reflect.TypeOf(&SBackupStorageAccessInfo{}), func() gotypes.ISerializable {
+		return &SBackupStorageAccessInfo{}
+	})
 }

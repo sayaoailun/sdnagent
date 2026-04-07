@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
@@ -26,7 +27,6 @@ import (
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
@@ -39,8 +39,8 @@ type SCloudregionResourceBase struct {
 
 type SCloudregionResourceBaseManager struct{}
 
-func ValidateCloudregionResourceInput(userCred mcclient.TokenCredential, input api.CloudregionResourceInput) (*SCloudregion, api.CloudregionResourceInput, error) {
-	regionObj, err := CloudregionManager.FetchByIdOrName(userCred, input.CloudregionId)
+func ValidateCloudregionResourceInput(ctx context.Context, userCred mcclient.TokenCredential, input api.CloudregionResourceInput) (*SCloudregion, api.CloudregionResourceInput, error) {
+	regionObj, err := CloudregionManager.FetchByIdOrName(ctx, userCred, input.CloudregionId)
 	if err != nil {
 		if errors.Cause(err) == sql.ErrNoRows {
 			return nil, input, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", CloudregionManager.Keyword(), input.CloudregionId)
@@ -50,6 +50,18 @@ func ValidateCloudregionResourceInput(userCred mcclient.TokenCredential, input a
 	}
 	input.CloudregionId = regionObj.GetId()
 	return regionObj.(*SCloudregion), input, nil
+}
+
+func ValidateCloudregionId(ctx context.Context, userCred mcclient.TokenCredential, regionId string) (*SCloudregion, error) {
+	regionObj, err := CloudregionManager.FetchByIdOrName(ctx, userCred, regionId)
+	if err != nil {
+		if errors.Cause(err) == sql.ErrNoRows {
+			return nil, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", CloudregionManager.Keyword(), regionId)
+		} else {
+			return nil, errors.Wrap(err, "CloudregionManager.FetchByIdOrName")
+		}
+	}
+	return regionObj.(*SCloudregion), nil
 }
 
 func (self *SCloudregionResourceBase) GetRegion() (*SCloudregion, error) {
@@ -124,7 +136,7 @@ func (manager *SCloudregionResourceBaseManager) ListItemFilter(
 	userCred mcclient.TokenCredential,
 	query api.RegionalFilterListInput,
 ) (*sqlchemy.SQuery, error) {
-	return managedResourceFilterByRegion(q, query, "", nil)
+	return managedResourceFilterByRegion(ctx, q, query, "", nil)
 }
 
 func (manager *SCloudregionResourceBaseManager) OrderByExtraFields(

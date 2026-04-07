@@ -20,10 +20,12 @@ import (
 	"strings"
 	"time"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
 
 	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
@@ -32,7 +34,7 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
+	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
@@ -257,7 +259,13 @@ func (self *SCloudregion) GetElasticSearchs(managerId string) ([]SElasticSearch,
 	return ret, nil
 }
 
-func (self *SCloudregion) SyncElasticSearchs(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, exts []cloudprovider.ICloudElasticSearch) compare.SyncResult {
+func (self *SCloudregion) SyncElasticSearchs(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	provider *SCloudprovider,
+	exts []cloudprovider.ICloudElasticSearch,
+	xor bool,
+) compare.SyncResult {
 	// 加锁防止重入
 	lockman.LockRawObject(ctx, ElasticSearchManager.KeywordPlural(), fmt.Sprintf("%s-%s", provider.Id, self.Id))
 	defer lockman.ReleaseRawObject(ctx, ElasticSearchManager.KeywordPlural(), fmt.Sprintf("%s-%s", provider.Id, self.Id))
@@ -291,14 +299,16 @@ func (self *SCloudregion) SyncElasticSearchs(ctx context.Context, userCred mccli
 		result.Delete()
 	}
 
-	// 和云上资源属性进行同步
-	for i := 0; i < len(commondb); i++ {
-		err := commondb[i].SyncWithCloudElasticSearch(ctx, userCred, commonext[i])
-		if err != nil {
-			result.UpdateError(err)
-			continue
+	if !xor {
+		// 和云上资源属性进行同步
+		for i := 0; i < len(commondb); i++ {
+			err := commondb[i].SyncWithCloudElasticSearch(ctx, userCred, commonext[i])
+			if err != nil {
+				result.UpdateError(err)
+				continue
+			}
+			result.Update()
 		}
-		result.Update()
 	}
 
 	// 创建本地没有的云上资源
@@ -320,7 +330,8 @@ type SEsCountStat struct {
 }
 
 func (man *SElasticSearchManager) TotalCount(
-	scope rbacutils.TRbacScope,
+	ctx context.Context,
+	scope rbacscope.TRbacScope,
 	ownerId mcclient.IIdentityProvider,
 	rangeObjs []db.IStandaloneModel,
 	providers []string, brands []string, cloudEnv string,
@@ -330,7 +341,7 @@ func (man *SElasticSearchManager) TotalCount(
 	esq = scopeOwnerIdFilter(esq, scope, ownerId)
 	esq = CloudProviderFilter(esq, esq.Field("manager_id"), providers, brands, cloudEnv)
 	esq = RangeObjectsFilter(esq, rangeObjs, esq.Field("cloudregion_id"), nil, esq.Field("manager_id"), nil, nil)
-	esq = db.ObjectIdQueryWithPolicyResult(esq, man, policyResult)
+	esq = db.ObjectIdQueryWithPolicyResult(ctx, esq, man, policyResult)
 
 	sq := esq.SubQuery()
 	q := sq.Query(sqlchemy.COUNT("total_es_count"),
@@ -368,7 +379,7 @@ func (self *SElasticSearch) StartDeleteTask(ctx context.Context, userCred mcclie
 	if err != nil {
 		return err
 	}
-	self.SetStatus(userCred, api.ELASTIC_SEARCH_STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, api.ELASTIC_SEARCH_STATUS_DELETING, "")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -411,7 +422,13 @@ func (self *SElasticSearch) syncRemoveCloudElasticSearch(ctx context.Context, us
 // 同步资源属性
 func (self *SElasticSearch) SyncWithCloudElasticSearch(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudElasticSearch) error {
 	diff, err := db.UpdateWithLock(ctx, self, func() error {
-		self.ExternalId = ext.GetGlobalId()
+		if options.Options.EnableSyncName {
+			newName, _ := db.GenerateAlterName(self, ext.GetName())
+			if len(newName) > 0 {
+				self.Name = newName
+			}
+		}
+
 		self.Status = ext.GetStatus()
 		self.Version = ext.GetVersion()
 		self.StorageType = ext.GetStorageType()
@@ -491,9 +508,12 @@ func (self *SElasticSearch) SyncWithCloudElasticSearch(ctx context.Context, user
 		})
 	}
 
-	syncVirtualResourceMetadata(ctx, userCred, self, ext)
+	if account := self.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, self, ext, account.ReadOnly)
+	}
+
 	if provider := self.GetCloudprovider(); provider != nil {
-		SyncCloudProject(userCred, self, provider.GetOwnerId(), ext, provider.Id)
+		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider)
 	}
 	db.OpsLog.LogSyncUpdate(self, diff, userCred)
 	return nil
@@ -594,9 +614,9 @@ func (self *SCloudregion) newFromCloudElasticSearch(ctx context.Context, userCre
 		Action: notifyclient.ActionSyncCreate,
 	})
 	// 同步标签
-	syncVirtualResourceMetadata(ctx, userCred, &es, ext)
+	syncVirtualResourceMetadata(ctx, userCred, &es, ext, false)
 	// 同步项目归属
-	SyncCloudProject(userCred, &es, provider.GetOwnerId(), ext, provider.Id)
+	SyncCloudProject(ctx, userCred, &es, provider.GetOwnerId(), ext, provider)
 
 	db.OpsLog.LogEvent(&es, db.ACT_CREATE, es.GetShortDesc(ctx), userCred)
 
@@ -656,4 +676,35 @@ func (self *SElasticSearch) GetDetailsAccessInfo(ctx context.Context, userCred m
 
 func (es *SElasticSearch) PostUpdate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	es.SVirtualResourceBase.PostUpdate(ctx, userCred, query, data)
+}
+
+func (self *SElasticSearch) StartSElasticSearchSyncTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
+	return StartResourceSyncStatusTask(ctx, userCred, self, "ElasticSearchSyncstatusTask", parentTaskId)
+}
+
+func (self *SElasticSearch) StartRemoteUpdateTask(ctx context.Context, userCred mcclient.TokenCredential, replaceTags bool, parentTaskId string) error {
+	data := jsonutils.NewDict()
+	if replaceTags {
+		data.Add(jsonutils.JSONTrue, "replace_tags")
+	}
+	if task, err := taskman.TaskManager.NewTask(ctx, "ElasticSearchRemoteUpdateTask", self, userCred, data, parentTaskId, "", nil); err != nil {
+		return errors.Wrap(err, "Start ElasticSearchRemoteUpdateTask")
+	} else {
+		self.SetStatus(ctx, userCred, api.ELASTIC_SEARCH_UPDATE_TAGS, "StartRemoteUpdateTask")
+		task.ScheduleRun(nil)
+	}
+	return nil
+}
+
+func (self *SElasticSearch) OnMetadataUpdated(ctx context.Context, userCred mcclient.TokenCredential) {
+	if len(self.ExternalId) == 0 || options.Options.KeepTagLocalization {
+		return
+	}
+	if account := self.GetCloudaccount(); account != nil && account.ReadOnly {
+		return
+	}
+	err := self.StartRemoteUpdateTask(ctx, userCred, true, "")
+	if err != nil {
+		log.Errorf("StartRemoteUpdateTask fail: %s", err)
+	}
 }

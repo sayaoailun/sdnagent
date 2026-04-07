@@ -26,22 +26,28 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/netutils"
+	"yunion.io/x/pkg/util/regutils"
 	"yunion.io/x/pkg/utils"
 
+	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
 	"yunion.io/x/onecloud/pkg/hostman/options"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/iproute2"
 	"yunion.io/x/onecloud/pkg/util/netutils2"
+	"yunion.io/x/onecloud/pkg/util/procutils"
 )
 
 type IBridgeDriver interface {
+	MigrateSlaveConfigs(IBridgeDriver) error
 	ConfirmToConfig() (bool, error)
 	GetMac() string
+	GetVlanId() int
 	FetchConfig()
 	Setup(IBridgeDriver) error
 	SetupAddresses(net.IPMask) error
 	SetupSlaveAddresses([][]string) error
-	SetupRoutes([]iproute2.RouteSpec) error
+	SetupRoutes(routes []iproute2.RouteSpec, add bool) error
 	BringupInterface() error
 
 	Exists() (bool, error)
@@ -53,12 +59,14 @@ type IBridgeDriver interface {
 	PersistentConfig() error
 	DisableDHCPClient() (bool, error)
 
-	GenerateIfupScripts(scriptPath string, nic jsonutils.JSONObject, isSlave bool) error
-	GenerateIfdownScripts(scriptPath string, nic jsonutils.JSONObject, isSlave bool) error
+	GenerateIfupScripts(scriptPath string, nic *desc.SGuestNetwork, isVolatileHost bool) error
+	GenerateIfdownScripts(scriptPath string, nic *desc.SGuestNetwork, isVolatileHost bool) error
 	RegisterHostlocalServer(mac, ip string) error
 
-	getUpScripts(nic jsonutils.JSONObject, isSlave bool) (string, error)
-	getDownScripts(nic jsonutils.JSONObject, isSlave bool) (string, error)
+	getUpScripts(nic *desc.SGuestNetwork, isVolatileHost bool) (string, error)
+	getDownScripts(nic *desc.SGuestNetwork, isVolatileHost bool) (string, error)
+
+	OnVolatileGuestResume(nic *desc.SGuestNetwork) error
 
 	Bridge() string
 }
@@ -80,7 +88,25 @@ func NewBaseBridgeDriver(bridge, inter, ip string) (*SBaseBridgeDriver, error) {
 			return nil, fmt.Errorf("%s not exists", inter)
 		}
 		bd.ip = ip
-		bd.inter.SetupGso(options.HostOptions.EthtoolEnableGso)
+		var enableGso bool
+		if len(options.HostOptions.EthtoolEnableGsoInterfaces) > 0 {
+			if utils.IsInStringArray(bridge, options.HostOptions.EthtoolEnableGsoInterfaces) ||
+				utils.IsInStringArray(inter, options.HostOptions.EthtoolEnableGsoInterfaces) {
+				enableGso = true
+			} else {
+				enableGso = false
+			}
+		} else if len(options.HostOptions.EthtoolDisableGsoInterfaces) > 0 {
+			if utils.IsInStringArray(bridge, options.HostOptions.EthtoolDisableGsoInterfaces) ||
+				utils.IsInStringArray(inter, options.HostOptions.EthtoolDisableGsoInterfaces) {
+				enableGso = false
+			} else {
+				enableGso = true
+			}
+		} else {
+			enableGso = options.HostOptions.EthtoolEnableGso
+		}
+		bd.inter.SetupGso(enableGso)
 	} else if len(ip) > 0 {
 		return nil, fmt.Errorf("A bridge without interface must have no IP")
 	}
@@ -93,10 +119,17 @@ func (d *SBaseBridgeDriver) FetchConfig() {
 }
 
 func (d *SBaseBridgeDriver) GetMac() string {
-	if len(d.bridge.Mac) == 0 {
-		d.bridge.FetchConfig()
+	if len(d.inter.GetMac()) == 0 {
+		d.inter.FetchConfig()
 	}
-	return d.bridge.Mac
+	return d.inter.GetMac()
+}
+
+func (d *SBaseBridgeDriver) GetVlanId() int {
+	if len(d.inter.GetMac()) == 0 {
+		d.inter.FetchConfig()
+	}
+	return d.inter.VlanId
 }
 
 func (d *SBaseBridgeDriver) Bridge() string {
@@ -126,6 +159,159 @@ func (d *SBaseBridgeDriver) BringupInterface() error {
 	return nil
 }
 
+func trySetupSlaveAddressesRoutes(o IBridgeDriver, migrateAddrs [][]string, delRoutes []iproute2.RouteSpec, migrateRoutes []iproute2.RouteSpec) error {
+	if len(migrateAddrs) > 0 {
+		tried := 0
+		const MAX_TRIES = 4
+		errs := make([]error, 0)
+		for tried < MAX_TRIES {
+			if err := o.SetupSlaveAddresses(migrateAddrs); err != nil {
+				errs = append(errs, err)
+				log.Errorf("SetupSlaveAddresses fail: %s", err)
+				tried += 1
+				if tried >= MAX_TRIES {
+					return errors.Wrap(errors.NewAggregate(errs), "SetupSlaveAddresses")
+				} else {
+					time.Sleep(time.Duration(tried) * time.Second)
+				}
+			} else {
+				break
+			}
+		}
+	}
+	if len(delRoutes) > 0 {
+		tried := 0
+		const MAX_TRIES = 4
+		errs := make([]error, 0)
+		for {
+			if err := o.SetupRoutes(delRoutes, false); err != nil {
+				errs = append(errs, err)
+				log.Errorf("delRoutes fail: %s", err)
+				tried += 1
+				if tried >= MAX_TRIES {
+					return errors.Wrap(errors.NewAggregate(errs), "DeleteRoutes")
+				} else {
+					time.Sleep(time.Duration(tried) * time.Second)
+				}
+			} else {
+				break
+			}
+		}
+	}
+	if len(migrateRoutes) > 0 {
+		tried := 0
+		const MAX_TRIES = 4
+		errs := make([]error, 0)
+		for {
+			if err := o.SetupRoutes(migrateRoutes, true); err != nil {
+				errs = append(errs, err)
+				log.Errorf("SetupRoutes fail: %s", err)
+				tried += 1
+				if tried >= MAX_TRIES {
+					return errors.Wrap(errors.NewAggregate(errs), "SetupRoutes")
+				} else {
+					time.Sleep(time.Duration(tried) * time.Second)
+				}
+			} else {
+				break
+			}
+		}
+	}
+	return nil
+}
+
+func (d *SBaseBridgeDriver) MigrateSlaveConfigs(o IBridgeDriver) error {
+	if d.inter != nil {
+		migrateAddrs := make([][]string, 0)
+		migrateRoutes := make([]iproute2.RouteSpec, 0)
+		delRoutes := make([]iproute2.RouteSpec, 0)
+		{
+			currentRoutes := d.bridge.GetRouteSpecs()
+			currentSlaves := d.bridge.GetSlaveAddresses()
+			routes := d.inter.GetRouteSpecs()
+			slaveAddrs := d.inter.GetSlaveAddresses()
+
+			log.Infof("to migrate routes: %s slaveAddress: %s", jsonutils.Marshal(routes), jsonutils.Marshal(slaveAddrs))
+
+			for i := range slaveAddrs {
+				if strings.HasPrefix(slaveAddrs[i][0], "fe80:") || strings.HasPrefix(slaveAddrs[i][0], "169.254.") {
+					// skip link local address
+					continue
+				}
+				if slaveAddrs[i][0] == d.bridge.Addr {
+					continue
+				}
+				find := false
+				for j := range currentSlaves {
+					if slaveAddrs[i][0] == currentSlaves[j][0] && slaveAddrs[i][1] == currentSlaves[j][1] {
+						find = true
+						break
+					}
+				}
+				if !find {
+					// need to migrate address
+					migrateAddrs = append(migrateAddrs, slaveAddrs[i])
+				}
+			}
+
+			for i := range routes {
+				find := false
+				for j := range currentRoutes {
+					log.Infof("new %s(%d,%s) current %s(%d,%s)", routes[i].Dst.String(), routes[i].Table, routes[i].Gw.String(), currentRoutes[j].Dst.String(), currentRoutes[j].Table, currentRoutes[j].Gw.String())
+					if routes[i].Dst.String() == currentRoutes[j].Dst.String() && routes[i].Table == currentRoutes[j].Table {
+						if routes[i].Gw.String() != currentRoutes[j].Gw.String() {
+							// need to replace
+							delRoutes = append(delRoutes, currentRoutes[j])
+							migrateRoutes = append(migrateRoutes, routes[i])
+						}
+						find = true
+						break
+					}
+				}
+				if !find {
+					for j := range slaveAddrs {
+						if routes[i].Dst.String() == addr2Prefix(slaveAddrs[j][0], slaveAddrs[j][1]) {
+							find = true
+							break
+						}
+					}
+				}
+				if !find {
+					// need to migrate route
+					migrateRoutes = append(migrateRoutes, routes[i])
+				}
+			}
+		}
+		log.Infof("to migrate routes: %s slaveAddress: %s delRoutes: %s", jsonutils.Marshal(migrateRoutes), jsonutils.Marshal(migrateAddrs), jsonutils.Marshal(delRoutes))
+		{
+			err := trySetupSlaveAddressesRoutes(o, migrateAddrs, delRoutes, migrateRoutes)
+			if err != nil {
+				return errors.Wrap(err, "trySetupSlaveAddressesRoutes")
+			}
+		}
+		{
+			err := d.inter.ClearAddrs()
+			if err != nil {
+				return errors.Wrap(err, "ClearAddrs")
+			}
+		}
+		{
+			routes := d.inter.GetRouteSpecs()
+			if len(routes) > 0 {
+				rt := iproute2.NewRoute(d.inter.String())
+				for i := range routes {
+					rt = rt.DelByCidr(routes[i].Dst.String())
+				}
+				err := rt.Err()
+				if err != nil {
+					return errors.Wrap(err, "Clear rotues")
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (d *SBaseBridgeDriver) ConfirmToConfig() (bool, error) {
 	exist, err := d.drv.Exists()
 	if err != nil {
@@ -135,6 +321,7 @@ func (d *SBaseBridgeDriver) ConfirmToConfig() (bool, error) {
 		d.bridge.FetchConfig()
 		if len(d.ip) > 0 {
 			if len(d.bridge.Addr) == 0 {
+				log.Infof("bridge %s has no ip assignment initially", d.bridge)
 				if len(d.inter.Addr) == 0 {
 					return false, fmt.Errorf("Neither %s nor %s owner address %s",
 						d.inter, d.bridge, d.ip)
@@ -145,6 +332,8 @@ func (d *SBaseBridgeDriver) ConfirmToConfig() (bool, error) {
 				}
 				log.Infof("Bridge address is not configured")
 				return false, nil
+			} else {
+				log.Infof("bridge %s already has ip %s", d.bridge, d.bridge.Addr)
 			}
 			if d.bridge.Addr != d.ip {
 				return false, fmt.Errorf("%s IP %s!=%s, mismatch", d.bridge, d.bridge.Addr, d.ip)
@@ -236,21 +425,74 @@ func (d *SBaseBridgeDriver) SetupSlaveAddresses(slaveAddrs [][]string) error {
 	return nil
 }
 
-func (d *SBaseBridgeDriver) SetupRoutes(routespecs []iproute2.RouteSpec) error {
+func (d *SBaseBridgeDriver) SetupRoutes(routespecs []iproute2.RouteSpec, add bool) error {
+	bridgeIP := d.inter.Addr
+	bridgeMask := d.inter.Mask
 	br := d.bridge.String()
-	r := iproute2.NewRoute(br)
-	for _, routespec := range routespecs {
-		rt := iproute2.RouteSpec{
-			Dst: routespec.Dst,
-			Src: routespec.Src,
-			Gw:  routespec.Gw,
+	for i := 0; i < len(routespecs); i++ {
+		errs := []error{}
+		routespec := routespecs[i]
+		if routespec.Dst.Contains(net.ParseIP(bridgeIP)) && bridgeMask.String() == routespec.Dst.Mask.String() {
+			log.Infof("skip setup route: %s", routespec.String())
+			continue
 		}
-		r.AddByRouteSpec(rt)
-	}
-	if err := r.Err(); err != nil {
-		return errors.Wrapf(err, "set routes on %s", br)
+		cmd := []string{
+			"route",
+		}
+		if add {
+			cmd = append(cmd, "add")
+		} else {
+			cmd = append(cmd, "del")
+		}
+		cmd = append(cmd, routespec.Dst.String())
+		if routespec.Gw != nil {
+			cmd = append(cmd, "via", routespec.Gw.String())
+		}
+		cmd = append(cmd, "dev", br)
+
+		output, err := procutils.NewRemoteCommandAsFarAsPossible("ip", cmd...).Output()
+		if err != nil {
+			errs = append(errs, errors.Wrapf(err, "run cmd: ip %s, output: %s", strings.Join(cmd, " "), output))
+			if add {
+				cmd = append(cmd, "onlink")
+				if output, err := procutils.NewRemoteCommandAsFarAsPossible("ip", cmd...).Output(); err != nil {
+					errs = append(errs, errors.Wrapf(err, "run cmd: ip %s, output: %s", strings.Join(cmd, " "), output))
+					return errors.Wrapf(errors.NewAggregate(errs), "setup route %s", routespec.String())
+				}
+			} else {
+				return errors.Wrapf(errors.NewAggregate(errs), "setup route %s", routespec.String())
+			}
+		}
 	}
 	return nil
+}
+
+func addr2Prefix(addrStr string, maskLenStr string) string {
+	if regutils.MatchIP6Addr(addrStr) {
+		v6Addr, _ := netutils.NewIPV6Addr(addrStr)
+		maskLen, _ := strconv.ParseInt(maskLenStr, 10, 64)
+		netAddr := v6Addr.NetAddr(uint8(maskLen))
+		return fmt.Sprintf("%s/%d", netAddr.String(), maskLen)
+	} else {
+		v4Addr, _ := netutils.NewIPV4Addr(addrStr)
+		maskLen, _ := strconv.ParseInt(maskLenStr, 10, 64)
+		netAddr := v4Addr.NetAddr(int8(maskLen))
+		return fmt.Sprintf("%s/%d", netAddr.String(), maskLen)
+	}
+}
+
+func addr2Prefix2(addrStr string, mask net.IPMask) string {
+	if regutils.MatchIP6Addr(addrStr) {
+		v6Addr, _ := netutils.NewIPV6Addr(addrStr)
+		maskLen, _ := mask.Size()
+		netAddr := v6Addr.NetAddr(uint8(maskLen))
+		return fmt.Sprintf("%s/%d", netAddr.String(), maskLen)
+	} else {
+		v4Addr, _ := netutils.NewIPV4Addr(addrStr)
+		maskLen, _ := mask.Size()
+		netAddr := v4Addr.NetAddr(int8(maskLen))
+		return fmt.Sprintf("%s/%d", netAddr.String(), maskLen)
+	}
 }
 
 func (d *SBaseBridgeDriver) Setup(o IBridgeDriver) error {
@@ -259,69 +501,62 @@ func (d *SBaseBridgeDriver) Setup(o IBridgeDriver) error {
 	if d.inter != nil && len(d.inter.Addr) > 0 {
 		routes = d.inter.GetRouteSpecs()
 		slaveAddrs = d.inter.GetSlaveAddresses()
+		log.Infof("to migrate routes: %s slaveAddress: %s", jsonutils.Marshal(routes), jsonutils.Marshal(slaveAddrs))
 	}
 	exist, err := o.Exists()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Exists")
 	}
 	if !exist {
 		if err := o.SetupBridgeDev(); err != nil {
-			return err
+			return errors.Wrap(err, "SetupBridgeDev")
 		}
 	}
 
 	infs, err := o.Interfaces()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Interfaces")
 	}
 	if d.inter != nil && !utils.IsInStringArray(d.inter.String(), infs) {
 		if err := o.SetupInterface(); err != nil {
-			return err
+			return errors.Wrap(err, "SetupInterface")
 		}
 	}
 	if len(d.bridge.Addr) == 0 {
 		if len(d.ip) > 0 {
 			if err := o.SetupAddresses(d.inter.Mask); err != nil {
-				return err
+				return errors.Wrap(err, "SetupAddresses")
 			}
 			time.Sleep(1 * time.Second)
-			if len(slaveAddrs) > 0 {
-				tried := 0
-				const MAX_TRIES = 4
-				for tried < MAX_TRIES {
-					if err := o.SetupSlaveAddresses(slaveAddrs); err != nil {
-						log.Errorf("SetupSlaveAddresses fail: %s", err)
-						tried += 1
-						if tried >= MAX_TRIES {
-							return err
-						} else {
-							time.Sleep(time.Duration(tried) * time.Second)
+			setupRoutes := make([]iproute2.RouteSpec, 0)
+			{
+				for i := range routes {
+					find := false
+					if !find {
+						if routes[i].Dst.String() == addr2Prefix2(d.ip, d.inter.Mask) {
+							find = true
 						}
-					} else {
-						break
+					}
+					if !find {
+						for j := range slaveAddrs {
+							if routes[i].Dst.String() == addr2Prefix(slaveAddrs[j][0], slaveAddrs[j][1]) {
+								find = true
+								break
+							}
+						}
+					}
+					if !find {
+						// need to migrate route
+						setupRoutes = append(setupRoutes, routes[i])
 					}
 				}
 			}
-			if len(routes) > 0 {
-				tried := 0
-				const MAX_TRIES = 4
-				for {
-					if err := o.SetupRoutes(routes); err != nil {
-						log.Errorf("SetupRoutes fail: %s", err)
-						tried += 1
-						if tried >= MAX_TRIES {
-							return err
-						} else {
-							time.Sleep(time.Duration(tried) * time.Second)
-						}
-					} else {
-						break
-					}
-				}
+			if err := trySetupSlaveAddressesRoutes(o, slaveAddrs, nil, setupRoutes); err != nil {
+				return errors.Wrap(err, "trySetupSlaveAddressesRoutes")
 			}
 		} else {
 			if err := o.SetupAddresses(nil); err != nil {
-				return err
+				return errors.Wrap(err, "SetupAddresses nil")
 			}
 		}
 	}
@@ -340,16 +575,16 @@ func (d *SBaseBridgeDriver) saveFileExecutable(scriptPath, script string) error 
 	return os.Chmod(scriptPath, syscall.S_IRUSR|syscall.S_IWUSR|syscall.S_IXUSR)
 }
 
-func (d *SBaseBridgeDriver) generateIfdownScripts(driver IBridgeDriver, scriptPath string, nic jsonutils.JSONObject, isSlave bool) error {
-	script, err := driver.getDownScripts(nic, isSlave)
+func (d *SBaseBridgeDriver) generateIfdownScripts(driver IBridgeDriver, scriptPath string, nic *desc.SGuestNetwork, isVolatileHost bool) error {
+	script, err := driver.getDownScripts(nic, isVolatileHost)
 	if err != nil {
 		return errors.Wrap(err, "getDownScripts")
 	}
 	return d.saveFileExecutable(scriptPath, script)
 }
 
-func (d *SBaseBridgeDriver) generateIfupScripts(driver IBridgeDriver, scriptPath string, nic jsonutils.JSONObject, isSlave bool) error {
-	script, err := driver.getUpScripts(nic, isSlave)
+func (d *SBaseBridgeDriver) generateIfupScripts(driver IBridgeDriver, scriptPath string, nic *desc.SGuestNetwork, isVolatileHost bool) error {
+	script, err := driver.getUpScripts(nic, isVolatileHost)
 	if err != nil {
 		log.Errorln(err)
 		return err

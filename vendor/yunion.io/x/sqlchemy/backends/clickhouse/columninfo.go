@@ -16,6 +16,7 @@ package clickhouse
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 
 	"yunion.io/x/log"
@@ -52,7 +53,7 @@ func (info *sSqlColumnInfo) getType() string {
 }
 
 func (info *sSqlColumnInfo) getDefault() string {
-	if len(info.DefaultExpression) > 0 {
+	if info.DefaultType == "DEFAULT" {
 		if strings.HasPrefix(info.DefaultExpression, "CAST(") {
 			defaultVals := strings.Split(info.DefaultExpression[len("CAST("):len(info.DefaultExpression)-1], ",")
 			defaultVal := defaultVals[0]
@@ -81,6 +82,14 @@ func (info *sSqlColumnInfo) getTagmap() map[string]string {
 			defVal = defVal[1 : len(defVal)-1]
 		}
 		tagmap[sqlchemy.TAG_DEFAULT] = defVal
+	}
+	sqlType := info.getType()
+	if strings.HasPrefix(sqlType, "Decimal") {
+		re := regexp.MustCompile(`Decimal\((\d+),\s*(\d+)\)`)
+		match := re.FindStringSubmatch(sqlType)
+		if len(match) == 3 {
+			tagmap[sqlchemy.TAG_WIDTH], tagmap[sqlchemy.TAG_PRECISION] = match[1], match[2]
+		}
 	}
 	return tagmap
 }
@@ -140,6 +149,7 @@ func parseKeys(keyStr string) []string {
 		key = strings.TrimSpace(key)
 		ret = append(ret, key)
 	}
+	sort.Strings(ret)
 	return ret
 }
 
@@ -163,7 +173,27 @@ func findSegment(sqlStr string, prefix string) string {
 	return ""
 }
 
-func parseCreateTable(sqlStr string) (primaries []string, orderbys []string, partition string, ttl string) {
+func trimPartition(partStr string) string {
+	for {
+		partStr = strings.TrimSpace(partStr)
+		if len(partStr) > 0 && partStr[0] == '(' {
+			partStr = partStr[1 : len(partStr)-1]
+		} else {
+			break
+		}
+	}
+	partStr = strings.ReplaceAll(partStr, " ", "")
+	return partStr
+}
+
+func parsePartitions(partStr string) []string {
+	partStr = trimPartition(partStr)
+	parts := strings.Split(partStr, ",")
+	sort.Strings(parts)
+	return parts
+}
+
+func parseCreateTable(sqlStr string) (primaries []string, orderbys []string, partitions []string, ttl string) {
 	matches := primaryKeyRegexp.FindAllStringSubmatch(sqlStr, -1)
 	if len(matches) > 0 {
 		primaries = parseKeys(matches[0][1])
@@ -172,7 +202,8 @@ func parseCreateTable(sqlStr string) (primaries []string, orderbys []string, par
 	if len(matches) > 0 {
 		orderbys = parseKeys(matches[0][1])
 	}
-	partition = findSegment(sqlStr, partitionByPrefix)
+	partitionStr := findSegment(sqlStr, partitionByPrefix)
+	partitions = parsePartitions(partitionStr)
 	ttl = findSegment(sqlStr, ttlPrefix)
 	return
 }

@@ -30,6 +30,12 @@ type CachedImageManagerCacheImageInput struct {
 	ImageId string `json:"image_id"`
 }
 
+type CachedimageUsage struct {
+	// 此镜像被使用次数
+	// example: 0
+	CachedCount int `json:"cached_count"`
+}
+
 type CachedimageDetails struct {
 	apis.SharableVirtualResourceDetails
 
@@ -56,9 +62,28 @@ type CachedimageDetails struct {
 
 	// 此镜像被使用次数
 	// example: 0
-	CachedCount int `json:"cached_count"`
+	CachedimageUsage
 }
 
 type CachedImageSetClassMetadataInput struct {
 	ClassMetadata map[string]string `json:"class_metadata"`
+}
+
+type CachedimageListInput struct {
+	apis.SharableVirtualResourceListInput
+	apis.ExternalizedResourceBaseListInput
+
+	CloudproviderResourceListInput
+	CloudregionResourceListInput
+	ZoneResourceInput
+
+	// 镜像类型，可能值为: system(公有云公共镜像), customized(自定义镜像)
+	// example: system
+	ImageType []string `json:"image_type"`
+
+	// filter by host schedtag
+	HostSchedtagId string `json:"host_schedtag_id"`
+
+	// valid cachedimage
+	Valid bool `json:"valid"`
 }

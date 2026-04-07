@@ -19,9 +19,11 @@ import (
 	"fmt"
 	"time"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/billing"
 	"yunion.io/x/pkg/util/compare"
 	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
@@ -34,11 +36,9 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/billing"
 	"yunion.io/x/onecloud/pkg/util/logclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
@@ -73,8 +73,9 @@ type SNatGateway struct {
 
 	SDeletePreventableResourceBase
 
-	NetworkId string `width:"36" charset:"ascii" nullable:"false" list:"user" create:"optional"`
-	IpAddr    string `width:"16" charset:"ascii" nullable:"false" list:"user"`
+	NetworkId   string `width:"36" charset:"ascii" nullable:"false" list:"user" create:"optional"`
+	NetworkType string `width:"16" charset:"ascii" nullable:"false" list:"user" create:"optional"`
+	IpAddr      string `width:"16" charset:"ascii" nullable:"false" list:"user"`
 
 	BandwidthMb int    `nullable:"false" list:"user"`
 	NatSpec     string `list:"user" create:"optional"` // NAT规格
@@ -154,7 +155,7 @@ func (man *SNatGatewayManager) ValidateCreateData(
 	if len(input.NetworkId) == 0 {
 		return input, httperrors.NewMissingParameterError("network_id")
 	}
-	_network, err := validators.ValidateModel(userCred, NetworkManager, &input.NetworkId)
+	_network, err := validators.ValidateModel(ctx, userCred, NetworkManager, &input.NetworkId)
 	if err != nil {
 		return input, err
 	}
@@ -189,7 +190,7 @@ func (man *SNatGatewayManager) ValidateCreateData(
 	}
 	if len(input.Eip) > 0 || input.EipBw > 0 {
 		if len(input.Eip) > 0 {
-			_eip, err := validators.ValidateModel(userCred, ElasticipManager, &input.Eip)
+			_eip, err := validators.ValidateModel(ctx, userCred, ElasticipManager, &input.Eip)
 			if err != nil {
 				return input, err
 			}
@@ -233,10 +234,10 @@ func (self *SNatGateway) PostCreate(
 
 	err := self.StartNatGatewayCreateTask(ctx, userCred, data.(*jsonutils.JSONDict))
 	if err != nil {
-		self.SetStatus(userCred, api.NAT_STATUS_CREATE_FAILED, err.Error())
+		self.SetStatus(ctx, userCred, api.NAT_STATUS_CREATE_FAILED, err.Error())
 		return
 	}
-	self.SetStatus(userCred, api.NAT_STATUS_ALLOCATE, "start allocate")
+	self.SetStatus(ctx, userCred, api.NAT_STATUS_ALLOCATE, "start allocate")
 }
 
 func (self *SNatGateway) StartNatGatewayCreateTask(ctx context.Context, userCred mcclient.TokenCredential, params *jsonutils.JSONDict) error {
@@ -392,9 +393,17 @@ func (manager *SNatGatewayManager) FetchCustomizeColumns(
 	return rows
 }
 
-func (manager *SNatGatewayManager) SyncNatGateways(ctx context.Context, userCred mcclient.TokenCredential, syncOwnerId mcclient.IIdentityProvider, provider *SCloudprovider, vpc *SVpc, cloudNatGateways []cloudprovider.ICloudNatGateway) ([]SNatGateway, []cloudprovider.ICloudNatGateway, compare.SyncResult) {
-	lockman.LockRawObject(ctx, "natgateways", vpc.Id)
-	defer lockman.ReleaseRawObject(ctx, "natgateways", vpc.Id)
+func (manager *SNatGatewayManager) SyncNatGateways(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	syncOwnerId mcclient.IIdentityProvider,
+	provider *SCloudprovider,
+	vpc *SVpc,
+	cloudNatGateways []cloudprovider.ICloudNatGateway,
+	xor bool,
+) ([]SNatGateway, []cloudprovider.ICloudNatGateway, compare.SyncResult) {
+	lockman.LockRawObject(ctx, manager.Keyword(), vpc.Id)
+	defer lockman.ReleaseRawObject(ctx, manager.Keyword(), vpc.Id)
 
 	localNatGateways := make([]SNatGateway, 0)
 	remoteNatGateways := make([]cloudprovider.ICloudNatGateway, 0)
@@ -425,10 +434,12 @@ func (manager *SNatGatewayManager) SyncNatGateways(ctx context.Context, userCred
 	}
 
 	for i := 0; i < len(commondb); i += 1 {
-		err := commondb[i].SyncWithCloudNatGateway(ctx, userCred, provider, commonext[i])
-		if err != nil {
-			syncResult.UpdateError(err)
-			continue
+		if !xor {
+			err := commondb[i].SyncWithCloudNatGateway(ctx, userCred, provider, commonext[i])
+			if err != nil {
+				syncResult.UpdateError(err)
+				continue
+			}
 		}
 		localNatGateways = append(localNatGateways, commondb[i])
 		remoteNatGateways = append(remoteNatGateways, commonext[i])
@@ -456,7 +467,7 @@ func (self *SNatGateway) syncRemoveCloudNatGateway(ctx context.Context, userCred
 
 	err := self.ValidateDeleteCondition(ctx, nil)
 	if err != nil { // cannot delete
-		return self.SetStatus(userCred, api.NAT_STATUS_UNKNOWN, "sync to delete")
+		return self.SetStatus(ctx, userCred, api.NAT_STATUS_UNKNOWN, "sync to delete")
 	}
 	err = self.purge(ctx, userCred)
 	if err != nil {
@@ -478,8 +489,16 @@ func (self *SNatGateway) ValidateDeleteCondition(ctx context.Context, info jsonu
 
 func (self *SNatGateway) SyncWithCloudNatGateway(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, extNat cloudprovider.ICloudNatGateway) error {
 	diff, err := db.UpdateWithLock(ctx, self, func() error {
+		if options.Options.EnableSyncName {
+			newName, _ := db.GenerateAlterName(self, extNat.GetName())
+			if len(newName) > 0 {
+				self.Name = newName
+			}
+		}
+
 		self.Status = extNat.GetStatus()
 		self.NatSpec = extNat.GetNatSpec()
+		self.NetworkType = extNat.GetNetworkType()
 		self.BandwidthMb = extNat.GetBandwidthMb()
 
 		vpc, err := self.GetVpc()
@@ -515,7 +534,9 @@ func (self *SNatGateway) SyncWithCloudNatGateway(ctx context.Context, userCred m
 		return err
 	}
 
-	syncMetadata(ctx, userCred, self, extNat)
+	if account, _ := provider.GetCloudaccount(); account != nil {
+		syncMetadata(ctx, userCred, self, extNat, account.ReadOnly)
+	}
 	SyncCloudDomain(userCred, self, provider.GetOwnerId())
 
 	db.OpsLog.LogSyncUpdate(self, diff, userCred)
@@ -535,6 +556,7 @@ func (manager *SNatGatewayManager) newFromCloudNatGateway(ctx context.Context, u
 	nat.VpcId = vpc.Id
 	nat.Status = extNat.GetStatus()
 	nat.NatSpec = extNat.GetNatSpec()
+	nat.NetworkType = extNat.GetNetworkType()
 	nat.BandwidthMb = extNat.GetBandwidthMb()
 	if createdAt := extNat.GetCreatedAt(); !createdAt.IsZero() {
 		nat.CreatedAt = extNat.GetCreatedAt()
@@ -581,7 +603,7 @@ func (manager *SNatGatewayManager) newFromCloudNatGateway(ctx context.Context, u
 	}
 
 	SyncCloudDomain(userCred, &nat, provider.GetOwnerId())
-	syncMetadata(ctx, userCred, &nat, extNat)
+	syncMetadata(ctx, userCred, &nat, extNat, false)
 
 	db.OpsLog.LogEvent(&nat, db.ACT_CREATE, nat.GetShortDesc(ctx), userCred)
 	notifyclient.EventNotify(ctx, userCred, notifyclient.SEventNotifyParam{
@@ -621,7 +643,7 @@ func (self *SNatGateway) CustomizeDelete(ctx context.Context, userCred mcclient.
 	if err != nil {
 		return err
 	}
-	self.SetStatus(userCred, api.NAT_STATUS_DELETING, jsonutils.Marshal(input).String())
+	self.SetStatus(ctx, userCred, api.NAT_STATUS_DELETING, jsonutils.Marshal(input).String())
 	return nil
 }
 
@@ -644,8 +666,8 @@ func (self *SNatGateway) GetEips() ([]SElasticip, error) {
 }
 
 func (self *SNatGateway) SyncNatGatewayEips(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, extEips []cloudprovider.ICloudEIP) compare.SyncResult {
-	lockman.LockRawObject(ctx, "elasticip", self.Id)
-	defer lockman.ReleaseRawObject(ctx, "elasticip", self.Id)
+	lockman.LockRawObject(ctx, ElasticipManager.Keyword(), self.Id)
+	defer lockman.ReleaseRawObject(ctx, ElasticipManager.Keyword(), self.Id)
 
 	result := compare.SyncResult{}
 
@@ -672,6 +694,8 @@ func (self *SNatGateway) SyncNatGatewayEips(ctx context.Context, userCred mcclie
 		}
 		result.Delete()
 	}
+
+	result.UpdateCnt = len(commondb)
 
 	for i := 0; i < len(added); i += 1 {
 		region, _ := self.GetRegion()
@@ -725,6 +749,9 @@ func (self *SNatGateway) GetVpc() (*SVpc, error) {
 }
 
 func (self *SNatGateway) GetINatGateway(ctx context.Context) (cloudprovider.ICloudNatGateway, error) {
+	if len(self.ExternalId) == 0 {
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "empty external id")
+	}
 	vpc, err := self.GetVpc()
 	if err != nil {
 		return nil, errors.Wrap(err, "GetVpc")
@@ -750,27 +777,7 @@ func (self *SNatGateway) Delete(ctx context.Context, userCred mcclient.TokenCred
 }
 
 func (self *SNatGateway) RealDelete(ctx context.Context, userCred mcclient.TokenCredential) error {
-	dnats, err := self.GetDTable()
-	if err != nil {
-		return errors.Wrap(err, "fetch dnat table failed")
-	}
-	snats, err := self.GetSTable()
-	if err != nil {
-		return errors.Wrap(err, "fetch snat table failed")
-	}
-	for i := range dnats {
-		err = dnats[i].RealDelete(ctx, userCred)
-		if err != nil {
-			return errors.Wrapf(err, "delete dnat %s failed", dnats[i].GetId())
-		}
-	}
-	for i := range snats {
-		err = snats[i].RealDelete(ctx, userCred)
-		if err != nil {
-			return errors.Wrapf(err, "delete snat %s failed", snats[i].GetId())
-		}
-	}
-	return self.SInfrasResourceBase.Delete(ctx, userCred)
+	return self.purge(ctx, userCred)
 }
 
 type SNatEntryManager struct {
@@ -818,10 +825,11 @@ func (man *SNatEntryManager) ListItemFilter(
 		return nil, errors.Wrap(err, "SNatgatewayResourceBaseManager.ListItemFilter")
 	}
 
-	q, err = managedResourceFilterByAccount(q, query.ManagedResourceListInput, "natgateway_id", func() *sqlchemy.SQuery {
-		natgateways := NatGatewayManager.Query().SubQuery()
-		return natgateways.Query(natgateways.Field("id"))
-	})
+	q, err = managedResourceFilterByAccount(ctx,
+		q, query.ManagedResourceListInput, "natgateway_id", func() *sqlchemy.SQuery {
+			natgateways := NatGatewayManager.Query().SubQuery()
+			return natgateways.Query(natgateways.Field("id"))
+		})
 	if err != nil {
 		return nil, errors.Wrap(err, "managedResourceFilterByAccount")
 	}
@@ -972,7 +980,7 @@ func (self *SNatGateway) StartRenewTask(ctx context.Context, userCred mcclient.T
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, api.NAT_STATUS_RENEWING, "")
+	self.SetStatus(ctx, userCred, api.NAT_STATUS_RENEWING, "")
 	return task.ScheduleRun(nil)
 }
 
@@ -1026,7 +1034,7 @@ func (self *SNatGateway) StartSetAutoRenewTask(ctx context.Context, userCred mcc
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, api.NAT_STATUS_SET_AUTO_RENEW, "")
+	self.SetStatus(ctx, userCred, api.NAT_STATUS_SET_AUTO_RENEW, "")
 	return task.ScheduleRun(nil)
 }
 
@@ -1041,7 +1049,7 @@ func (self *SNatEntry) GetINatGateway(ctx context.Context) (cloudprovider.ICloud
 
 func (self *SNatEntry) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
 	log.Infof("NAT Entry delete do nothing")
-	self.SetStatus(userCred, api.NAT_STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, api.NAT_STATUS_DELETING, "")
 	return nil
 }
 
@@ -1050,7 +1058,7 @@ func (self *SNatEntry) RealDelete(ctx context.Context, userCred mcclient.TokenCr
 	if err != nil {
 		return err
 	}
-	self.SetStatus(userCred, api.NAT_STATUS_DELETED, "real delete")
+	self.SetStatus(ctx, userCred, api.NAT_STATUS_DELETED, "real delete")
 	return nil
 }
 
@@ -1106,16 +1114,34 @@ func (self *SNatGateway) StartRemoteUpdateTask(ctx context.Context, userCred mcc
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, apis.STATUS_UPDATE_TAGS, "StartRemoteUpdateTask")
+	self.SetStatus(ctx, userCred, apis.STATUS_UPDATE_TAGS, "StartRemoteUpdateTask")
 	return task.ScheduleRun(nil)
 }
 
 func (self *SNatGateway) OnMetadataUpdated(ctx context.Context, userCred mcclient.TokenCredential) {
-	if len(self.ExternalId) == 0 {
+	if len(self.ExternalId) == 0 || options.Options.KeepTagLocalization {
 		return
 	}
-	err := self.StartRemoteUpdateTask(ctx, userCred, true, "")
+	vpc, err := self.GetVpc()
+	if err != nil {
+		return
+	}
+	if account := vpc.GetCloudaccount(); account != nil && account.ReadOnly {
+		return
+	}
+	err = self.StartRemoteUpdateTask(ctx, userCred, true, "")
 	if err != nil {
 		log.Errorf("StartRemoteUpdateTask fail: %s", err)
 	}
+}
+
+func (nat *SNatGateway) GetShortDesc(ctx context.Context) *jsonutils.JSONDict {
+	desc := nat.SStatusInfrasResourceBase.GetShortDesc(ctx)
+	region, _ := nat.GetRegion()
+	provider := nat.GetCloudprovider()
+	info := MakeCloudProviderInfo(region, nil, provider)
+	desc.Set("bandwidth_mb", jsonutils.NewInt(int64(nat.BandwidthMb)))
+	desc.Set("nat_spec", jsonutils.NewString(nat.NatSpec))
+	desc.Update(jsonutils.Marshal(&info))
+	return desc
 }

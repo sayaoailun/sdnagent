@@ -18,10 +18,12 @@ import (
 	"context"
 	"time"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
@@ -31,16 +33,16 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
+	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
 type SCDNDomainManager struct {
-	db.SEnabledStatusInfrasResourceBaseManager
+	db.SVirtualResourceBaseManager
 	db.SExternalizedResourceBaseManager
+	db.SEnabledResourceBaseManager
 	SManagedResourceBaseManager
 	SDeletePreventableResourceBaseManager
 }
@@ -49,7 +51,7 @@ var CDNDomainManager *SCDNDomainManager
 
 func init() {
 	CDNDomainManager = &SCDNDomainManager{
-		SEnabledStatusInfrasResourceBaseManager: db.NewEnabledStatusInfrasResourceBaseManager(
+		SVirtualResourceBaseManager: db.NewVirtualResourceBaseManager(
 			SCDNDomain{},
 			"cdn_domains_tbl",
 			"cdn_domain",
@@ -60,7 +62,8 @@ func init() {
 }
 
 type SCDNDomain struct {
-	db.SEnabledStatusInfrasResourceBase
+	db.SVirtualResourceBase
+	db.SEnabledResourceBase
 	db.SExternalizedResourceBase
 
 	SDeletePreventableResourceBase
@@ -74,6 +77,20 @@ type SCDNDomain struct {
 	ServiceType string `list:"user" width:"32" create:"domain_required"`
 	// 加速区域
 	Area string `list:"user" width:"32" update:"domain" create:"domain_required"`
+	// 是否忽略参数
+	CacheKeys *cloudprovider.SCDNCacheKeys `list:"user" create:"domain_optional"`
+	// 是否分片回源
+	RangeOriginPull *cloudprovider.SCDNRangeOriginPull `list:"user" create:"domain_optional"`
+	// 缓存配置
+	Cache *cloudprovider.SCDNCache `list:"user" create:"domain_optional"`
+	// https配置
+	HTTPS *cloudprovider.SCDNHttps `list:"user" create:"domain_optional"`
+	// 强制跳转
+	ForceRedirect *cloudprovider.SCDNForceRedirect `list:"user" create:"domain_optional"`
+	// 防盗链配置
+	Referer *cloudprovider.SCDNReferer `list:"user" create:"domain_optional"`
+	// 浏览器缓存配置
+	MaxAge *cloudprovider.SCDNMaxAge `list:"user" create:"domain_optional"`
 }
 
 func (manager *SCDNDomainManager) GetContextManagers() [][]db.IModelManager {
@@ -91,12 +108,12 @@ func (manager *SCDNDomainManager) FetchCustomizeColumns(
 	isList bool,
 ) []api.CDNDomainDetails {
 	rows := make([]api.CDNDomainDetails, len(objs))
-	stdRows := manager.SEnabledStatusInfrasResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+	virtRows := manager.SVirtualResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	managerRows := manager.SManagedResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	for i := range rows {
 		rows[i] = api.CDNDomainDetails{
-			EnabledStatusInfrasResourceBaseDetails: stdRows[i],
-			ManagedResourceInfo:                    managerRows[i],
+			VirtualResourceDetails: virtRows[i],
+			ManagedResourceInfo:    managerRows[i],
 		}
 	}
 	return rows
@@ -112,7 +129,7 @@ func (self *SCloudprovider) GetCDNDomains() ([]SCDNDomain, error) {
 	return domains, nil
 }
 
-func (self *SCloudprovider) SyncCDNDomains(ctx context.Context, userCred mcclient.TokenCredential, exts []cloudprovider.ICloudCDNDomain) compare.SyncResult {
+func (self *SCloudprovider) SyncCDNDomains(ctx context.Context, userCred mcclient.TokenCredential, exts []cloudprovider.ICloudCDNDomain, xor bool) compare.SyncResult {
 	lockman.LockRawObject(ctx, CDNDomainManager.Keyword(), self.Id)
 	defer lockman.ReleaseRawObject(ctx, CDNDomainManager.Keyword(), self.Id)
 
@@ -143,13 +160,15 @@ func (self *SCloudprovider) SyncCDNDomains(ctx context.Context, userCred mcclien
 		}
 		result.Delete()
 	}
-	for i := 0; i < len(commondb); i += 1 {
-		err = commondb[i].SyncWithCloudCDNDomain(ctx, userCred, commonext[i])
-		if err != nil {
-			result.UpdateError(err)
-			continue
+	if !xor {
+		for i := 0; i < len(commondb); i += 1 {
+			err = commondb[i].SyncWithCloudCDNDomain(ctx, userCred, commonext[i])
+			if err != nil {
+				result.UpdateError(err)
+				continue
+			}
+			result.Update()
 		}
-		result.Update()
 	}
 	for i := 0; i < len(added); i += 1 {
 		_, err := self.newFromCloudCDNDomain(ctx, userCred, added[i])
@@ -161,6 +180,24 @@ func (self *SCloudprovider) SyncCDNDomains(ctx context.Context, userCred mcclien
 	}
 
 	return result
+}
+
+// 启用资源
+func (self *SCDNDomain) PerformEnable(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformEnableInput) (jsonutils.JSONObject, error) {
+	err := db.EnabledPerformEnable(self, ctx, userCred, true)
+	if err != nil {
+		return nil, errors.Wrap(err, "EnabledPerformEnable")
+	}
+	return nil, nil
+}
+
+// 禁用资源
+func (self *SCDNDomain) PerformDisable(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformDisableInput) (jsonutils.JSONObject, error) {
+	err := db.EnabledPerformEnable(self, ctx, userCred, false)
+	if err != nil {
+		return nil, errors.Wrap(err, "EnabledPerformEnable")
+	}
+	return nil, nil
 }
 
 func (self *SCDNDomain) syncRemoveCloudCDNDomain(ctx context.Context, userCred mcclient.TokenCredential) error {
@@ -189,7 +226,7 @@ func (self *SCDNDomain) ValidateDeleteCondition(ctx context.Context, info jsonut
 	if self.DisableDelete.IsTrue() {
 		return httperrors.NewInvalidStatusError("CDN is locked, cannot delete")
 	}
-	return self.SEnabledStatusInfrasResourceBase.ValidateDeleteCondition(ctx, nil)
+	return self.SVirtualResourceBase.ValidateDeleteCondition(ctx, nil)
 }
 
 func (self *SCDNDomain) GetICloudCDNDomain(ctx context.Context) (cloudprovider.ICloudCDNDomain, error) {
@@ -206,12 +243,36 @@ func (self *SCDNDomain) GetICloudCDNDomain(ctx context.Context) (cloudprovider.I
 
 func (self *SCDNDomain) SyncWithCloudCDNDomain(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudCDNDomain) error {
 	diff, err := db.UpdateWithLock(ctx, self, func() error {
-		self.Name = ext.GetName()
+		if options.Options.EnableSyncName {
+			self.Name = ext.GetName()
+		}
 		self.Status = ext.GetStatus()
 		self.Area = ext.GetArea()
 		self.ServiceType = ext.GetServiceType()
 		self.Cname = ext.GetCname()
 		self.Origins = ext.GetOrigins()
+		cacheKeys, err := ext.GetCacheKeys()
+		if err == nil {
+			self.CacheKeys = cacheKeys
+		}
+		if rangeOrigin, err := ext.GetRangeOriginPull(); err == nil {
+			self.RangeOriginPull = rangeOrigin
+		}
+		if cache, err := ext.GetCache(); err == nil {
+			self.Cache = cache
+		}
+		if https, err := ext.GetHTTPS(); err == nil {
+			self.HTTPS = https
+		}
+		if fr, err := ext.GetForceRedirect(); err == nil {
+			self.ForceRedirect = fr
+		}
+		if referer, err := ext.GetReferer(); err == nil {
+			self.Referer = referer
+		}
+		if maxAge, err := ext.GetMaxAge(); err == nil {
+			self.MaxAge = maxAge
+		}
 		return nil
 	})
 	if err != nil {
@@ -224,11 +285,13 @@ func (self *SCDNDomain) SyncWithCloudCDNDomain(ctx context.Context, userCred mcc
 			Action: notifyclient.ActionSyncUpdate,
 		})
 	}
-	syncMetadata(ctx, userCred, self, ext)
+
+	if account := self.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, self, ext, account.ReadOnly)
+	}
 
 	if provider := self.GetCloudprovider(); provider != nil {
-		SyncCloudDomain(userCred, self, provider.GetOwnerId())
-		self.SyncShareState(ctx, userCred, provider.getAccountShareInfo())
+		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider)
 	}
 
 	return nil
@@ -246,16 +309,21 @@ func (self *SCloudprovider) newFromCloudCDNDomain(ctx context.Context, userCred 
 	domain.ServiceType = ext.GetServiceType()
 	domain.Cname = ext.GetCname()
 	domain.Origins = ext.GetOrigins()
+	domain.CacheKeys, _ = ext.GetCacheKeys()
+	domain.RangeOriginPull, _ = ext.GetRangeOriginPull()
+	domain.Cache, _ = ext.GetCache()
+	domain.HTTPS, _ = ext.GetHTTPS()
+	domain.ForceRedirect, _ = ext.GetForceRedirect()
+	domain.Referer, _ = ext.GetReferer()
+	domain.MaxAge, _ = ext.GetMaxAge()
 
 	err := CDNDomainManager.TableSpec().Insert(ctx, &domain)
 	if err != nil {
 		return nil, err
 	}
 
-	syncMetadata(ctx, userCred, &domain, ext)
-	SyncCloudDomain(userCred, &domain, self.GetOwnerId())
-
-	domain.SyncShareState(ctx, userCred, self.getAccountShareInfo())
+	syncVirtualResourceMetadata(ctx, userCred, &domain, ext, false)
+	SyncCloudProject(ctx, userCred, &domain, self.GetOwnerId(), ext, self)
 
 	db.OpsLog.LogEvent(&domain, db.ACT_CREATE, domain.GetShortDesc(ctx), userCred)
 	notifyclient.EventNotify(ctx, userCred, notifyclient.SEventNotifyParam{
@@ -276,7 +344,7 @@ func (manager *SCDNDomainManager) ValidateCreateData(
 	if len(input.CloudproviderId) == 0 {
 		return input, httperrors.NewMissingParameterError("cloudprovider_id")
 	}
-	_provider, err := validators.ValidateModel(userCred, CloudproviderManager, &input.CloudproviderId)
+	_provider, err := validators.ValidateModel(ctx, userCred, CloudproviderManager, &input.CloudproviderId)
 	if err != nil {
 		return input, err
 	}
@@ -297,7 +365,7 @@ func (manager *SCDNDomainManager) ValidateCreateData(
 }
 
 func (self *SCDNDomain) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
-	self.SEnabledStatusInfrasResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
+	self.SVirtualResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
 	self.StartCdnCreateTask(ctx, userCred, "")
 }
 
@@ -307,7 +375,7 @@ func (self *SCDNDomain) StartCdnCreateTask(ctx context.Context, userCred mcclien
 	if err != nil {
 		return errors.Wrapf(err, "NewTask")
 	}
-	self.SetStatus(userCred, apis.STATUS_CREATING, "")
+	self.SetStatus(ctx, userCred, apis.STATUS_CREATING, "")
 	return task.ScheduleRun(nil)
 }
 
@@ -324,19 +392,19 @@ func (self *SCDNDomain) StartDeleteTask(ctx context.Context, userCred mcclient.T
 		return task.ScheduleRun(nil)
 	}()
 	if err != nil {
-		self.SetStatus(userCred, api.CDN_DOMAIN_STATUS_DELETE_FAILED, err.Error())
+		self.SetStatus(ctx, userCred, api.CDN_DOMAIN_STATUS_DELETE_FAILED, err.Error())
 		return nil
 	}
 	return nil
 }
 
 func (self *SCDNDomain) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
-	self.SetStatus(userCred, api.CDN_DOMAIN_STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, api.CDN_DOMAIN_STATUS_DELETING, "")
 	return nil
 }
 
 func (self *SCDNDomain) RealDelete(ctx context.Context, userCred mcclient.TokenCredential) error {
-	return self.SEnabledStatusInfrasResourceBase.Delete(ctx, userCred)
+	return self.SVirtualResourceBase.Delete(ctx, userCred)
 }
 
 // 列出CDN域名
@@ -348,9 +416,14 @@ func (manager *SCDNDomainManager) ListItemFilter(
 ) (*sqlchemy.SQuery, error) {
 	var err error
 
-	q, err = manager.SEnabledStatusInfrasResourceBaseManager.ListItemFilter(ctx, q, userCred, query.EnabledStatusInfrasResourceBaseListInput)
+	q, err = manager.SVirtualResourceBaseManager.ListItemFilter(ctx, q, userCred, query.VirtualResourceListInput)
 	if err != nil {
-		return nil, errors.Wrap(err, "SEnabledStatusInfrasResourceBaseManager.ListItemFilter")
+		return nil, errors.Wrap(err, "SVirtualResourceBaseManager.ListItemFilter")
+	}
+
+	q, err = manager.SEnabledResourceBaseManager.ListItemFilter(ctx, q, userCred, query.EnabledResourceBaseListInput)
+	if err != nil {
+		return nil, errors.Wrap(err, "SEnabledResourceBaseManager.ListItemFilter")
 	}
 
 	q, err = manager.SExternalizedResourceBaseManager.ListItemFilter(ctx, q, userCred, query.ExternalizedResourceBaseListInput)
@@ -370,7 +443,7 @@ func (manager *SCDNDomainManager) QueryDistinctExtraField(q *sqlchemy.SQuery, fi
 	switch field {
 	default:
 		var err error
-		q, err = manager.SEnabledStatusInfrasResourceBaseManager.QueryDistinctExtraField(q, field)
+		q, err = manager.SVirtualResourceBaseManager.QueryDistinctExtraField(q, field)
 		if err == nil {
 			return q, nil
 		}
@@ -389,9 +462,9 @@ func (manager *SCDNDomainManager) OrderByExtraFields(
 	userCred mcclient.TokenCredential,
 	query api.CDNDomainListInput,
 ) (*sqlchemy.SQuery, error) {
-	q, err := manager.SEnabledStatusInfrasResourceBaseManager.OrderByExtraFields(ctx, q, userCred, query.EnabledStatusInfrasResourceBaseListInput)
+	q, err := manager.SVirtualResourceBaseManager.OrderByExtraFields(ctx, q, userCred, query.VirtualResourceListInput)
 	if err != nil {
-		return nil, errors.Wrap(err, "SEnabledStatusInfrasResourceBaseManager.OrderByExtraFields")
+		return nil, errors.Wrap(err, "SVirtualResourceBaseManager.OrderByExtraFields")
 	}
 	q, err = manager.SManagedResourceBaseManager.OrderByExtraFields(ctx, q, userCred, query.ManagedResourceListInput)
 	if err != nil {
@@ -402,7 +475,7 @@ func (manager *SCDNDomainManager) OrderByExtraFields(
 
 func (manager *SCDNDomainManager) totalCount(
 	ownerId mcclient.IIdentityProvider,
-	scope rbacutils.TRbacScope,
+	scope rbacscope.TRbacScope,
 	rangeObjs []db.IStandaloneModel,
 	providers []string,
 	brands []string,
@@ -410,7 +483,7 @@ func (manager *SCDNDomainManager) totalCount(
 ) int {
 	q := CDNDomainManager.Query()
 
-	if scope != rbacutils.ScopeSystem && ownerId != nil {
+	if scope != rbacscope.ScopeSystem && ownerId != nil {
 		q = q.Equals("domain_id", ownerId.GetProjectDomainId())
 	}
 	q = CloudProviderFilter(q, q.Field("manager_id"), providers, brands, cloudEnv)
@@ -426,9 +499,9 @@ func (manager *SCDNDomainManager) ListItemExportKeys(ctx context.Context,
 	userCred mcclient.TokenCredential,
 	keys stringutils2.SSortedStrings,
 ) (*sqlchemy.SQuery, error) {
-	q, err := manager.SEnabledStatusInfrasResourceBaseManager.ListItemExportKeys(ctx, q, userCred, keys)
+	q, err := manager.SVirtualResourceBaseManager.ListItemExportKeys(ctx, q, userCred, keys)
 	if err != nil {
-		return nil, errors.Wrap(err, "SEnabledStatusInfrasResourceBaseManager.ListItemExportKeys")
+		return nil, errors.Wrap(err, "SVirtualResourceBaseManager.ListItemExportKeys")
 	}
 	if keys.ContainsAny(manager.SManagedResourceBaseManager.GetExportKeys()...) {
 		q, err = manager.SManagedResourceBaseManager.ListItemExportKeys(ctx, q, userCred, keys)
@@ -473,12 +546,12 @@ func (self *SCDNDomain) StartRemoteUpdateTask(ctx context.Context, userCred mccl
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, apis.STATUS_UPDATE_TAGS, "StartRemoteUpdateTask")
+	self.SetStatus(ctx, userCred, apis.STATUS_UPDATE_TAGS, "StartRemoteUpdateTask")
 	return task.ScheduleRun(nil)
 }
 
 func (self *SCDNDomain) OnMetadataUpdated(ctx context.Context, userCred mcclient.TokenCredential) {
-	if len(self.ExternalId) == 0 {
+	if len(self.ExternalId) == 0 || options.Options.KeepTagLocalization {
 		return
 	}
 	err := self.StartRemoteUpdateTask(ctx, userCred, true, "")

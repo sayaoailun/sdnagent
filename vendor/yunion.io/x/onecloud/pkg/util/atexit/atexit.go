@@ -15,10 +15,16 @@
 package atexit
 
 import (
+	"context"
 	"os"
 	"runtime/debug"
 	"sort"
 	"sync"
+
+	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/version"
+
+	"yunion.io/x/onecloud/pkg/mcclient/modules/yunionconf"
 )
 
 // ExitHandlerFunc is the type of handler func
@@ -26,7 +32,7 @@ type ExitHandlerFunc func(ExitHandler)
 
 // ExitHandler defines the spec of handler
 //
-// Reason and Func are mandatory and must not be empty or nil
+// # Reason and Func are mandatory and must not be empty or nil
 //
 // Handlers with smaller Prio will be executed earlier than those with bigger
 // Prio at exit time.  Handler func will receive a copy of the ExitHandler
@@ -95,6 +101,7 @@ func Handle() {
 						if val != nil {
 							print("panic ", val, "\n")
 							debug.PrintStack()
+							yunionconf.BugReport.SendBugReport(context.Background(), version.GetShortString(), string(debug.Stack()), errors.Errorf("%s", val))
 						}
 					}()
 					eh.Func(eh)

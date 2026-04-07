@@ -15,11 +15,11 @@
 package models
 
 import (
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 )
 
 func RangeObjectsFilter(q *sqlchemy.SQuery, rangeObjs []db.IStandaloneModel, regionField sqlchemy.IQueryField, zoneField sqlchemy.IQueryField, managerField sqlchemy.IQueryField, hostField sqlchemy.IQueryField, storageField sqlchemy.IQueryField) *sqlchemy.SQuery {
@@ -53,15 +53,15 @@ func rangeObjFilter(q *sqlchemy.SQuery, rangeObj db.IStandaloneModel, regionFiel
 	case "wire":
 		wire := rangeObj.(*SWire)
 		if hostField != nil {
-			hostwires := HostwireManager.Query("host_id", "wire_id").SubQuery()
-			q = q.Join(hostwires, sqlchemy.Equals(hostwires.Field("host_id"), hostField))
-			q = q.Filter(sqlchemy.Equals(hostwires.Field("wire_id"), wire.Id))
+			netifs := NetInterfaceManager.Query("baremetal_id", "wire_id").SubQuery()
+			q = q.Join(netifs, sqlchemy.Equals(netifs.Field("baremetal_id"), hostField))
+			q = q.Filter(sqlchemy.Equals(netifs.Field("wire_id"), wire.Id))
 		} else if storageField != nil {
-			hostwires := HostwireManager.Query("host_id", "wire_id").SubQuery()
+			netifs := NetInterfaceManager.Query("baremetal_id", "wire_id").SubQuery()
 			hoststorages := HoststorageManager.Query("host_id", "storage_id").SubQuery()
 			q = q.Join(hoststorages, sqlchemy.Equals(hoststorages.Field("storage_id"), storageField))
-			q = q.Join(hostwires, sqlchemy.Equals(hoststorages.Field("host_id"), hostwires.Field("host_id")))
-			q = q.Filter(sqlchemy.Equals(hostwires.Field("wire_id"), wire.Id))
+			q = q.Join(netifs, sqlchemy.Equals(hoststorages.Field("host_id"), netifs.Field("baremetal_id")))
+			q = q.Filter(sqlchemy.Equals(netifs.Field("wire_id"), wire.Id))
 		} else if zoneField != nil {
 			q = q.Filter(sqlchemy.Equals(zoneField, wire.ZoneId))
 		} else if regionField != nil {
@@ -160,13 +160,13 @@ func rangeObjFilter(q *sqlchemy.SQuery, rangeObj db.IStandaloneModel, regionFiel
 	return q
 }
 
-func scopeOwnerIdFilter(q *sqlchemy.SQuery, scope rbacutils.TRbacScope, ownerId mcclient.IIdentityProvider) *sqlchemy.SQuery {
+func scopeOwnerIdFilter(q *sqlchemy.SQuery, scope rbacscope.TRbacScope, ownerId mcclient.IIdentityProvider) *sqlchemy.SQuery {
 	switch scope {
-	case rbacutils.ScopeSystem:
+	case rbacscope.ScopeSystem:
 		// do nothing
-	case rbacutils.ScopeDomain:
+	case rbacscope.ScopeDomain:
 		q = q.Equals("domain_id", ownerId.GetProjectDomainId())
-	case rbacutils.ScopeProject:
+	case rbacscope.ScopeProject:
 		q = q.Equals("tenant_id", ownerId.GetProjectId())
 	}
 	return q

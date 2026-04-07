@@ -24,6 +24,7 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
@@ -31,7 +32,6 @@ import (
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	"yunion.io/x/onecloud/pkg/mcclient/informer"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/identity"
-	"yunion.io/x/onecloud/pkg/util/httputils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -61,7 +61,7 @@ var RoleCacheManager *SRoleCacheManager
 
 func init() {
 	RoleCacheManager = &SRoleCacheManager{
-		NewKeystoneCacheObjectManager(SRole{}, "roles_cache_tbl", "role", "roles"), false}
+		NewKeystoneCacheObjectManager(SRole{}, "roles_cache_tbl", "role_cache", "role_caches"), false}
 	// log.Debugf("initialize role cache manager %s", RoleCacheManager.KeywordPlural())
 	RoleCacheManager.SetVirtualObject(RoleCacheManager)
 
@@ -122,6 +122,7 @@ func (manager *SRoleCacheManager) FetchRoleFromKeystone(ctx context.Context, idS
 	query := jsonutils.NewDict()
 	query.Set("scope", jsonutils.NewString("system"))
 	query.Set("system", jsonutils.JSONTrue)
+	query.Set("pending_delete", jsonutils.NewString("all"))
 
 	s := auth.GetAdminSession(ctx, consts.GetRegion())
 	role, err := modules.RolesV3.GetById(s, idStr, query)

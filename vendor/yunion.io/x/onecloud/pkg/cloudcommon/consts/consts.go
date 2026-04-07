@@ -25,7 +25,11 @@ var (
 
 	globalRegion = ""
 
+	globalZone = ""
+
 	globalServiceType = ""
+
+	globalServiceName = ""
 
 	tenantCacheExpireSeconds = 900
 
@@ -53,6 +57,14 @@ func GetRegion() string {
 	return globalRegion
 }
 
+func SetZone(zone string) {
+	globalZone = zone
+}
+
+func GetZone() string {
+	return globalZone
+}
+
 func SetDataResp(enable bool) {
 	enableDataResp = enable
 }
@@ -67,6 +79,14 @@ func SetServiceType(srvType string) {
 
 func GetServiceType() string {
 	return globalServiceType
+}
+
+func SetServiceName(srvName string) {
+	globalServiceName = srvName
+}
+
+func GetServiceName() string {
+	return globalServiceName
 }
 
 func SetTenantCacheExpireSeconds(sec int) {

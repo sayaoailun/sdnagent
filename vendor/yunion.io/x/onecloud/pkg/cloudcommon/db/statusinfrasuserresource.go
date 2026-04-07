@@ -20,13 +20,13 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/util/reflectutils"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -47,8 +47,8 @@ func NewStatusDomainLevelUserResourceBaseManager(dt interface{}, tableName strin
 	}
 }
 
-func (model *SStatusDomainLevelUserResourceBase) SetStatus(userCred mcclient.TokenCredential, status string, reason string) error {
-	return statusBaseSetStatus(model, userCred, status, reason)
+func (model *SStatusDomainLevelUserResourceBase) SetStatus(ctx context.Context, userCred mcclient.TokenCredential, status string, reason string) error {
+	return statusBaseSetStatus(ctx, model, userCred, status, reason)
 }
 
 func (manager *SStatusDomainLevelUserResourceBaseManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input apis.StatusDomainLevelUserResourceCreateInput) (apis.StatusDomainLevelUserResourceCreateInput, error) {
@@ -60,12 +60,12 @@ func (manager *SStatusDomainLevelUserResourceBaseManager) ValidateCreateData(ctx
 	return input, nil
 }
 
-func (manager *SStatusDomainLevelUserResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery, owner mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
+func (manager *SStatusDomainLevelUserResourceBaseManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if owner != nil {
 		switch scope {
-		case rbacutils.ScopeProject, rbacutils.ScopeUser:
+		case rbacscope.ScopeProject, rbacscope.ScopeUser:
 			return q.Equals("owner_id", owner.GetUserId())
-		case rbacutils.ScopeDomain:
+		case rbacscope.ScopeDomain:
 			sq := UserCacheManager.Query("id").Equals("domain_id", owner.GetProjectDomainId())
 			q = q.Filter(
 				sqlchemy.OR(

@@ -18,20 +18,22 @@ import (
 	"context"
 	"database/sql"
 	"strings"
+	"time"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/tristate"
 	"yunion.io/x/pkg/util/compare"
-	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
+	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
@@ -51,6 +53,7 @@ func (manager *SGuestManager) FetchCustomizeColumns(
 	encRows := manager.SEncryptedResourceManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	guestIds := make([]string, len(objs))
 	guests := make([]SGuest, len(objs))
+	backupHostIds := make([]string, len(objs))
 	for i := range objs {
 		rows[i] = api.ServerDetails{
 			VirtualResourceDetails: virtRows[i],
@@ -60,6 +63,7 @@ func (manager *SGuestManager) FetchCustomizeColumns(
 		}
 		guest := objs[i].(*SGuest)
 		guestIds[i] = guest.GetId()
+		backupHostIds[i] = guest.BackupHostId
 		guests[i] = *guest
 	}
 
@@ -78,7 +82,7 @@ func (manager *SGuestManager) FetchCustomizeColumns(
 			}
 		}
 	}
-	if len(fields) == 0 || fields.Contains("ips") {
+	/*if len(fields) == 0 || fields.Contains("ips") {
 		gips := fetchGuestIPs(guestIds, tristate.False)
 		if gips != nil {
 			for i := range rows {
@@ -87,7 +91,7 @@ func (manager *SGuestManager) FetchCustomizeColumns(
 				}
 			}
 		}
-	}
+	}*/
 	if len(fields) == 0 || fields.Contains("vip") {
 		gvips := fetchGuestVips(guestIds)
 		if gvips != nil {
@@ -108,26 +112,49 @@ func (manager *SGuestManager) FetchCustomizeColumns(
 			}
 		}
 	}
-	if len(fields) == 0 || fields.Contains("macs") {
-		gMacs := fetchGuestMacs(guestIds, tristate.False)
-		if gMacs != nil {
-			for i := range rows {
-				if gMac, ok := gMacs[guestIds[i]]; ok {
-					rows[i].Macs = strings.Join(gMac, ",")
-				}
-			}
-		}
-	}
-	if len(fields) == 0 || fields.Contains("nics") {
+
+	if len(fields) == 0 || fields.Contains("ips") || fields.Contains("macs") || fields.Contains("nics") || fields.Contains("subips") {
 		nicsMap := fetchGuestNICs(ctx, guestIds, tristate.False)
 		if nicsMap != nil {
 			for i := range rows {
 				if nics, ok := nicsMap[guestIds[i]]; ok {
-					rows[i].Nics = nics
+					if len(fields) == 0 || fields.Contains("nics") {
+						rows[i].Nics = nics
+					}
+					if len(fields) == 0 || fields.Contains("macs") {
+						macs := make([]string, 0, len(nics))
+						for _, nic := range nics {
+							macs = append(macs, nic.Mac)
+						}
+						rows[i].Macs = strings.Join(macs, ",")
+					}
+					if len(fields) == 0 || fields.Contains("ips") {
+						ips := make([]string, 0, len(nics))
+						for _, nic := range nics {
+							if len(nic.IpAddr) > 0 {
+								ips = append(ips, nic.IpAddr)
+							}
+							if len(nic.Ip6Addr) > 0 {
+								ips = append(ips, nic.Ip6Addr)
+							}
+						}
+						rows[i].IPs = strings.Join(ips, ",")
+					}
+					if len(fields) == 0 || fields.Contains("subips") {
+						subips := make([]string, 0)
+						for _, nic := range nics {
+							if len(nic.SubIps) > 0 {
+								ips := strings.Split(nic.SubIps, ",")
+								subips = append(subips, ips...)
+							}
+						}
+						rows[i].SubIPs = subips
+					}
 				}
 			}
 		}
 	}
+
 	if len(fields) == 0 || fields.Contains("vpc") || fields.Contains("vpc_id") {
 		gvpcs := fetchGuestVpcs(guestIds)
 		if gvpcs != nil {
@@ -209,11 +236,14 @@ func (manager *SGuestManager) FetchCustomizeColumns(
 				}
 			}
 		}
-		instanceTypes := fetchGuestGpuInstanceTypes(guestIds)
-		if len(instanceTypes) > 0 {
+		info, _ := fetchGuestGpuInstanceTypes(guestIds)
+		if len(info) > 0 {
 			for i := range rows {
-				if utils.IsInStringArray(guests[i].InstanceType, instanceTypes) {
+				gpu, ok := info[guests[i].InstanceType]
+				if ok {
 					rows[i].IsGpu = true
+					rows[i].GpuModel = gpu.Model
+					rows[i].GpuCount = gpu.Amount
 				}
 			}
 		}
@@ -222,12 +252,29 @@ func (manager *SGuestManager) FetchCustomizeColumns(
 		gcds := fetchGuestCdroms(guestIds)
 		if gcds != nil {
 			for i := range rows {
-				if gcd, ok := gcds[guestIds[i]]; ok {
-					rows[i].Cdrom = gcd.GetDetails()
+				for _, gcd := range gcds[guestIds[i]] {
+					if details := gcd.GetDetails(); len(details) > 0 {
+						t := api.Cdrom{Ordinal: gcd.Ordinal, Detail: details, BootIndex: gcd.BootIndex, Name: gcd.Name}
+						rows[i].Cdrom = append(rows[i].Cdrom, t)
+					}
 				}
 			}
 		}
 	}
+	if len(fields) == 0 || fields.Contains("floppy") {
+		gfloppys := fetchGuestFloppys(guestIds)
+		if gfloppys != nil {
+			for i := range rows {
+				for _, gfl := range gfloppys[guestIds[i]] {
+					if details := gfl.GetDetails(); len(details) > 0 {
+						t := api.Floppy{Ordinal: gfl.Ordinal, Detail: details}
+						rows[i].Floppy = append(rows[i].Floppy, t)
+					}
+				}
+			}
+		}
+	}
+
 	if len(fields) == 0 || fields.Contains("scaling_group") {
 		sggs := fetchScalingGroupGuest(guestIds...)
 		if sggs != nil && len(sggs) != 0 {
@@ -240,8 +287,76 @@ func (manager *SGuestManager) FetchCustomizeColumns(
 		}
 	}
 
+	if len(fields) == 0 || fields.Contains("backup_host_name") || fields.Contains("backup_host_status") && len(backupHostIds) > 0 {
+		backups, _ := fetchGuestBackupInfo(backupHostIds)
+		meta := []db.SMetadata{}
+		db.Metadata.Query().In("obj_id", guestIds).Equals("obj_type", manager.Keyword()).Equals("key", api.MIRROR_JOB).All(&meta)
+		syncStatus := map[string]string{}
+		for i := range meta {
+			v := meta[i]
+			syncStatus[v.ObjId] = v.Value
+		}
+		if len(backups) > 0 || len(syncStatus) > 0 {
+			for i := range rows {
+				rows[i].BackupInfo, _ = backups[backupHostIds[i]]
+				rows[i].BackupGuestSyncStatus, _ = syncStatus[guestIds[i]]
+			}
+		}
+	}
+
+	if len(fields) == 0 || fields.Contains("container") {
+		containers, _ := fetchContainers(guestIds)
+		if len(containers) > 0 {
+			for i := range rows {
+				rows[i].Containers, _ = containers[guestIds[i]]
+			}
+		}
+	}
+
 	for i := range rows {
-		rows[i] = objs[i].(*SGuest).moreExtraInfo(ctx, rows[i], userCred, query, fields, isList)
+		if len(fields) == 0 || fields.Contains("auto_delete_at") {
+			if guests[i].PendingDeleted {
+				pendingDeletedAt := guests[i].PendingDeletedAt.Add(time.Second * time.Duration(options.Options.PendingDeleteExpireSeconds))
+				rows[i].AutoDeleteAt = pendingDeletedAt
+			}
+		}
+		if len(fields) == 0 || fields.Contains("can_recycle") {
+			if guests[i].BillingType == billing_api.BILLING_TYPE_PREPAID && !guests[i].ExpiredAt.Before(time.Now()) && len(rows[i].ManagerId) > 0 {
+				rows[i].CanRecycle = true
+			}
+		}
+
+		rows[i].IsPrepaidRecycle = (rows[i].HostResourceType == api.HostResourceTypePrepaidRecycle && rows[i].HostBillingType == billing_api.BILLING_TYPE_PREPAID)
+
+		drv, _ := GetDriver(guests[i].Hypervisor, rows[i].Provider)
+		if drv != nil {
+			rows[i].CdromSupport, _ = drv.IsSupportCdrom(&guests[i])
+			rows[i].FloppySupport, _ = drv.IsSupportFloppy(&guests[i])
+			rows[i].MonitorUrl = drv.FetchMonitorUrl(ctx, &guests[i])
+		}
+
+		if len(guests[i].HostId) == 0 && guests[i].Status == api.VM_SCHEDULE_FAILED {
+			rows[i].Brand = "Unknown"
+			rows[i].Provider = "Unknown"
+		}
+
+		if !isList {
+			rows[i].Networks = guests[i].getNetworksDetails()
+			rows[i].VirtualIps = strings.Join(guests[i].getVirtualIPs(), ",")
+			rows[i].SecurityRules = guests[i].getSecurityGroupsRules()
+
+			osName := guests[i].GetOS()
+			if len(osName) > 0 {
+				rows[i].OsName = osName
+				if len(guests[i].OsType) == 0 {
+					rows[i].OsType = osName
+				}
+			}
+
+			if userCred.HasSystemAdminPrivilege() {
+				rows[i].AdminSecurityRules = guests[i].getAdminSecurityRules()
+			}
+		}
 	}
 
 	return rows
@@ -279,7 +394,9 @@ func fetchGuestDisksInfo(guestIds []string) map[string][]api.GuestDiskInfo {
 		guestdisks.Field("bps"),
 		disks.Field("template_id").Label("image_id"),
 		guestdisks.Field("guest_id"),
+		guestdisks.Field("boot_index"),
 		disks.Field("storage_id"),
+		disks.Field("preallocation"),
 	)
 	q = q.Join(guestdisks, sqlchemy.Equals(guestdisks.Field("disk_id"), disks.Field("id")))
 	q = q.Join(storages, sqlchemy.Equals(disks.Field("storage_id"), storages.Field("id")))
@@ -416,39 +533,15 @@ func fetchGuestVipEips(guestIds []string) map[string][]string {
 	return ret
 }
 
-func fetchGuestMacs(guestIds []string, virtual tristate.TriState) map[string][]string {
-	guestnetworks := GuestnetworkManager.Query().SubQuery()
-	q := guestnetworks.Query(guestnetworks.Field("guest_id"), guestnetworks.Field("mac_addr"))
-	q = q.In("guest_id", guestIds)
-	if virtual.IsTrue() {
-		q = q.IsTrue("virtual")
-	} else if virtual.IsFalse() {
-		q = q.IsFalse("virtual")
-	}
-	q = q.IsNotEmpty("mac_addr")
-	q = q.Asc("mac_addr")
-	type sGuestIdMacAddr struct {
-		GuestId string
-		MacAddr string
-	}
-	gims := make([]sGuestIdMacAddr, 0)
-	err := q.All(&gims)
-	if err != nil && errors.Cause(err) != sql.ErrNoRows {
-		return nil
-	}
-	ret := make(map[string][]string)
-	for i := range gims {
-		if _, ok := ret[gims[i].GuestId]; !ok {
-			ret[gims[i].GuestId] = make([]string, 0)
-		}
-		ret[gims[i].GuestId] = append(ret[gims[i].GuestId], gims[i].MacAddr)
-	}
-	return ret
-}
-
 func fetchGuestNICs(ctx context.Context, guestIds []string, virtual tristate.TriState) map[string][]api.GuestnetworkShortDesc {
 	netq := NetworkManager.Query().SubQuery()
 	wirq := WireManager.Query().SubQuery()
+
+	subIPQ := NetworkAddressManager.Query("parent_id").Equals("parent_type", api.NetworkAddressParentTypeGuestnetwork)
+	subIPQ = subIPQ.AppendField(sqlchemy.GROUP_CONCAT("sub_ips", subIPQ.Field("ip_addr")))
+	subIPQ = subIPQ.GroupBy(subIPQ.Field("parent_id"))
+	subIP := subIPQ.SubQuery()
+
 	gnwq := GuestnetworkManager.Query()
 	q := gnwq.AppendField(
 		gnwq.Field("guest_id"),
@@ -458,10 +551,15 @@ func fetchGuestNICs(ctx context.Context, guestIds []string, virtual tristate.Tri
 		gnwq.Field("mac_addr").Label("mac"),
 		gnwq.Field("team_with"),
 		gnwq.Field("network_id"), // caution: do not alias netq.id as network_id
+
+		gnwq.Field("port_mappings"),
+
 		wirq.Field("vpc_id"),
+		subIP.Field("sub_ips"),
 	)
 	q = q.Join(netq, sqlchemy.Equals(netq.Field("id"), gnwq.Field("network_id")))
 	q = q.Join(wirq, sqlchemy.Equals(wirq.Field("id"), netq.Field("wire_id")))
+	q = q.LeftJoin(subIP, sqlchemy.Equals(q.Field("row_id"), subIP.Field("parent_id")))
 	q = q.In("guest_id", guestIds)
 
 	var descs []struct {
@@ -469,7 +567,7 @@ func fetchGuestNICs(ctx context.Context, guestIds []string, virtual tristate.Tri
 		api.GuestnetworkShortDesc
 	}
 	if err := q.All(&descs); err != nil {
-		if err != sql.ErrNoRows {
+		if errors.Cause(err) != sql.ErrNoRows {
 			log.Errorf("query guest nics info: %v", err)
 		}
 		return nil
@@ -651,17 +749,62 @@ func fetchGuestKeypairs(guestIds []string) map[string]sGuestKeypair {
 	return ret
 }
 
-func fetchGuestGpuInstanceTypes(guestIds []string) []string {
+func fetchGuestGpuInstanceTypes(guestIds []string) (map[string]*GpuSpec, error) {
+	ret := map[string]*GpuSpec{}
 	sq := GuestManager.Query("instance_type").In("id", guestIds).SubQuery()
-	q := ServerSkuManager.Query("name").In("name", sq).GT("gpu_count", 0).Distinct()
-	instanceTypes := []string{}
-	skus, _ := q.AllStringMap()
-	for i := range skus {
-		for _, v := range skus[i] {
-			instanceTypes = append(instanceTypes, v)
-		}
+	q := ServerSkuManager.Query("name", "gpu_spec", "gpu_count").In("name", sq).IsNotEmpty("gpu_spec").Distinct()
+	gpus := []struct {
+		Name     string
+		GpuSpec  string
+		GpuCount string
+	}{}
+	err := q.All(&gpus)
+	if err != nil {
+		return ret, err
 	}
-	return instanceTypes
+	for _, gpu := range gpus {
+		ret[gpu.Name] = &GpuSpec{Model: gpu.GpuSpec, Amount: gpu.GpuCount}
+	}
+	return ret, nil
+}
+
+func fetchGuestBackupInfo(hostIds []string) (map[string]api.BackupInfo, error) {
+	ret := map[string]api.BackupInfo{}
+	hosts := []SHost{}
+	err := HostManager.Query().In("id", hostIds).All(&hosts)
+	if err != nil {
+		return nil, err
+	}
+	for _, host := range hosts {
+		ret[host.Id] = api.BackupInfo{BackupHostName: host.Name, BackupHostStatus: host.HostStatus}
+	}
+	return ret, nil
+}
+
+func fetchContainers(guestIds []string) (map[string][]*api.PodContainerDesc, error) {
+	ret := map[string][]*api.PodContainerDesc{}
+	containers := []SContainer{}
+	err := GetContainerManager().Query().In("guest_id", guestIds).All(&containers)
+	if err != nil {
+		return nil, err
+	}
+	for i := range containers {
+		container := containers[i]
+		_, ok := ret[container.GuestId]
+		if !ok {
+			ret[container.GuestId] = []*api.PodContainerDesc{}
+		}
+		desc := &api.PodContainerDesc{
+			Id:     container.GetId(),
+			Name:   container.GetName(),
+			Status: container.Status,
+		}
+		if container.Spec != nil {
+			desc.Image = container.Spec.Image
+		}
+		ret[container.GuestId] = append(ret[container.GuestId], desc)
+	}
+	return ret, nil
 }
 
 func fetchGuestIsolatedDevices(guestIds []string) map[string][]api.SIsolatedDevice {
@@ -691,16 +834,42 @@ func fetchGuestIsolatedDevices(guestIds []string) map[string][]api.SIsolatedDevi
 	return ret
 }
 
-func fetchGuestCdroms(guestIds []string) map[string]SGuestcdrom {
-	q := GuestcdromManager.Query().In("id", guestIds)
+func fetchGuestCdroms(guestIds []string) map[string][]SGuestcdrom {
+	sq := GuestcdromManager.Query().In("id", guestIds).SubQuery()
+	image := CachedimageManager.Query().SubQuery()
+
+	q := sq.Query(
+		sq.Field("id"),
+		sq.Field("path"),
+		sq.Field("boot_index"),
+		sq.Field("image_id"),
+		image.Field("size"),
+		image.Field("name"),
+	)
+	q = q.LeftJoin(image, sqlchemy.Equals(sq.Field("image_id"), image.Field("id")))
+
 	gcds := make([]SGuestcdrom, 0)
 	err := q.All(&gcds)
 	if err != nil {
 		return nil
 	}
-	ret := make(map[string]SGuestcdrom)
+	ret := make(map[string][]SGuestcdrom)
 	for i := range gcds {
-		ret[gcds[i].Id] = gcds[i]
+		ret[gcds[i].Id] = append(ret[gcds[i].Id], gcds[i])
+	}
+	return ret
+}
+
+func fetchGuestFloppys(guestIds []string) map[string][]SGuestfloppy {
+	q := GuestFloppyManager.Query().In("id", guestIds)
+	gfls := make([]SGuestfloppy, 0)
+	err := q.All(&gfls)
+	if err != nil {
+		return nil
+	}
+	ret := make(map[string][]SGuestfloppy)
+	for i := range gfls {
+		ret[gfls[i].Id] = append(ret[gfls[i].Id], gfls[i])
 	}
 	return ret
 }

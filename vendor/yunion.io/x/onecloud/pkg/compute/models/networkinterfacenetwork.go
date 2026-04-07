@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
@@ -27,7 +28,6 @@ import (
 
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/mcclient"
 )
 
@@ -167,6 +167,10 @@ func (manager *SNetworkinterfacenetworkManager) newFromCloudInterfaceAddress(ctx
 	network := _network.(*SNetwork)
 	if !network.IsAddressInRange(ipAddr) {
 		return fmt.Errorf("ip %s not in network %s(%s) range", address.IpAddr, network.Name, network.Id)
+	}
+	// skip sync used ip address
+	if used, err := network.isAddressUsed(ctx, address.IpAddr); err != nil || used {
+		return nil
 	}
 
 	address.NetworkId = network.Id

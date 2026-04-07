@@ -22,6 +22,24 @@ import (
 	"yunion.io/x/onecloud/pkg/apis"
 )
 
+type StorageUsage struct {
+	HostCount     int
+	DiskCount     int
+	SnapshotCount int
+	Used          int64
+	Wasted        int64
+}
+
+func (self StorageUsage) IsZero() bool {
+	return self.HostCount+self.DiskCount+self.SnapshotCount == 0
+}
+
+type StorageHardwareInfo struct {
+	Model     *string `json:"model"`
+	Vendor    *string `json:"vendor"`
+	Bandwidth float64 `json:"bandwidth" help:"Bandwidth of the device, and the unit is GB/s"`
+}
+
 type StorageCreateInput struct {
 	apis.EnabledStatusInfrasResourceBaseCreateInput
 
@@ -92,6 +110,15 @@ type StorageCreateInput struct {
 	// 网络文件系统共享目录, storage_type 为 nfs 时, 此参数必传
 	// example: /nfs_root/
 	NfsSharedDir string `json:"nfs_shared_dir"`
+
+	// swagger:ignore
+	HardwareInfo *StorageHardwareInfo `json:"hardware_info"`
+	// CLVM VG Name
+	CLVMVgName string
+	// SLVM VG Name
+	SLVMVgName string
+	MasterHost string
+	Lvmlockd   bool
 }
 
 type RbdTimeoutInput struct {
@@ -128,8 +155,10 @@ type SStorageCapacityInfo struct {
 }
 
 type StorageHost struct {
-	Id   string
-	Name string
+	Id         string
+	Name       string
+	Status     string
+	HostStatus string
 }
 
 type StorageDetails struct {
@@ -140,10 +169,14 @@ type StorageDetails struct {
 	SStorage
 
 	SStorageCapacityInfo
+	ActualUsed int64 `json:"real_time_used_capacity,omitzero"`
+	VCapacity  int64 `json:"virtual_capacity,omitzero"`
 
 	Hosts []StorageHost `json:"hosts"`
 
 	Schedtags []SchedtagShortDescDetails `json:"schedtags"`
+
+	StorageUsage `json:"storage_usage"`
 
 	// 超分比
 	CommitBound float32 `json:"commit_bound"`
@@ -159,13 +192,13 @@ func (self StorageDetails) GetMetricTags() map[string]string {
 		"project_domain": self.ProjectDomain,
 		"external_id":    self.ExternalId,
 	}
-	return ret
+	return AppendMetricTags(ret, self.MetadataResourceInfo)
 }
 
 func (self StorageDetails) GetMetricPairs() map[string]string {
 	usageActive := "0"
 	if self.Capacity > 0 {
-		usageActive = strconv.FormatFloat(float64(self.ActualCapacityUsed/self.Capacity*100.0), 'f', -1, 64)
+		usageActive = strconv.FormatFloat(float64(self.ActualCapacityUsed)/float64(self.Capacity)*100.0, 'f', -1, 64)
 	}
 	ret := map[string]string{
 		"free":         strconv.FormatFloat(float64(self.Capacity-self.ActualCapacityUsed), 'f', 2, 64),
@@ -212,4 +245,8 @@ type StorageUpdateInput struct {
 	StorageConf *jsonutils.JSONDict
 
 	UpdateStorageConf bool
+
+	// swagger:ignore
+	HardwareInfo *StorageHardwareInfo `json:"hardware_info"`
+	MasterHost   string
 }

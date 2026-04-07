@@ -41,8 +41,8 @@ type SHostResourceBaseManager struct {
 	hostIdFieldName string
 }
 
-func ValidateHostResourceInput(userCred mcclient.TokenCredential, input api.HostResourceInput) (*SHost, api.HostResourceInput, error) {
-	hostObj, err := HostManager.FetchByIdOrName(userCred, input.HostId)
+func ValidateHostResourceInput(ctx context.Context, userCred mcclient.TokenCredential, input api.HostResourceInput) (*SHost, api.HostResourceInput, error) {
+	hostObj, err := HostManager.FetchByIdOrName(ctx, userCred, input.HostId)
 	if err != nil {
 		if errors.Cause(err) == sql.ErrNoRows {
 			return nil, input, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", HostManager.Keyword(), input.HostId)
@@ -104,10 +104,15 @@ func (manager *SHostResourceBaseManager) FetchCustomizeColumns(
 			host := hosts[hostIds[i]]
 			rows[i].Host = host.Name
 			rows[i].HostSN = host.SN
-			rows[i].HostStatus = host.Status
+			rows[i].HostStatus = host.HostStatus
+			rows[i].HostEnabled = host.Enabled.Bool()
 			rows[i].HostServiceStatus = host.HostStatus
 			rows[i].HostType = host.HostType
+			rows[i].HostAccessIp = host.AccessIp
+			rows[i].HostEIP = host.PublicIp
 			rows[i].ManagerId = host.ManagerId
+			rows[i].HostResourceType = host.ResourceType
+			rows[i].HostBillingType = host.BillingType
 			rows[i].ZoneId = host.ZoneId
 		}
 		zoneList[i] = &SZoneResourceBase{rows[i].ZoneId}
@@ -134,15 +139,27 @@ func (manager *SHostResourceBaseManager) ListItemFilter(
 	query api.HostFilterListInput,
 ) (*sqlchemy.SQuery, error) {
 	if len(query.HostId) > 0 {
-		hostObj, _, err := ValidateHostResourceInput(userCred, query.HostResourceInput)
+		hostObj, _, err := ValidateHostResourceInput(ctx, userCred, query.HostResourceInput)
 		if err != nil {
 			return nil, errors.Wrap(err, "ValidateHostResourceInput")
 		}
 		q = q.Equals(manager.getHostIdFieldName(), hostObj.GetId())
 	}
 	if len(query.HostSN) > 0 {
-		sq := HostManager.Query("id").Equals("sn", query.HostSN).SubQuery()
+		sq := HostManager.Query("id").In("sn", query.HostSN).SubQuery()
 		q = q.In(manager.getHostIdFieldName(), sq)
+	}
+	if len(query.HostWireId) > 0 {
+		wireObj, err := WireManager.FetchByIdOrName(ctx, userCred, query.HostWireId)
+		if err != nil {
+			if errors.Cause(err) == sql.ErrNoRows {
+				return nil, httperrors.NewResourceNotFoundError2(WireManager.Keyword(), query.HostWireId)
+			} else {
+				return nil, errors.Wrap(err, "WireManager.FetchByIdOrName")
+			}
+		}
+		netifsQ := NetInterfaceManager.Query("baremetal_id").Equals("wire_id", wireObj.GetId()).Distinct().SubQuery()
+		q = q.In(manager.getHostIdFieldName(), netifsQ)
 	}
 	subq := HostManager.Query("id").Snapshot()
 	subq, err := manager.SZoneResourceBaseManager.ListItemFilter(ctx, subq, userCred, query.ZonalFilterListInput)

@@ -19,8 +19,11 @@ import (
 	"time"
 
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 
 	"yunion.io/x/onecloud/pkg/apihelper"
+	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/mcclient/modules/apimap"
 )
 
 type ModelSetsMaxUpdatedAt struct {
@@ -36,12 +39,17 @@ type ModelSetsMaxUpdatedAt struct {
 	Elasticips         time.Time
 	NetworkAddresses   time.Time
 
+	DnsZones   time.Time
 	DnsRecords time.Time
 
 	RouteTables time.Time
 
 	Groupguests   time.Time
 	Groupnetworks time.Time
+
+	LoadbalancerNetworks  time.Time
+	LoadbalancerListeners time.Time
+	LoadbalancerAcls      time.Time
 }
 
 func NewModelSetsMaxUpdatedAt() *ModelSetsMaxUpdatedAt {
@@ -58,12 +66,17 @@ func NewModelSetsMaxUpdatedAt() *ModelSetsMaxUpdatedAt {
 		Elasticips:         apihelper.PseudoZeroTime,
 		NetworkAddresses:   apihelper.PseudoZeroTime,
 
+		DnsZones:   apihelper.PseudoZeroTime,
 		DnsRecords: apihelper.PseudoZeroTime,
 
 		RouteTables: apihelper.PseudoZeroTime,
 
 		Groupguests:   apihelper.PseudoZeroTime,
 		Groupnetworks: apihelper.PseudoZeroTime,
+
+		LoadbalancerNetworks:  apihelper.PseudoZeroTime,
+		LoadbalancerListeners: apihelper.PseudoZeroTime,
+		LoadbalancerAcls:      apihelper.PseudoZeroTime,
 	}
 }
 
@@ -80,6 +93,7 @@ type ModelSets struct {
 	Elasticips         Elasticips
 	NetworkAddresses   NetworkAddresses
 
+	DnsZones   DnsZones
 	DnsRecords DnsRecords
 
 	RouteTables RouteTables
@@ -87,6 +101,10 @@ type ModelSets struct {
 	Groupguests   Groupguests
 	Groupnetworks Groupnetworks
 	Groups        Groups
+
+	LoadbalancerNetworks  LoadbalancerNetworks
+	LoadbalancerListeners LoadbalancerListeners
+	LoadbalancerAcls      LoadbalancerAcls
 }
 
 func NewModelSets() *ModelSets {
@@ -103,6 +121,7 @@ func NewModelSets() *ModelSets {
 		Elasticips:         Elasticips{},
 		NetworkAddresses:   NetworkAddresses{},
 
+		DnsZones:   DnsZones{},
 		DnsRecords: DnsRecords{},
 
 		RouteTables: RouteTables{},
@@ -110,6 +129,10 @@ func NewModelSets() *ModelSets {
 		Groupguests:   Groupguests{},
 		Groupnetworks: Groupnetworks{},
 		Groups:        Groups{},
+
+		LoadbalancerNetworks:  LoadbalancerNetworks{},
+		LoadbalancerListeners: LoadbalancerListeners{},
+		LoadbalancerAcls:      LoadbalancerAcls{},
 	}
 }
 
@@ -128,12 +151,18 @@ func (mss *ModelSets) ModelSetList() []apihelper.IModelSet {
 		mss.Elasticips,
 		mss.NetworkAddresses,
 
+		mss.DnsZones,
 		mss.DnsRecords,
 
 		mss.RouteTables,
 
 		mss.Groupguests,
 		mss.Groupnetworks,
+		mss.Groups,
+
+		mss.LoadbalancerNetworks,
+		mss.LoadbalancerListeners,
+		mss.LoadbalancerAcls,
 	}
 }
 
@@ -155,12 +184,18 @@ func (mss *ModelSets) copy_() *ModelSets {
 		Elasticips:         mss.Elasticips.Copy().(Elasticips),
 		NetworkAddresses:   mss.NetworkAddresses.Copy().(NetworkAddresses),
 
+		DnsZones:   mss.DnsZones.Copy().(DnsZones),
 		DnsRecords: mss.DnsRecords.Copy().(DnsRecords),
 
 		RouteTables: mss.RouteTables.Copy().(RouteTables),
 
 		Groupguests:   mss.Groupguests.Copy().(Groupguests),
 		Groupnetworks: mss.Groupnetworks.Copy().(Groupnetworks),
+		Groups:        mss.Groups.Copy().(Groups),
+
+		LoadbalancerNetworks:  mss.LoadbalancerNetworks.Copy().(LoadbalancerNetworks),
+		LoadbalancerListeners: mss.LoadbalancerListeners.Copy().(LoadbalancerListeners),
+		LoadbalancerAcls:      mss.LoadbalancerAcls.Copy().(LoadbalancerAcls),
 	}
 	return mssCopy
 }
@@ -195,6 +230,18 @@ func (mss *ModelSets) ApplyUpdates(mssNews apihelper.IModelSets) apihelper.Model
 	return r
 }
 
+func (mss *ModelSets) FetchFromAPIMap(s *mcclient.ClientSession) (apihelper.IModelSets, error) {
+	mssNews := mss.NewEmpty()
+	ret, err := apimap.APIMap.GetVPCAgentTopo(s)
+	if err != nil {
+		return nil, errors.Wrap(err, "GetVPCAgentTopo")
+	}
+	if err := ret.Unmarshal(mssNews, "models"); err != nil {
+		return nil, errors.Wrap(err, "Unmarshal topo")
+	}
+	return mssNews, nil
+}
+
 func (mss *ModelSets) join() bool {
 	mss.Guests.initJoin()
 	mss.Groups = Groups{}
@@ -212,6 +259,8 @@ func (mss *ModelSets) join() bool {
 	msg = append(msg, "mss.Networks.joinGuestnetworks(mss.Guestnetworks)")
 	p = append(p, mss.Networks.joinNetworkAddresses(mss.NetworkAddresses))
 	msg = append(msg, "mss.Networks.joinNetworkAddresses(mss.NetworkAddresses)")
+	p = append(p, mss.Networks.joinLoadbalancerNetworks(mss.LoadbalancerNetworks))
+	msg = append(msg, "mss.Networks.joinLoadbalancerNetworks(mss.LoadbalancerNetworks)")
 	p = append(p, mss.Networks.joinElasticips(mss.Elasticips))
 	msg = append(msg, "mss.Networks.joinElasticips(mss.Elasticips)")
 	p = append(p, mss.Guests.joinHosts(mss.Hosts))
@@ -234,6 +283,14 @@ func (mss *ModelSets) join() bool {
 	msg = append(msg, "mss.Groups.joinGroupnetworks(mss.Groupnetworks, mss.Networks)")
 	p = append(p, mss.Groupnetworks.joinElasticips(mss.Elasticips))
 	msg = append(msg, "mss.Groupnetworks.joinElasticips(mss.Elasticips)")
+	p = append(p, mss.LoadbalancerNetworks.joinElasticips(mss.Elasticips))
+	msg = append(msg, "mss.LoadbalancerNetworks.joinElasticips(mss.Elasticips)")
+	p = append(p, mss.LoadbalancerNetworks.joinLoadbalancerListeners(mss.LoadbalancerListeners))
+	msg = append(msg, "mss.LoadbalancerNetworks.joinLoadbalancerListeners(mss.LoadbalancerListeners)")
+	p = append(p, mss.LoadbalancerListeners.joinLoadbalancerAcls(mss.LoadbalancerAcls))
+	msg = append(msg, "mss.LoadbalancerListeners.joinLoadbalancerAcls(mss.LoadbalancerAcls)")
+	p = append(p, mss.DnsZones.joinRecords(mss.DnsRecords))
+	msg = append(msg, "mss.Vpcs.joinRecords(mss.DnsRecords)")
 	ret := true
 	var failMsg []string
 	for i, b := range p {
@@ -244,6 +301,10 @@ func (mss *ModelSets) join() bool {
 	}
 	if !ret {
 		log.Errorln(strings.Join(failMsg, ","))
+	} else {
+		for _, g := range mss.Guests {
+			g.FixIsDefaults()
+		}
 	}
 	return ret
 }

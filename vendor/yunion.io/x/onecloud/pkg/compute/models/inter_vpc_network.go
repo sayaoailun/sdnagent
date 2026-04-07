@@ -21,6 +21,7 @@ import (
 
 	"gopkg.in/fatih/set.v0"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/tristate"
@@ -32,7 +33,7 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
+	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
@@ -89,6 +90,16 @@ func (manager *SInterVpcNetworkManager) OrderByExtraFields(
 	q, err = manager.SManagedResourceBaseManager.OrderByExtraFields(ctx, q, userCred, query.ManagedResourceListInput)
 	if err != nil {
 		return nil, errors.Wrap(err, "SManagedResourceBaseManager.OrderByExtraFields")
+	}
+	if db.NeedOrderQuery([]string{query.OrderByVpcCount}) {
+		vpcNetVpcQ := InterVpcNetworkVpcManager.Query()
+		vpcNetVpcQ = vpcNetVpcQ.AppendField(vpcNetVpcQ.Field("inter_vpc_network_id"), sqlchemy.COUNT("vpc_count", vpcNetVpcQ.Field("vpc_id")))
+		vpcNetVpcQ = vpcNetVpcQ.GroupBy(vpcNetVpcQ.Field("inter_vpc_network_id"))
+		vpcNetVpcSQ := vpcNetVpcQ.SubQuery()
+		q = q.LeftJoin(vpcNetVpcSQ, sqlchemy.Equals(vpcNetVpcSQ.Field("inter_vpc_network_id"), q.Field("id")))
+		q = q.AppendField(q.QueryFields()...)
+		q = q.AppendField(vpcNetVpcSQ.Field("vpc_count"))
+		q = db.OrderByFields(q, []string{query.OrderByVpcCount}, []sqlchemy.IQueryField{q.Field("vpc_count")})
 	}
 	return q, nil
 }
@@ -147,7 +158,7 @@ func (self *SInterVpcNetwork) PostCreate(ctx context.Context, userCred mcclient.
 	if err != nil {
 		return
 	}
-	self.SetStatus(userCred, api.INTER_VPC_NETWORK_STATUS_CREATING, "")
+	self.SetStatus(ctx, userCred, api.INTER_VPC_NETWORK_STATUS_CREATING, "")
 	task.ScheduleRun(nil)
 }
 
@@ -241,7 +252,7 @@ func (self *SInterVpcNetwork) CustomizeDelete(ctx context.Context, userCred mccl
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, api.INTER_VPC_NETWORK_STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, api.INTER_VPC_NETWORK_STATUS_DELETING, "")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -269,7 +280,7 @@ func (self *SInterVpcNetwork) StartInterVpcNetworkAddVpcTask(ctx context.Context
 	if err != nil {
 		return err
 	}
-	self.SetStatus(userCred, api.INTER_VPC_NETWORK_STATUS_ADDVPC, "")
+	self.SetStatus(ctx, userCred, api.INTER_VPC_NETWORK_STATUS_ADDVPC, "")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -278,7 +289,7 @@ func (self *SInterVpcNetwork) PerformAddvpc(ctx context.Context, userCred mcclie
 	if len(input.VpcId) == 0 {
 		return nil, httperrors.NewMissingParameterError("vpc_id")
 	}
-	_vpc, err := validators.ValidateModel(userCred, VpcManager, &input.VpcId)
+	_vpc, err := validators.ValidateModel(ctx, userCred, VpcManager, &input.VpcId)
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +332,7 @@ func (self *SInterVpcNetwork) StartInterVpcNetworkRemoveVpcTask(ctx context.Cont
 	if err != nil {
 		return err
 	}
-	self.SetStatus(userCred, api.INTER_VPC_NETWORK_STATUS_REMOVEVPC, "")
+	self.SetStatus(ctx, userCred, api.INTER_VPC_NETWORK_STATUS_REMOVEVPC, "")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -331,7 +342,7 @@ func (self *SInterVpcNetwork) PerformRemovevpc(ctx context.Context, userCred mcc
 		return nil, httperrors.NewMissingParameterError("vpc_id")
 	}
 	// get vpc
-	_vpc, err := VpcManager.FetchByIdOrName(userCred, input.VpcId)
+	_vpc, err := VpcManager.FetchByIdOrName(ctx, userCred, input.VpcId)
 	if err != nil {
 		if errors.Cause(err) == sql.ErrNoRows {
 			return nil, httperrors.NewResourceNotFoundError2("vpc", input.VpcId)
@@ -414,7 +425,9 @@ func (self *SInterVpcNetwork) SyncWithCloudInterVpcNetwork(ctx context.Context, 
 	_, err := db.Update(self, func() error {
 		self.ExternalId = ext.GetGlobalId()
 		self.Status = ext.GetStatus()
-		self.Name = ext.GetName()
+		if options.Options.EnableSyncName {
+			self.Name = ext.GetName()
+		}
 		return nil
 	})
 	if err != nil {
@@ -489,7 +502,7 @@ func (self *SInterVpcNetwork) GetInterVpcNetworkRouteSets() ([]SInterVpcNetworkR
 	return routes, nil
 }
 
-func (self *SInterVpcNetwork) SyncInterVpcNetworkRouteSets(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudInterVpcNetwork) compare.SyncResult {
+func (self *SInterVpcNetwork) SyncInterVpcNetworkRouteSets(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudInterVpcNetwork, xor bool) compare.SyncResult {
 	lockman.LockRawObject(ctx, self.Keyword(), fmt.Sprintf("%s-records", self.Id))
 	defer lockman.ReleaseRawObject(ctx, self.Keyword(), fmt.Sprintf("%s-records", self.Id))
 
@@ -525,13 +538,15 @@ func (self *SInterVpcNetwork) SyncInterVpcNetworkRouteSets(ctx context.Context, 
 		}
 	}
 
-	for i := 0; i < len(commondb); i++ {
-		err := commondb[i].syncWithCloudRouteSet(ctx, userCred, self, commonext[i])
-		if err != nil {
-			syncResult.UpdateError(err)
-			continue
+	if !xor {
+		for i := 0; i < len(commondb); i++ {
+			err := commondb[i].syncWithCloudRouteSet(ctx, userCred, self, commonext[i])
+			if err != nil {
+				syncResult.UpdateError(err)
+				continue
+			}
+			syncResult.Update()
 		}
-		syncResult.Update()
 	}
 
 	for i := 0; i < len(added); i++ {

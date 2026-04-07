@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
@@ -27,7 +28,6 @@ import (
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
@@ -214,9 +214,16 @@ func (manager *SNetworkInterfaceManager) getNetworkInterfacesByProviderId(provid
 	return nics, nil
 }
 
-func (manager *SNetworkInterfaceManager) SyncNetworkInterfaces(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, region *SCloudregion, exts []cloudprovider.ICloudNetworkInterface) ([]SNetworkInterface, []cloudprovider.ICloudNetworkInterface, compare.SyncResult) {
-	lockman.LockRawObject(ctx, "network-interfaces", fmt.Sprintf("%s-%s", provider.Id, region.Id))
-	defer lockman.ReleaseRawObject(ctx, "network-interfaces", fmt.Sprintf("%s-%s", provider.Id, region.Id))
+func (manager *SNetworkInterfaceManager) SyncNetworkInterfaces(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	provider *SCloudprovider,
+	region *SCloudregion,
+	exts []cloudprovider.ICloudNetworkInterface,
+	xor bool,
+) ([]SNetworkInterface, []cloudprovider.ICloudNetworkInterface, compare.SyncResult) {
+	lockman.LockRawObject(ctx, manager.Keyword(), fmt.Sprintf("%s-%s", provider.Id, region.Id))
+	defer lockman.ReleaseRawObject(ctx, manager.Keyword(), fmt.Sprintf("%s-%s", provider.Id, region.Id))
 
 	localResources := make([]SNetworkInterface, 0)
 	remoteResources := make([]cloudprovider.ICloudNetworkInterface, 0)
@@ -246,16 +253,17 @@ func (manager *SNetworkInterfaceManager) SyncNetworkInterfaces(ctx context.Conte
 		}
 	}
 
-	for i := 0; i < len(commondb); i += 1 {
-		err := commondb[i].SyncWithCloudNetworkInterface(ctx, userCred, provider, commonext[i])
-		if err != nil {
-			syncResult.UpdateError(err)
-			continue
+	if !xor {
+		for i := 0; i < len(commondb); i += 1 {
+			err := commondb[i].SyncWithCloudNetworkInterface(ctx, userCred, provider, commonext[i])
+			if err != nil {
+				syncResult.UpdateError(err)
+				continue
+			}
+			localResources = append(localResources, commondb[i])
+			remoteResources = append(remoteResources, commonext[i])
+			syncResult.Update()
 		}
-		syncMetadata(ctx, userCred, &commondb[i], commonext[i])
-		localResources = append(localResources, commondb[i])
-		remoteResources = append(remoteResources, commonext[i])
-		syncResult.Update()
 	}
 
 	for i := 0; i < len(added); i += 1 {
@@ -264,7 +272,7 @@ func (manager *SNetworkInterfaceManager) SyncNetworkInterfaces(ctx context.Conte
 			syncResult.AddError(err)
 			continue
 		}
-		syncMetadata(ctx, userCred, new, added[i])
+		syncMetadata(ctx, userCred, new, added[i], false)
 		localResources = append(localResources, *new)
 		remoteResources = append(remoteResources, added[i])
 		syncResult.Add()
@@ -276,24 +284,7 @@ func (self *SNetworkInterface) syncRemoveCloudNetworkInterface(ctx context.Conte
 	lockman.LockObject(ctx, self)
 	defer lockman.ReleaseObject(ctx, self)
 
-	err := self.ValidateDeleteCondition(ctx, nil)
-	if err != nil {
-		self.SetStatus(userCred, api.NETWORK_INTERFACE_STATUS_UNKNOWN, "sync to delete")
-		return errors.Wrapf(err, "ValidateDeleteCondition")
-	}
-
-	networks, err := self.GetNetworks()
-	if err != nil {
-		return errors.Wrapf(err, "GetNetworks")
-	}
-	for i := range networks {
-		err = networks[i].Delete(ctx, userCred)
-		if err != nil {
-			return errors.Wrapf(err, "Delete networkinterfacenetwork %d", networks[i].RowId)
-		}
-	}
-
-	return self.Delete(ctx, userCred)
+	return self.purge(ctx, userCred)
 }
 
 func (self *SNetworkInterface) SyncWithCloudNetworkInterface(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, ext cloudprovider.ICloudNetworkInterface) error {
@@ -311,6 +302,9 @@ func (self *SNetworkInterface) SyncWithCloudNetworkInterface(ctx context.Context
 	}
 
 	SyncCloudDomain(userCred, self, provider.GetOwnerId())
+	if account, _ := provider.GetCloudaccount(); account != nil {
+		syncMetadata(ctx, userCred, self, ext, account.ReadOnly)
+	}
 	db.OpsLog.LogSyncUpdate(self, diff, userCred)
 	return nil
 }

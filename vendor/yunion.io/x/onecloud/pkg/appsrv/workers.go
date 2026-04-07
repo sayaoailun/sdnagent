@@ -25,6 +25,7 @@ import (
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 )
 
 const (
@@ -83,6 +84,24 @@ func (worker *SWorker) run() {
 		req := worker.manager.queue.Pop()
 		if req != nil {
 			task := req.(*sWorkerTask)
+
+			if worker.manager.cancelPrevIdent {
+				// cancel previous identical tasks
+				findIdent := false
+				worker.manager.queue.Range(func(iReq interface{}) bool {
+					iTask := iReq.(*sWorkerTask)
+					if iTask.task.Dump() == task.task.Dump() {
+						// found idential task
+						findIdent = true
+						return false
+					}
+					return true
+				})
+				if findIdent {
+					continue
+				}
+			}
+
 			if task.worker != nil {
 				task.worker <- worker
 			}
@@ -160,6 +179,11 @@ type SWorkerManager struct {
 	dbWorker       bool
 
 	ignoreOverflow bool
+
+	cancelPrevIdent bool
+
+	queueInitHook  func() error
+	queueEmptyHook func() error
 }
 
 func NewWorkerManager(name string, workerCount int, backlog int, dbWorker bool) *SWorkerManager {
@@ -178,6 +202,8 @@ func NewWorkerManagerIgnoreOverflow(name string, workerCount int, backlog int, d
 		dbWorker:       dbWorker,
 
 		ignoreOverflow: ignoreOverflow,
+
+		cancelPrevIdent: false,
 	}
 
 	workerManagerLock.Lock()
@@ -197,6 +223,29 @@ type sWorkerTask struct {
 	worker  chan *SWorker
 	onError func(error)
 	start   time.Time
+}
+
+func (wm *SWorkerManager) SetQueueInitHook(f func() error) {
+	wm.queueInitHook = f
+}
+
+func (wm *SWorkerManager) SetQueueEmptyHook(f func() error) {
+	wm.queueEmptyHook = f
+}
+
+func (wm *SWorkerManager) EnableCancelPreviousIdenticalTask() {
+	wm.cancelPrevIdent = true
+}
+
+func (wm *SWorkerManager) UpdateWorkerCount(workerCount int) error {
+	wm.workerLock.Lock()
+	defer wm.workerLock.Unlock()
+	if wm.queue.Size() > 0 {
+		return errors.Errorf("worker queue is not empty")
+	}
+	wm.queue = NewRing(workerCount * wm.backlog)
+	wm.workerCount = workerCount
+	return nil
 }
 
 func (wm *SWorkerManager) String() string {
@@ -222,6 +271,12 @@ func (wm *SWorkerManager) removeWorker(worker *SWorker) {
 	} else {
 		wm.detachedWorker.removeWithLock(worker)
 	}
+	if wm.activeWorker.size()+wm.detachedWorker.size() == 0 && wm.queueEmptyHook != nil {
+		err := wm.queueEmptyHook()
+		if err != nil {
+			log.Errorf("queueEmptyHook fail %s", err)
+		}
+	}
 }
 
 func execCallback(task *sWorkerTask) {
@@ -245,6 +300,13 @@ func (wm *SWorkerManager) schedule() {
 }
 
 func (wm *SWorkerManager) scheduleWithLock() {
+	if wm.activeWorker.size()+wm.detachedWorker.size() == 0 && wm.queueInitHook != nil {
+		err := wm.queueInitHook()
+		if err != nil {
+			log.Errorf("queueInitHook fail %s", err)
+			return
+		}
+	}
 	queueSize := wm.queue.Size()
 	if wm.activeWorker.size() < wm.workerCount && queueSize > 0 {
 		wm.workerId += 1

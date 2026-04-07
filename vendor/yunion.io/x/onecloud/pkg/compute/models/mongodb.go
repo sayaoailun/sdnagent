@@ -19,10 +19,13 @@ import (
 	"fmt"
 	"time"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/billing"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
@@ -33,10 +36,9 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
+	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/billing"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
@@ -384,10 +386,10 @@ func (self *SMongoDB) StartDeleteTask(ctx context.Context, userCred mcclient.Tok
 		return task.ScheduleRun(nil)
 	}()
 	if err != nil {
-		self.SetStatus(userCred, api.MONGO_DB_STATUS_DELETE_FAILED, err.Error())
+		self.SetStatus(ctx, userCred, api.MONGO_DB_STATUS_DELETE_FAILED, err.Error())
 		return err
 	}
-	return self.SetStatus(userCred, api.MONGO_DB_STATUS_DELETING, "")
+	return self.SetStatus(ctx, userCred, api.MONGO_DB_STATUS_DELETING, "")
 }
 
 func (self *SCloudregion) GetMongoDBs(managerId string) ([]SMongoDB, error) {
@@ -403,9 +405,15 @@ func (self *SCloudregion) GetMongoDBs(managerId string) ([]SMongoDB, error) {
 	return dbs, nil
 }
 
-func (self *SCloudregion) SyncMongoDBs(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, cloudMongoDBs []cloudprovider.ICloudMongoDB) ([]SMongoDB, []cloudprovider.ICloudMongoDB, compare.SyncResult) {
-	lockman.LockRawObject(ctx, "mongodbs", fmt.Sprintf("%s-%s", provider.Id, self.Id))
-	defer lockman.ReleaseRawObject(ctx, "mongodbs", fmt.Sprintf("%s-%s", provider.Id, self.Id))
+func (self *SCloudregion) SyncMongoDBs(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	provider *SCloudprovider,
+	cloudMongoDBs []cloudprovider.ICloudMongoDB,
+	xor bool,
+) ([]SMongoDB, []cloudprovider.ICloudMongoDB, compare.SyncResult) {
+	lockman.LockRawObject(ctx, MongoDBManager.Keyword(), fmt.Sprintf("%s-%s", provider.Id, self.Id))
+	defer lockman.ReleaseRawObject(ctx, MongoDBManager.Keyword(), fmt.Sprintf("%s-%s", provider.Id, self.Id))
 
 	localMongoDBs := []SMongoDB{}
 	remoteMongoDBs := []cloudprovider.ICloudMongoDB{}
@@ -436,15 +444,17 @@ func (self *SCloudregion) SyncMongoDBs(ctx context.Context, userCred mcclient.To
 		result.Delete()
 	}
 
-	for i := 0; i < len(commondb); i++ {
-		err := commondb[i].SyncWithCloudMongoDB(ctx, userCred, commonext[i])
-		if err != nil {
-			result.UpdateError(err)
-			continue
+	if !xor {
+		for i := 0; i < len(commondb); i++ {
+			err := commondb[i].SyncWithCloudMongoDB(ctx, userCred, commonext[i])
+			if err != nil {
+				result.UpdateError(err)
+				continue
+			}
+			localMongoDBs = append(localMongoDBs, commondb[i])
+			remoteMongoDBs = append(remoteMongoDBs, commonext[i])
+			result.Update()
 		}
-		localMongoDBs = append(localMongoDBs, commondb[i])
-		remoteMongoDBs = append(remoteMongoDBs, commonext[i])
-		result.Update()
 	}
 
 	for i := 0; i < len(added); i++ {
@@ -489,7 +499,13 @@ func (self *SMongoDB) SyncAllWithCloudMongoDB(ctx context.Context, userCred mccl
 
 func (self *SMongoDB) SyncWithCloudMongoDB(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudMongoDB) error {
 	diff, err := db.UpdateWithLock(ctx, self, func() error {
-		self.ExternalId = ext.GetGlobalId()
+		if options.Options.EnableSyncName {
+			newName, _ := db.GenerateAlterName(self, ext.GetName())
+			if len(newName) > 0 {
+				self.Name = newName
+			}
+		}
+
 		self.IpAddr = ext.GetIpAddr()
 		self.VcpuCount = ext.GetVcpuCount()
 		self.VmemSizeMb = ext.GetVmemSizeMb()
@@ -552,9 +568,11 @@ func (self *SMongoDB) SyncWithCloudMongoDB(ctx context.Context, userCred mcclien
 			Action: notifyclient.ActionSyncUpdate,
 		})
 	}
-	syncVirtualResourceMetadata(ctx, userCred, self, ext)
+	if account := self.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, self, ext, account.ReadOnly)
+	}
 	if provider := self.GetCloudprovider(); provider != nil {
-		SyncCloudProject(userCred, self, provider.GetOwnerId(), ext, provider.Id)
+		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider)
 	}
 	db.OpsLog.LogSyncUpdate(self, diff, userCred)
 	return nil
@@ -648,8 +666,8 @@ func (self *SCloudregion) newFromCloudMongoDB(ctx context.Context, userCred mccl
 		Action: notifyclient.ActionSyncCreate,
 	})
 
-	syncVirtualResourceMetadata(ctx, userCred, &ins, ext)
-	SyncCloudProject(userCred, &ins, provider.GetOwnerId(), ext, provider.Id)
+	syncVirtualResourceMetadata(ctx, userCred, &ins, ext, false)
+	SyncCloudProject(ctx, userCred, &ins, provider.GetOwnerId(), ext, provider)
 	db.OpsLog.LogEvent(&ins, db.ACT_CREATE, ins.GetShortDesc(ctx), userCred)
 
 	return &ins, nil
@@ -662,7 +680,8 @@ type SMongoDBCountStat struct {
 }
 
 func (man *SMongoDBManager) TotalCount(
-	scope rbacutils.TRbacScope,
+	ctx context.Context,
+	scope rbacscope.TRbacScope,
 	ownerId mcclient.IIdentityProvider,
 	rangeObjs []db.IStandaloneModel,
 	providers []string, brands []string, cloudEnv string,
@@ -673,7 +692,7 @@ func (man *SMongoDBManager) TotalCount(
 	mgq = scopeOwnerIdFilter(mgq, scope, ownerId)
 	mgq = CloudProviderFilter(mgq, mgq.Field("manager_id"), providers, brands, cloudEnv)
 	mgq = RangeObjectsFilter(mgq, rangeObjs, mgq.Field("cloudregion_id"), nil, mgq.Field("manager_id"), nil, nil)
-	mgq = db.ObjectIdQueryWithPolicyResult(mgq, man, policyResult)
+	mgq = db.ObjectIdQueryWithPolicyResult(ctx, mgq, man, policyResult)
 
 	sq := mgq.SubQuery()
 	q := sq.Query(sqlchemy.COUNT("total_mongodb_count"),
@@ -689,7 +708,7 @@ func (man *SMongoDBManager) TotalCount(
 func (self *SMongoDB) GetQuotaKeys() quotas.IQuotaKeys {
 	region, _ := self.GetRegion()
 	return fetchRegionalQuotaKeys(
-		rbacutils.ScopeProject,
+		rbacscope.ScopeProject,
 		self.GetOwnerId(),
 		region,
 		self.GetCloudprovider(),
@@ -811,12 +830,15 @@ func (self *SMongoDB) StartRemoteUpdateTask(ctx context.Context, userCred mcclie
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, apis.STATUS_UPDATE_TAGS, "StartRemoteUpdateTask")
+	self.SetStatus(ctx, userCred, apis.STATUS_UPDATE_TAGS, "StartRemoteUpdateTask")
 	return task.ScheduleRun(nil)
 }
 
 func (self *SMongoDB) OnMetadataUpdated(ctx context.Context, userCred mcclient.TokenCredential) {
-	if len(self.ExternalId) == 0 {
+	if len(self.ExternalId) == 0 || options.Options.KeepTagLocalization {
+		return
+	}
+	if account := self.GetCloudaccount(); account != nil && account.ReadOnly {
 		return
 	}
 	err := self.StartRemoteUpdateTask(ctx, userCred, true, "")

@@ -21,7 +21,9 @@ import (
 	"strconv"
 	"strings"
 
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/sets"
 	"yunion.io/x/pkg/utils"
 
@@ -43,7 +45,7 @@ func isDiskConfigStorageMatch(
 	confAdapter *int,
 	storage *BaremetalStorage,
 	selected []*BaremetalStorage,
-) bool {
+) (bool, error) {
 	isRotate := storage.Rotate
 	adapter := storage.Adapter
 	index := storage.Index
@@ -58,17 +60,26 @@ func isDiskConfigStorageMatch(
 	adapterIsEqual := (confAdapter == nil || *confAdapter == adapter) &&
 		(confDriver == nil || *confDriver == driver)
 
-	log.V(10).Debugf("Try storage: %#v, typeIsHybrid: %v, typeIsRotate: %v, typeIsSSD: %v, rangeIsNoneAndCountZero: %v, rangeIsNotNoneAndIndexInRange: %v, rangeIsNoneAndSmallThanCount: %v, adapterIsEqual: %v", *storage, typeIsHybrid, typeIsRotate, typeIsSSD, rangeIsNoneAndCountZero, rangeIsNotNoneAndIndexInRange, rangeIsNoneAndSmallThanCount, adapterIsEqual)
-
 	if (typeIsHybrid || typeIsRotate || typeIsSSD) &&
 		(rangeIsNoneAndCountZero || rangeIsNotNoneAndIndexInRange || rangeIsNoneAndSmallThanCount) &&
 		adapterIsEqual {
-		return true
+		return true, nil
 	}
-	return false
+	errs := []error{}
+	// aggregate errors
+	if !(typeIsHybrid || typeIsRotate || typeIsSSD) {
+		errs = append(errs, fmt.Errorf("check type: is_hybrid: %v, is_rotate: %v, is_ssd: %v, type: %s", typeIsHybrid, typeIsRotate, typeIsSSD, config.Type))
+	}
+	if !(rangeIsNoneAndCountZero || rangeIsNotNoneAndIndexInRange || rangeIsNoneAndSmallThanCount) {
+		errs = append(errs, fmt.Errorf("check range: is_none: %v, index_in_range: %v, small_than_count: %v, index: %d, range: %v", rangeIsNoneAndCountZero, rangeIsNotNoneAndIndexInRange, rangeIsNoneAndSmallThanCount, index, config.Range))
+	}
+	if adapterIsEqual {
+		errs = append(errs, fmt.Errorf("check adapter: is_equal: %v", adapterIsEqual))
+	}
+	return false, errors.NewAggregate(errs)
 }
 
-func RetrieveStorages(diskConfig *api.BaremetalDiskConfig, storages []*BaremetalStorage) (selected, rest []*BaremetalStorage) {
+func RetrieveStorages(diskConfig *api.BaremetalDiskConfig, storages []*BaremetalStorage) (selected, rest []*BaremetalStorage, err error) {
 	var confDriver *string = nil
 	var confAdapter *int = nil
 
@@ -81,24 +92,36 @@ func RetrieveStorages(diskConfig *api.BaremetalDiskConfig, storages []*Baremetal
 
 	selected = make([]*BaremetalStorage, 0)
 	rest = make([]*BaremetalStorage, 0)
+	errs := []error{}
+
 	idx := 0
 	curAdapter := 0
 	adapterChange := false
+	curDriver := ""
+	driverChange := false
 
 	for _, storage := range storages {
 		if storage.Adapter != curAdapter {
 			adapterChange = true
 			curAdapter = storage.Adapter
 		}
+		if storage.Driver != curDriver {
+			driverChange = true
+			curDriver = storage.Driver
+		}
 		if adapterChange {
 			idx = 0
 			adapterChange = false
+		}
+		if driverChange {
+			idx = 0
+			driverChange = false
 		}
 		if storage.Index == 0 {
 			storage.Index = int64(idx)
 		}
 
-		if isDiskConfigStorageMatch(diskConfig, confDriver, confAdapter, storage, selected) {
+		if isMatched, mErr := isDiskConfigStorageMatch(diskConfig, confDriver, confAdapter, storage, selected); isMatched {
 			if confDriver == nil {
 				confDriver = &storage.Driver
 			}
@@ -108,12 +131,16 @@ func RetrieveStorages(diskConfig *api.BaremetalDiskConfig, storages []*Baremetal
 			selected = append(selected, storage)
 		} else {
 			rest = append(rest, storage)
+			errs = append(errs, mErr)
 		}
 		if confDriver == nil {
 			idx++
 		} else if *confDriver == storage.Driver {
 			idx++
 		}
+	}
+	if len(errs) > 0 {
+		err = errors.NewAggregate(errs)
 	}
 	return
 }
@@ -347,10 +374,10 @@ func CalculateLayout(confs []*api.BaremetalDiskConfig, storages []*BaremetalStor
 			noneConf, _ := ParseDiskConfig(DISK_CONF_NONE)
 			conf = &noneConf
 		}
-		selected, restStorges := RetrieveStorages(conf, storages)
+		selected, restStorges, rErr := RetrieveStorages(conf, storages)
 		storages = restStorges
 		if len(selected) == 0 {
-			err = fmt.Errorf("Not found matched storages by config: %#v", conf)
+			err = errors.Wrapf(rErr, "not found matched storages by config: %#v", conf)
 			return
 		}
 		resultErr := MeetConfig(conf, selected)
@@ -426,6 +453,8 @@ func CheckDisksAllocable(layouts []Layout, disks []*api.DiskConfig) (bool, []*ap
 					storeFreeSize = -1
 				}
 			} else {
+				store := layouts[storeIndex]
+				log.Warningf("Disk size %dMB large than storage size %dMB, skip storage %s", disk.SizeMb, storeFreeSize, jsonutils.Marshal(store).PrettyString())
 				storeIndex++
 				storeFreeSize = -1
 			}
@@ -676,6 +705,15 @@ func ValidateDiskConfigs(confs []*api.BaremetalDiskConfig) error {
 			if hasRaidConf {
 				return fmt.Errorf("Raid config after none raid config %d", idx)
 			}
+		}
+	}
+	return nil
+}
+
+func ValidateRootDiskMatcher(input *api.BaremetalRootDiskMatcher) error {
+	if input.SizeMBRange != nil {
+		if input.SizeMBRange.Start > input.SizeMBRange.End {
+			return errors.Errorf("size_mb_range.start %d is large than size_mb_range.end %d", input.SizeMBRange.Start, input.SizeMBRange.End)
 		}
 	}
 	return nil

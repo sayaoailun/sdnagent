@@ -42,6 +42,7 @@ var FULLISO_TIME_REG *regexp.Regexp
 var ISO_TIME_REG2 *regexp.Regexp
 var ISO_NO_SECOND_TIME_REG2 *regexp.Regexp
 var FULLISO_TIME_REG2 *regexp.Regexp
+var FULLISO_TIME_REG3 *regexp.Regexp
 var ZSTACK_TIME_REG *regexp.Regexp
 var COMPACT_TIME_REG *regexp.Regexp
 var MYSQL_TIME_REG *regexp.Regexp
@@ -49,6 +50,7 @@ var CLICKHOUSE_TIME_REG *regexp.Regexp
 var NORMAL_TIME_REG *regexp.Regexp
 var FULLNORMAL_TIME_REG *regexp.Regexp
 var RFC2882_TIME_REG *regexp.Regexp
+var CEPH_TIME_REG *regexp.Regexp
 var EMAIL_REG *regexp.Regexp
 var CHINA_MOBILE_REG *regexp.Regexp
 var FS_FORMAT_REG *regexp.Regexp
@@ -77,6 +79,7 @@ func init() {
 	ISO_TIME_REG2 = regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})$`)
 	ISO_NO_SECOND_TIME_REG2 = regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(Z|[+-]\d{2}:\d{2})$`)
 	FULLISO_TIME_REG2 = regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3,9}(Z|[+-]\d{2}:\d{2})$`)
+	FULLISO_TIME_REG3 = regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3,9}$`)
 	COMPACT_TIME_REG = regexp.MustCompile(`^\d{14}$`)
 	ZSTACK_TIME_REG = regexp.MustCompile(`^\w+ \d{1,2}, \d{4} \d{1,2}:\d{1,2}:\d{1,2} (AM|PM)$`) //ZStack time format "Apr 1, 2019 3:23:17 PM"
 	MYSQL_TIME_REG = regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$`)
@@ -84,6 +87,8 @@ func init() {
 	NORMAL_TIME_REG = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$`)
 	FULLNORMAL_TIME_REG = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}$`)
 	RFC2882_TIME_REG = regexp.MustCompile(`[A-Z][a-z]{2}, [0-9]{1,2} [A-Z][a-z]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} [A-Z]{3}`)
+	// Tue May  7 15:46:33 2024
+	CEPH_TIME_REG = regexp.MustCompile(`[A-Z][a-z]{2} [A-Z][a-z]{2} [ 123][0-9] [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}`)
 	EMAIL_REG = regexp.MustCompile(`^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,4}$`)
 	CHINA_MOBILE_REG = regexp.MustCompile(`^1[0-9-]{10}$`)
 	FS_FORMAT_REG = regexp.MustCompile(`^(ext|fat|hfs|xfs|swap|ntfs|reiserfs|ufs|btrfs)`)
@@ -130,6 +135,14 @@ func MatchCIDR(str string) bool {
 		return false
 	}
 	return ip != nil && !strings.Contains(str, ":")
+}
+
+func MatchCIDR6(str string) bool {
+	ip, _, err := net.ParseCIDR(str)
+	if err != nil {
+		return false
+	}
+	return ip != nil && !strings.Contains(str, ".")
 }
 
 func MatchIP6Addr(str string) bool {
@@ -228,6 +241,10 @@ func MatchFullISOTime2(str string) bool {
 	return FULLISO_TIME_REG2.MatchString(str)
 }
 
+func MatchFullISOTime3(str string) bool {
+	return FULLISO_TIME_REG3.MatchString(str)
+}
+
 func MatchCompactTime(str string) bool {
 	return COMPACT_TIME_REG.MatchString(str)
 }
@@ -250,6 +267,10 @@ func MatchFullNormalTime(str string) bool {
 
 func MatchRFC2882Time(str string) bool {
 	return RFC2882_TIME_REG.MatchString(str)
+}
+
+func MatchCephTime(str string) bool {
+	return CEPH_TIME_REG.MatchString(str)
 }
 
 func MatchEmail(str string) bool {

@@ -20,12 +20,12 @@ import (
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/util/reflectutils"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -59,12 +59,12 @@ func (manager *SVirtualJointResourceBaseManager) AllowAttach(ctx context.Context
 	return false
 }
 
-func (manager *SVirtualJointResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery, owner mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
+func (manager *SVirtualJointResourceBaseManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if owner != nil {
 		masterQ := manager.GetMasterManager().Query("id")
-		masterQ = manager.GetMasterManager().FilterByOwner(masterQ, owner, scope)
+		masterQ = manager.GetMasterManager().FilterByOwner(ctx, masterQ, manager.GetMasterManager(), userCred, owner, scope)
 		slaveQ := manager.GetSlaveManager().Query("id")
-		slaveQ = manager.GetSlaveManager().FilterByOwner(slaveQ, owner, scope)
+		slaveQ = manager.GetSlaveManager().FilterByOwner(ctx, slaveQ, manager.GetSlaveManager(), userCred, owner, scope)
 		iManager := manager.GetIJointModelManager()
 		q = q.In(iManager.GetMasterFieldName(), masterQ.SubQuery())
 		q = q.In(iManager.GetSlaveFieldName(), slaveQ.SubQuery())
@@ -72,7 +72,7 @@ func (manager *SVirtualJointResourceBaseManager) FilterByOwner(q *sqlchemy.SQuer
 	return q
 }
 
-func (manager *SVirtualJointResourceBaseManager) FilterBySystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
+func (manager *SVirtualJointResourceBaseManager) FilterBySystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	q = manager.SJointResourceBaseManager.FilterBySystemAttributes(q, userCred, query, scope)
 	masterQ := manager.GetMasterManager().Query("id")
 	masterQ = manager.GetMasterManager().FilterBySystemAttributes(masterQ, userCred, query, scope)
@@ -84,7 +84,7 @@ func (manager *SVirtualJointResourceBaseManager) FilterBySystemAttributes(q *sql
 	return q
 }
 
-func (manager *SVirtualJointResourceBaseManager) FilterByHiddenSystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
+func (manager *SVirtualJointResourceBaseManager) FilterByHiddenSystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	q = manager.SJointResourceBaseManager.FilterByHiddenSystemAttributes(q, userCred, query, scope)
 	masterQ := manager.GetMasterManager().Query("id")
 	masterQ = manager.GetMasterManager().FilterByHiddenSystemAttributes(masterQ, userCred, query, scope)

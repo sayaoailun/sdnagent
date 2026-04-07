@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"reflect"
+	"strings"
 	"time"
 
 	"yunion.io/x/jsonutils"
@@ -85,7 +86,8 @@ func init() {
 
 type SBackupDiskConfig struct {
 	api.DiskConfig
-	Name string
+	Name        string
+	BackupAsTar *api.DiskBackupAsTarInput
 }
 
 func (dc *SBackupDiskConfig) String() string {
@@ -235,7 +237,7 @@ func (dm *SDiskBackupManager) ValidateCreateData(
 		return input, httperrors.NewMissingParameterError("backup_storage_id")
 	}
 	// check disk
-	_disk, err := validators.ValidateModel(userCred, DiskManager, &input.DiskId)
+	_disk, err := validators.ValidateModel(ctx, userCred, DiskManager, &input.DiskId)
 	if err != nil {
 		return input, err
 	}
@@ -251,7 +253,7 @@ func (dm *SDiskBackupManager) ValidateCreateData(
 		}
 	}
 
-	ibs, err := BackupStorageManager.FetchByIdOrName(userCred, input.BackupStorageId)
+	ibs, err := BackupStorageManager.FetchByIdOrName(ctx, userCred, input.BackupStorageId)
 	if err != nil {
 		if errors.Cause(err) == sql.ErrNoRows {
 			return input, httperrors.NewResourceNotFoundError2(BackupStorageManager.Keyword(), input.BackupStorageId)
@@ -268,6 +270,7 @@ func (dm *SDiskBackupManager) ValidateCreateData(
 	if bs.Status != api.BACKUPSTORAGE_STATUS_ONLINE {
 		return input, httperrors.NewForbiddenError("can't backup guest to backup storage with status %s", bs.Status)
 	}
+	input.BackupStorageId = bs.GetId()
 	storage, err := disk.GetStorage()
 	if err != nil {
 		return input, errors.Wrapf(err, "unable to get storage of disk %s", disk.GetId())
@@ -279,10 +282,40 @@ func (dm *SDiskBackupManager) ValidateCreateData(
 	}
 	input.CloudregionId = region.Id
 
+	if input.BackupAsTar != nil {
+		if input.BackupAsTar.ContainerId == "" {
+			return input, httperrors.NewMissingParameterError("container_id")
+		}
+		ctr, err := GetContainerManager().FetchByIdOrName(ctx, userCred, input.BackupAsTar.ContainerId)
+		if err != nil {
+			return input, httperrors.NewNotFoundError("fetch container by %s", input.BackupAsTar.ContainerId)
+		}
+		input.BackupAsTar.ContainerId = ctr.GetId()
+		if err := dm.validateBackupAsTarFiles(input.BackupAsTar.IncludeFiles); err != nil {
+			return input, httperrors.NewInputParameterError("validate include_files: %s", err)
+		}
+		if err := dm.validateBackupAsTarFiles(input.BackupAsTar.ExcludeFiles); err != nil {
+			return input, httperrors.NewInputParameterError("validate exclude_files: %s", err)
+		}
+	}
+
 	return input, nil
 }
 
+func (dm *SDiskBackupManager) validateBackupAsTarFiles(paths []string) error {
+	for _, p := range paths {
+		if strings.HasPrefix(p, "/") {
+			return httperrors.NewInputParameterError("%s can't start with /", p)
+		}
+	}
+	return nil
+}
+
 func (db *SDiskBackup) CustomizeCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) error {
+	input := new(api.DiskBackupCreateInput)
+	if err := data.Unmarshal(input); err != nil {
+		return err
+	}
 	err := db.SVirtualResourceBase.CustomizeCreate(ctx, userCred, ownerId, query, data)
 	if err != nil {
 		return err
@@ -293,8 +326,9 @@ func (db *SDiskBackup) CustomizeCreate(ctx context.Context, userCred mcclient.To
 	}
 	disk := diskObj.(*SDisk)
 	db.DiskConfig = &SBackupDiskConfig{
-		DiskConfig: *disk.ToDiskConfig(),
-		Name:       disk.GetName(),
+		DiskConfig:  *disk.ToDiskConfig(),
+		Name:        disk.GetName(),
+		BackupAsTar: input.BackupAsTar,
 	}
 	db.DiskType = disk.DiskType
 	db.DiskSizeMb = disk.DiskSize
@@ -311,7 +345,7 @@ func (db *SDiskBackup) PostCreate(ctx context.Context, userCred mcclient.TokenCr
 	if err != nil {
 		log.Errorf("unable to GetDisk: %s", err.Error())
 	}
-	err = disk.InheritTo(ctx, db)
+	err = disk.InheritTo(ctx, userCred, db)
 	if err != nil {
 		log.Errorf("unable to inherit from disk %s to backup %s: %s", disk.GetId(), db.GetId(), err.Error())
 	}
@@ -389,6 +423,15 @@ func (manager *SDiskBackupManager) OrderByExtraFields(ctx context.Context, q *sq
 	if err != nil {
 		return nil, errors.Wrap(err, "SCloudregionResourceBaseManager.OrderByExtraFields")
 	}
+
+	if db.NeedOrderQuery([]string{query.OrderByDiskName}) {
+		dQ := DiskManager.Query()
+		dSQ := dQ.AppendField(dQ.Field("name").Label("disk_name"), dQ.Field("id")).SubQuery()
+		q = q.LeftJoin(dSQ, sqlchemy.Equals(dSQ.Field("id"), q.Field("disk_id")))
+		q = q.AppendField(q.QueryFields()...)
+		q = q.AppendField(dSQ.Field("disk_name"))
+		q = db.OrderByFields(q, []string{query.OrderByDiskName}, []sqlchemy.IQueryField{q.Field("disk_name")})
+	}
 	return q, nil
 }
 
@@ -406,7 +449,7 @@ func (self *SDiskBackup) CustomizeDelete(ctx context.Context, userCred mcclient.
 }
 
 func (self *SDiskBackup) StartBackupDeleteTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string, forceDelete bool) error {
-	self.SetStatus(userCred, api.BACKUP_STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, api.BACKUP_STATUS_DELETING, "")
 	log.Infof("start to delete diskbackup %s and set deleting", self.GetId())
 	params := jsonutils.NewDict()
 	if forceDelete {
@@ -429,7 +472,7 @@ func (self *SDiskBackup) PerformRecovery(ctx context.Context, userCred mcclient.
 }
 
 func (self *SDiskBackup) StartRecoveryTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string, diskName string) error {
-	self.SetStatus(userCred, api.BACKUP_STATUS_RECOVERY, "")
+	self.SetStatus(ctx, userCred, api.BACKUP_STATUS_RECOVERY, "")
 	var params *jsonutils.JSONDict
 	if diskName != "" {
 		params = jsonutils.NewDict()

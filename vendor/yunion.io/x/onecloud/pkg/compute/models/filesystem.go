@@ -19,9 +19,11 @@ import (
 	"strings"
 	"time"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/billing"
 	"yunion.io/x/pkg/util/compare"
 	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
@@ -33,16 +35,14 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/billing"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
 type SFileSystemManager struct {
-	db.SStatusInfrasResourceBaseManager
+	db.SVirtualResourceBaseManager
 	db.SExternalizedResourceBaseManager
 	SManagedResourceBaseManager
 	SCloudregionResourceBaseManager
@@ -55,7 +55,7 @@ var FileSystemManager *SFileSystemManager
 
 func init() {
 	FileSystemManager = &SFileSystemManager{
-		SStatusInfrasResourceBaseManager: db.NewStatusInfrasResourceBaseManager(
+		SVirtualResourceBaseManager: db.NewVirtualResourceBaseManager(
 			SFileSystem{},
 			"file_systems_tbl",
 			"file_system",
@@ -66,7 +66,7 @@ func init() {
 }
 
 type SFileSystem struct {
-	db.SStatusInfrasResourceBase
+	db.SVirtualResourceBase
 	db.SExternalizedResourceBase
 	SManagedResourceBase
 	SBillingResourceBase
@@ -100,8 +100,8 @@ func (manager *SFileSystemManager) GetContextManagers() [][]db.IModelManager {
 	}
 }
 
-func (self *SFileSystem) GetCloudproviderId() string {
-	return self.ManagerId
+func (fileSystem *SFileSystem) GetCloudproviderId() string {
+	return fileSystem.ManagerId
 }
 
 func (manager *SFileSystemManager) ListItemFilter(
@@ -111,9 +111,9 @@ func (manager *SFileSystemManager) ListItemFilter(
 	query api.FileSystemListInput,
 ) (*sqlchemy.SQuery, error) {
 	var err error
-	q, err = manager.SStatusInfrasResourceBaseManager.ListItemFilter(ctx, q, userCred, query.StatusInfrasResourceBaseListInput)
+	q, err = manager.SVirtualResourceBaseManager.ListItemFilter(ctx, q, userCred, query.VirtualResourceListInput)
 	if err != nil {
-		return nil, errors.Wrapf(err, "SStatusInfrasResourceBaseManager.ListItemFilter")
+		return nil, errors.Wrapf(err, "SVirtualResourceBaseManager.ListItemFilter")
 	}
 	q, err = manager.SExternalizedResourceBaseManager.ListItemFilter(ctx, q, userCred, query.ExternalizedResourceBaseListInput)
 	if err != nil {
@@ -133,7 +133,7 @@ func (manager *SFileSystemManager) ListItemFilter(
 func (man *SFileSystemManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input api.FileSystemCreateInput) (api.FileSystemCreateInput, error) {
 	var err error
 	if len(input.NetworkId) > 0 {
-		net, err := validators.ValidateModel(userCred, NetworkManager, &input.NetworkId)
+		net, err := validators.ValidateModel(ctx, userCred, NetworkManager, &input.NetworkId)
 		if err != nil {
 			return input, err
 		}
@@ -148,7 +148,7 @@ func (man *SFileSystemManager) ValidateCreateData(ctx context.Context, userCred 
 	if len(input.ZoneId) == 0 {
 		return input, httperrors.NewMissingParameterError("zone_id")
 	}
-	_zone, err := validators.ValidateModel(userCred, ZoneManager, &input.ZoneId)
+	_zone, err := validators.ValidateModel(ctx, userCred, ZoneManager, &input.ZoneId)
 	if err != nil {
 		return input, err
 	}
@@ -180,33 +180,33 @@ func (man *SFileSystemManager) ValidateCreateData(ctx context.Context, userCred 
 		input.ExpiredAt = billingCycle.EndAt(tm)
 	}
 
-	input.StatusInfrasResourceBaseCreateInput, err = man.SStatusInfrasResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.StatusInfrasResourceBaseCreateInput)
+	input.VirtualResourceCreateInput, err = man.SVirtualResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.VirtualResourceCreateInput)
 	if err != nil {
 		return input, err
 	}
 	return input, nil
 }
 
-func (self *SFileSystem) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
-	self.SStatusInfrasResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
-	self.StartCreateTask(ctx, userCred, jsonutils.GetAnyString(data, []string{"network_id"}), "")
+func (fileSystem *SFileSystem) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
+	fileSystem.SVirtualResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
+	fileSystem.StartCreateTask(ctx, userCred, jsonutils.GetAnyString(data, []string{"network_id"}), "")
 }
 
-func (self *SFileSystem) StartCreateTask(ctx context.Context, userCred mcclient.TokenCredential, networkId string, parentTaskId string) error {
+func (fileSystem *SFileSystem) StartCreateTask(ctx context.Context, userCred mcclient.TokenCredential, networkId string, parentTaskId string) error {
 	var err = func() error {
 		params := jsonutils.NewDict()
 		params.Add(jsonutils.NewString(networkId), "network_id")
-		task, err := taskman.TaskManager.NewTask(ctx, "FileSystemCreateTask", self, userCred, params, parentTaskId, "", nil)
+		task, err := taskman.TaskManager.NewTask(ctx, "FileSystemCreateTask", fileSystem, userCred, params, parentTaskId, "", nil)
 		if err != nil {
 			return errors.Wrapf(err, "NewTask")
 		}
 		return task.ScheduleRun(nil)
 	}()
 	if err != nil {
-		self.SetStatus(userCred, api.NAS_STATUS_CREATE_FAILED, err.Error())
+		fileSystem.SetStatus(ctx, userCred, api.NAS_STATUS_CREATE_FAILED, err.Error())
 		return err
 	}
-	self.SetStatus(userCred, api.NAS_STATUS_CREATING, "")
+	fileSystem.SetStatus(ctx, userCred, api.NAS_STATUS_CREATING, "")
 	return nil
 }
 
@@ -219,15 +219,15 @@ func (manager SFileSystemManager) FetchCustomizeColumns(
 	isList bool,
 ) []api.FileSystemDetails {
 	rows := make([]api.FileSystemDetails, len(objs))
-	stdRows := manager.SStatusInfrasResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+	virtRows := manager.SVirtualResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	regionRows := manager.SCloudregionResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	mRows := manager.SManagedResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	zoneIds := make([]string, len(objs))
 	for i := range rows {
 		rows[i] = api.FileSystemDetails{
-			StatusInfrasResourceBaseDetails: stdRows[i],
-			CloudregionResourceInfo:         regionRows[i],
-			ManagedResourceInfo:             mRows[i],
+			VirtualResourceDetails:  virtRows[i],
+			CloudregionResourceInfo: regionRows[i],
+			ManagedResourceInfo:     mRows[i],
 		}
 		nas := objs[i].(*SFileSystem)
 		zoneIds[i] = nas.ZoneId
@@ -249,9 +249,9 @@ func (manager *SFileSystemManager) ListItemExportKeys(ctx context.Context,
 	keys stringutils2.SSortedStrings,
 ) (*sqlchemy.SQuery, error) {
 	var err error
-	q, err = manager.SStatusInfrasResourceBaseManager.ListItemExportKeys(ctx, q, userCred, keys)
+	q, err = manager.SVirtualResourceBaseManager.ListItemExportKeys(ctx, q, userCred, keys)
 	if err != nil {
-		return nil, errors.Wrap(err, "SStatusInfrasResourceBaseManager.ListItemExportKeys")
+		return nil, errors.Wrap(err, "SVirtualResourceBaseManager.ListItemExportKeys")
 	}
 	q, err = manager.SCloudregionResourceBaseManager.ListItemExportKeys(ctx, q, userCred, keys)
 	if err != nil {
@@ -263,7 +263,7 @@ func (manager *SFileSystemManager) ListItemExportKeys(ctx context.Context,
 func (manager *SFileSystemManager) QueryDistinctExtraField(q *sqlchemy.SQuery, field string) (*sqlchemy.SQuery, error) {
 	var err error
 
-	q, err = manager.SStatusInfrasResourceBaseManager.QueryDistinctExtraField(q, field)
+	q, err = manager.SVirtualResourceBaseManager.QueryDistinctExtraField(q, field)
 	if err == nil {
 		return q, nil
 	}
@@ -287,9 +287,9 @@ func (manager *SFileSystemManager) OrderByExtraFields(
 ) (*sqlchemy.SQuery, error) {
 	var err error
 
-	q, err = manager.SStatusInfrasResourceBaseManager.OrderByExtraFields(ctx, q, userCred, query.StatusInfrasResourceBaseListInput)
+	q, err = manager.SVirtualResourceBaseManager.OrderByExtraFields(ctx, q, userCred, query.VirtualResourceListInput)
 	if err != nil {
-		return nil, errors.Wrap(err, "SStatusInfrasResourceBaseManager.OrderByExtraFields")
+		return nil, errors.Wrap(err, "SVirtualResourceBaseManager.OrderByExtraFields")
 	}
 	q, err = manager.SManagedResourceBaseManager.OrderByExtraFields(ctx, q, userCred, query.ManagedResourceListInput)
 	if err != nil {
@@ -303,9 +303,12 @@ func (manager *SFileSystemManager) OrderByExtraFields(
 	return q, nil
 }
 
-func (self *SCloudregion) GetFileSystems() ([]SFileSystem, error) {
+func (region *SCloudregion) GetFileSystems(managerId string) ([]SFileSystem, error) {
 	ret := []SFileSystem{}
-	q := FileSystemManager.Query().Equals("cloudregion_id", self.Id)
+	q := FileSystemManager.Query().Equals("cloudregion_id", region.Id)
+	if len(managerId) > 0 {
+		q = q.Equals("manager_id", managerId)
+	}
 	err := db.FetchModelObjects(FileSystemManager, q, &ret)
 	if err != nil {
 		return nil, errors.Wrapf(err, "db.FetchModelObjects")
@@ -313,18 +316,24 @@ func (self *SCloudregion) GetFileSystems() ([]SFileSystem, error) {
 	return ret, nil
 }
 
-func (self *SCloudregion) SyncFileSystems(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, filesystems []cloudprovider.ICloudFileSystem) ([]SFileSystem, []cloudprovider.ICloudFileSystem, compare.SyncResult) {
-	lockman.LockRawObject(ctx, self.Id, "filesystems")
-	defer lockman.ReleaseRawObject(ctx, self.Id, "filesystems")
+func (region *SCloudregion) SyncFileSystems(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	provider *SCloudprovider,
+	filesystems []cloudprovider.ICloudFileSystem,
+	xor bool,
+) ([]SFileSystem, []cloudprovider.ICloudFileSystem, compare.SyncResult) {
+	lockman.LockRawObject(ctx, region.Id, FileSystemManager.Keyword())
+	defer lockman.ReleaseRawObject(ctx, region.Id, FileSystemManager.Keyword())
 
 	result := compare.SyncResult{}
 
 	localFSs := []SFileSystem{}
 	remoteFSs := []cloudprovider.ICloudFileSystem{}
 
-	dbFSs, err := self.GetFileSystems()
+	dbFSs, err := region.GetFileSystems(provider.Id)
 	if err != nil {
-		result.Error(errors.Wrapf(err, "self.GetFileSystems"))
+		result.Error(errors.Wrapf(err, "GetFileSystems"))
 		return localFSs, remoteFSs, result
 	}
 
@@ -347,22 +356,24 @@ func (self *SCloudregion) SyncFileSystems(ctx context.Context, userCred mcclient
 		result.Delete()
 	}
 	for i := 0; i < len(commondb); i += 1 {
-		err = commondb[i].SyncWithCloudFileSystem(ctx, userCred, commonext[i])
-		if err != nil {
-			result.UpdateError(err)
-			continue
+		if !xor {
+			err = commondb[i].SyncWithCloudFileSystem(ctx, userCred, commonext[i])
+			if err != nil {
+				result.UpdateError(err)
+				continue
+			}
 		}
 		localFSs = append(localFSs, commondb[i])
 		remoteFSs = append(remoteFSs, commonext[i])
 		result.Update()
 	}
 	for i := 0; i < len(added); i += 1 {
-		newFs, err := self.newFromCloudFileSystem(ctx, userCred, provider, added[i])
+		newFs, err := region.newFromCloudFileSystem(ctx, userCred, provider, added[i])
 		if err != nil {
 			result.AddError(err)
 			continue
 		}
-		syncMetadata(ctx, userCred, newFs, added[i])
+		syncMetadata(ctx, userCred, newFs, added[i], false)
 		localFSs = append(localFSs, *newFs)
 		remoteFSs = append(remoteFSs, added[i])
 		result.Add()
@@ -371,55 +382,55 @@ func (self *SCloudregion) SyncFileSystems(ctx context.Context, userCred mcclient
 	return localFSs, remoteFSs, result
 }
 
-func (self *SFileSystem) syncRemove(ctx context.Context, userCred mcclient.TokenCredential) error {
-	lockman.LockObject(ctx, self)
-	defer lockman.ReleaseObject(ctx, self)
+func (fileSystem *SFileSystem) syncRemove(ctx context.Context, userCred mcclient.TokenCredential) error {
+	lockman.LockObject(ctx, fileSystem)
+	defer lockman.ReleaseObject(ctx, fileSystem)
 
-	self.DeletePreventionOff(self, userCred)
+	fileSystem.DeletePreventionOff(fileSystem, userCred)
 
-	err := self.ValidateDeleteCondition(ctx, nil)
+	err := fileSystem.ValidateDeleteCondition(ctx, nil)
 	if err != nil { // cannot delete
-		return self.SetStatus(userCred, api.NAS_STATUS_UNKNOWN, "sync to delete")
+		return fileSystem.SetStatus(ctx, userCred, api.NAS_STATUS_UNKNOWN, "sync to delete")
 	}
 
-	err = self.RealDelete(ctx, userCred)
+	err = fileSystem.RealDelete(ctx, userCred)
 	if err != nil {
 		return err
 	}
 	notifyclient.EventNotify(ctx, userCred, notifyclient.SEventNotifyParam{
-		Obj:    self,
+		Obj:    fileSystem,
 		Action: notifyclient.ActionSyncDelete,
 	})
 	return nil
 }
 
-func (self *SFileSystem) CustomizeDelete(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) error {
+func (fileSystem *SFileSystem) CustomizeDelete(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) error {
 
-	return self.StartDeleteTask(ctx, userCred, "")
+	return fileSystem.StartDeleteTask(ctx, userCred, "")
 }
 
-func (self *SFileSystem) StartDeleteTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
+func (fileSystem *SFileSystem) StartDeleteTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
 	var err = func() error {
-		task, err := taskman.TaskManager.NewTask(ctx, "FileSystemDeleteTask", self, userCred, nil, parentTaskId, "", nil)
+		task, err := taskman.TaskManager.NewTask(ctx, "FileSystemDeleteTask", fileSystem, userCred, nil, parentTaskId, "", nil)
 		if err != nil {
 			return errors.Wrapf(err, "NewTask")
 		}
 		return task.ScheduleRun(nil)
 	}()
 	if err != nil {
-		self.SetStatus(userCred, api.NAS_STATUS_DELETE_FAILED, err.Error())
+		fileSystem.SetStatus(ctx, userCred, api.NAS_STATUS_DELETE_FAILED, err.Error())
 		return nil
 	}
-	self.SetStatus(userCred, api.NAS_STATUS_DELETING, "")
+	fileSystem.SetStatus(ctx, userCred, api.NAS_STATUS_DELETING, "")
 	return nil
 }
 
-func (self *SFileSystem) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
+func (fileSystem *SFileSystem) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
 	return nil
 }
 
-func (self *SFileSystem) RealDelete(ctx context.Context, userCred mcclient.TokenCredential) error {
-	mts, err := self.GetMountTargets()
+func (fileSystem *SFileSystem) RealDelete(ctx context.Context, userCred mcclient.TokenCredential) error {
+	mts, err := fileSystem.GetMountTargets()
 	if err != nil {
 		return errors.Wrapf(err, "GetMountTargets")
 	}
@@ -429,36 +440,43 @@ func (self *SFileSystem) RealDelete(ctx context.Context, userCred mcclient.Token
 			return errors.Wrapf(err, "mount target %s real delete", mts[i].DomainName)
 		}
 	}
-	return self.SInfrasResourceBase.Delete(ctx, userCred)
+	return fileSystem.SVirtualResourceBase.Delete(ctx, userCred)
 }
 
-func (self *SFileSystem) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
-	if self.DisableDelete.IsTrue() {
+func (fileSystem *SFileSystem) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
+	if fileSystem.DisableDelete.IsTrue() {
 		return httperrors.NewInvalidStatusError("FileSystem is locked, cannot delete")
 	}
-	return self.SStatusInfrasResourceBase.ValidateDeleteCondition(ctx, nil)
+	return fileSystem.SVirtualResourceBase.ValidateDeleteCondition(ctx, nil)
 }
 
-func (self *SFileSystem) SyncAllWithCloudFileSystem(ctx context.Context, userCred mcclient.TokenCredential, fs cloudprovider.ICloudFileSystem) error {
-	syncFileSystemMountTargets(ctx, userCred, self, fs)
-	return self.SyncWithCloudFileSystem(ctx, userCred, fs)
+func (fileSystem *SFileSystem) SyncAllWithCloudFileSystem(ctx context.Context, userCred mcclient.TokenCredential, fs cloudprovider.ICloudFileSystem) error {
+	syncFileSystemMountTargets(ctx, userCred, fileSystem, fs, false)
+	return fileSystem.SyncWithCloudFileSystem(ctx, userCred, fs)
 }
 
-func (self *SFileSystem) SyncWithCloudFileSystem(ctx context.Context, userCred mcclient.TokenCredential, fs cloudprovider.ICloudFileSystem) error {
-	diff, err := db.Update(self, func() error {
-		self.Status = fs.GetStatus()
-		self.StorageType = fs.GetStorageType()
-		self.Protocol = fs.GetProtocol()
-		self.Capacity = fs.GetCapacityGb()
-		self.UsedCapacity = fs.GetUsedCapacityGb()
-		self.FileSystemType = fs.GetFileSystemType()
-		self.MountTargetCountLimit = fs.GetMountTargetCountLimit()
-		if zoneId := fs.GetZoneId(); len(zoneId) > 0 {
-			region, err := self.GetRegion()
-			if err != nil {
-				return errors.Wrapf(err, "self.GetRegion")
+func (fileSystem *SFileSystem) SyncWithCloudFileSystem(ctx context.Context, userCred mcclient.TokenCredential, fs cloudprovider.ICloudFileSystem) error {
+	diff, err := db.Update(fileSystem, func() error {
+		if options.Options.EnableSyncName {
+			newName, _ := db.GenerateAlterName(fileSystem, fs.GetName())
+			if len(newName) > 0 {
+				fileSystem.Name = newName
 			}
-			self.ZoneId, _ = region.getZoneIdBySuffix(zoneId)
+		}
+
+		fileSystem.Status = fs.GetStatus()
+		fileSystem.StorageType = fs.GetStorageType()
+		fileSystem.Protocol = fs.GetProtocol()
+		fileSystem.Capacity = fs.GetCapacityGb()
+		fileSystem.UsedCapacity = fs.GetUsedCapacityGb()
+		fileSystem.FileSystemType = fs.GetFileSystemType()
+		fileSystem.MountTargetCountLimit = fs.GetMountTargetCountLimit()
+		if zoneId := fs.GetZoneId(); len(zoneId) > 0 {
+			region, err := fileSystem.GetRegion()
+			if err != nil {
+				return errors.Wrapf(err, "fileSystem.GetRegion")
+			}
+			fileSystem.ZoneId, _ = region.getZoneIdBySuffix(zoneId)
 		}
 		return nil
 	})
@@ -467,16 +485,23 @@ func (self *SFileSystem) SyncWithCloudFileSystem(ctx context.Context, userCred m
 	}
 	if len(diff) > 0 {
 		notifyclient.EventNotify(ctx, userCred, notifyclient.SEventNotifyParam{
-			Obj:    self,
+			Obj:    fileSystem,
 			Action: notifyclient.ActionSyncUpdate,
 		})
 	}
-	syncMetadata(ctx, userCred, self, fs)
+	if account := fileSystem.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, fileSystem, fs, account.ReadOnly)
+	}
+
+	if provider := fileSystem.GetCloudprovider(); provider != nil {
+		SyncCloudProject(ctx, userCred, fileSystem, provider.GetOwnerId(), fs, provider)
+	}
+
 	return nil
 }
 
-func (self *SCloudregion) getZoneIdBySuffix(zoneId string) (string, error) {
-	zones, err := self.GetZones()
+func (region *SCloudregion) getZoneIdBySuffix(zoneId string) (string, error) {
+	zones, err := region.GetZones()
 	if err != nil {
 		return "", errors.Wrapf(err, "region.GetZones")
 	}
@@ -488,11 +513,11 @@ func (self *SCloudregion) getZoneIdBySuffix(zoneId string) (string, error) {
 	return "", errors.Wrapf(cloudprovider.ErrNotFound, zoneId)
 }
 
-func (self *SCloudregion) newFromCloudFileSystem(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, fs cloudprovider.ICloudFileSystem) (*SFileSystem, error) {
+func (region *SCloudregion) newFromCloudFileSystem(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, fs cloudprovider.ICloudFileSystem) (*SFileSystem, error) {
 	nas := SFileSystem{}
 	nas.SetModelManager(FileSystemManager, &nas)
 	nas.ExternalId = fs.GetGlobalId()
-	nas.CloudregionId = self.Id
+	nas.CloudregionId = region.Id
 	nas.ManagerId = provider.Id
 	nas.Status = fs.GetStatus()
 	nas.CreatedAt = fs.GetCreatedAt()
@@ -503,7 +528,7 @@ func (self *SCloudregion) newFromCloudFileSystem(ctx context.Context, userCred m
 	nas.FileSystemType = fs.GetFileSystemType()
 	nas.MountTargetCountLimit = fs.GetMountTargetCountLimit()
 	if zoneId := fs.GetZoneId(); len(zoneId) > 0 {
-		nas.ZoneId, _ = self.getZoneIdBySuffix(zoneId)
+		nas.ZoneId, _ = region.getZoneIdBySuffix(zoneId)
 	}
 	fileSystem, err := func() (*SFileSystem, error) {
 		lockman.LockRawObject(ctx, FileSystemManager.Keyword(), "name")
@@ -524,13 +549,20 @@ func (self *SCloudregion) newFromCloudFileSystem(ctx context.Context, userCred m
 		Obj:    &nas,
 		Action: notifyclient.ActionSyncCreate,
 	})
+
+	if account, _ := provider.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, fileSystem, fs, account.ReadOnly)
+	}
+
+	SyncCloudProject(ctx, userCred, fileSystem, provider.GetOwnerId(), fs, provider)
+
 	return fileSystem, nil
 }
 
 // 同步NAS状态
-func (self *SFileSystem) PerformSyncstatus(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.FileSystemSyncstatusInput) (jsonutils.JSONObject, error) {
+func (fileSystem *SFileSystem) PerformSyncstatus(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.FileSystemSyncstatusInput) (jsonutils.JSONObject, error) {
 	var openTask = true
-	count, err := taskman.TaskManager.QueryTasksOfObject(self, time.Now().Add(-3*time.Minute), &openTask).CountWithError()
+	count, err := taskman.TaskManager.QueryTasksOfObject(fileSystem, time.Now().Add(-3*time.Minute), &openTask).CountWithError()
 	if err != nil {
 		return nil, err
 	}
@@ -538,21 +570,24 @@ func (self *SFileSystem) PerformSyncstatus(ctx context.Context, userCred mcclien
 		return nil, httperrors.NewBadRequestError("Nas has %d task active, can't sync status", count)
 	}
 
-	return nil, self.StartSyncstatus(ctx, userCred, "")
+	return nil, fileSystem.StartSyncstatus(ctx, userCred, "")
 }
 
-func (self *SFileSystem) StartSyncstatus(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
-	return StartResourceSyncStatusTask(ctx, userCred, self, "FileSystemSyncstatusTask", parentTaskId)
+func (fileSystem *SFileSystem) StartSyncstatus(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
+	return StartResourceSyncStatusTask(ctx, userCred, fileSystem, "FileSystemSyncstatusTask", parentTaskId)
 }
 
-func (self *SFileSystem) GetIRegion(ctx context.Context) (cloudprovider.ICloudRegion, error) {
-	provider, err := self.GetDriver(ctx)
+func (fileSystem *SFileSystem) GetIRegion(ctx context.Context) (cloudprovider.ICloudRegion, error) {
+	provider, err := fileSystem.GetDriver(ctx)
 	if err != nil {
-		return nil, errors.Wrapf(err, "self.GetDriver")
+		return nil, errors.Wrapf(err, "fileSystem.GetDriver")
 	}
-	region, err := self.GetRegion()
+	if provider.GetFactory().IsOnPremise() {
+		return provider.GetOnPremiseIRegion()
+	}
+	region, err := fileSystem.GetRegion()
 	if err != nil {
-		return nil, errors.Wrapf(err, "self.GetRegion")
+		return nil, errors.Wrapf(err, "fileSystem.GetRegion")
 	}
 	iRegion, err := provider.GetIRegionById(region.ExternalId)
 	if err != nil {
@@ -561,15 +596,15 @@ func (self *SFileSystem) GetIRegion(ctx context.Context) (cloudprovider.ICloudRe
 	return iRegion, nil
 }
 
-func (self *SFileSystem) GetICloudFileSystem(ctx context.Context) (cloudprovider.ICloudFileSystem, error) {
-	if len(self.ExternalId) == 0 {
+func (fileSystem *SFileSystem) GetICloudFileSystem(ctx context.Context) (cloudprovider.ICloudFileSystem, error) {
+	if len(fileSystem.ExternalId) == 0 {
 		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "empty externalId")
 	}
-	iRegion, err := self.GetIRegion(ctx)
+	iRegion, err := fileSystem.GetIRegion(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "self.GetIRegion")
+		return nil, errors.Wrap(err, "fileSystem.GetIRegion")
 	}
-	return iRegion.GetICloudFileSystemById(self.ExternalId)
+	return iRegion.GetICloudFileSystemById(fileSystem.ExternalId)
 }
 
 func (manager *SFileSystemManager) getExpiredPostpaids() ([]SFileSystem, error) {
@@ -583,12 +618,12 @@ func (manager *SFileSystemManager) getExpiredPostpaids() ([]SFileSystem, error) 
 	return fs, nil
 }
 
-func (self *SFileSystem) doExternalSync(ctx context.Context, userCred mcclient.TokenCredential) error {
-	iFs, err := self.GetICloudFileSystem(ctx)
+func (fileSystem *SFileSystem) doExternalSync(ctx context.Context, userCred mcclient.TokenCredential) error {
+	iFs, err := fileSystem.GetICloudFileSystem(ctx)
 	if err != nil {
 		return errors.Wrapf(err, "GetICloudFileSystem")
 	}
-	return self.SyncWithCloudFileSystem(ctx, userCred, iFs)
+	return fileSystem.SyncWithCloudFileSystem(ctx, userCred, iFs)
 }
 
 func (manager *SFileSystemManager) DeleteExpiredPostpaids(ctx context.Context, userCred mcclient.TokenCredential, isStart bool) {
@@ -609,26 +644,43 @@ func (manager *SFileSystemManager) DeleteExpiredPostpaids(ctx context.Context, u
 	}
 }
 
-func (self *SFileSystem) PerformRemoteUpdate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.FileSystemRemoteUpdateInput) (jsonutils.JSONObject, error) {
-	return nil, self.StartRemoteUpdateTask(ctx, userCred, (input.ReplaceTags != nil && *input.ReplaceTags), "")
+func (fileSystem *SFileSystem) PerformRemoteUpdate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.FileSystemRemoteUpdateInput) (jsonutils.JSONObject, error) {
+	return nil, fileSystem.StartRemoteUpdateTask(ctx, userCred, (input.ReplaceTags != nil && *input.ReplaceTags), "")
 }
 
-func (self *SFileSystem) StartRemoteUpdateTask(ctx context.Context, userCred mcclient.TokenCredential, replaceTags bool, parentTaskId string) error {
+func (fileSystem *SFileSystem) StartRemoteUpdateTask(ctx context.Context, userCred mcclient.TokenCredential, replaceTags bool, parentTaskId string) error {
 	data := jsonutils.NewDict()
 	if replaceTags {
 		data.Add(jsonutils.JSONTrue, "replace_tags")
 	}
-	task, err := taskman.TaskManager.NewTask(ctx, "FileSystemRemoteUpdateTask", self, userCred, data, parentTaskId, "", nil)
+	task, err := taskman.TaskManager.NewTask(ctx, "FileSystemRemoteUpdateTask", fileSystem, userCred, data, parentTaskId, "", nil)
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, api.NAS_UPDATE_TAGS, "StartRemoteUpdateTask")
+	fileSystem.SetStatus(ctx, userCred, api.NAS_UPDATE_TAGS, "StartRemoteUpdateTask")
 	return task.ScheduleRun(nil)
 }
 
-func (self *SFileSystem) OnMetadataUpdated(ctx context.Context, userCred mcclient.TokenCredential) {
-	if len(self.ExternalId) == 0 {
+func (fileSystem *SFileSystem) OnMetadataUpdated(ctx context.Context, userCred mcclient.TokenCredential) {
+	if len(fileSystem.ExternalId) == 0 || options.Options.KeepTagLocalization {
 		return
 	}
-	self.StartRemoteUpdateTask(ctx, userCred, true, "")
+	if account := fileSystem.GetCloudaccount(); account != nil && account.ReadOnly {
+		return
+	}
+	fileSystem.StartRemoteUpdateTask(ctx, userCred, true, "")
+}
+
+func (fileSystem *SFileSystem) GetShortDesc(ctx context.Context) *jsonutils.JSONDict {
+	desc := fileSystem.SVirtualResourceBase.GetShortDesc(ctx)
+	region, _ := fileSystem.GetRegion()
+	provider := fileSystem.GetCloudprovider()
+	info := MakeCloudProviderInfo(region, nil, provider)
+	desc.Set("file_system_type", jsonutils.NewString(fileSystem.FileSystemType))
+	desc.Set("storage_type", jsonutils.NewString(fileSystem.StorageType))
+	desc.Set("protocol", jsonutils.NewString(fileSystem.Protocol))
+	desc.Set("capacity", jsonutils.NewInt(fileSystem.Capacity))
+	desc.Set("used_capacity", jsonutils.NewInt(fileSystem.UsedCapacity))
+	desc.Update(jsonutils.Marshal(&info))
+	return desc
 }

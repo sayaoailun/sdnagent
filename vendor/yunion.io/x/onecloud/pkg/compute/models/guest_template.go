@@ -22,11 +22,13 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/util/sets"
 	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
+	api "yunion.io/x/onecloud/pkg/apis/compute"
 	computeapis "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/cmdline"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -37,7 +39,6 @@ import (
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	"yunion.io/x/onecloud/pkg/mcclient/modules/image"
 	"yunion.io/x/onecloud/pkg/util/logclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -132,7 +133,7 @@ func (gtm *SGuestTemplateManager) ValidateCreateData(
 
 func (gt *SGuestTemplate) PostCreate(ctx context.Context, userCred mcclient.TokenCredential,
 	ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
-	gt.SetStatus(userCred, computeapis.GT_READY, "")
+	gt.SetStatus(ctx, userCred, computeapis.GT_READY, "")
 	gt.updateCheckTime()
 	logclient.AddActionLogWithContext(ctx, gt, logclient.ACT_CREATE, nil, userCred, true)
 }
@@ -359,8 +360,7 @@ func (gt *SGuestTemplate) getMoreDetails(ctx context.Context, userCred mcclient.
 	// sku deal
 	if len(input.InstanceType) > 0 {
 		skuOutput := computeapis.GuestTemplateSku{}
-		provider := GetDriver(gt.Hypervisor).GetProvider()
-		sku, err := ServerSkuManager.FetchSkuByNameAndProvider(input.InstanceType, provider, true)
+		sku, err := ServerSkuManager.FetchSkuByNameAndProvider(input.InstanceType, out.Provider, true)
 		if err != nil {
 			skuOutput.Name = input.InstanceType
 			skuOutput.MemorySizeMb = gt.VmemSize
@@ -389,7 +389,7 @@ func (gt *SGuestTemplate) getMoreDetails(ctx context.Context, userCred mcclient.
 
 	// keypair
 	if len(input.KeypairId) > 0 {
-		model, err := KeypairManager.FetchByIdOrName(userCred, input.KeypairId)
+		model, err := KeypairManager.FetchByIdOrName(ctx, userCred, input.KeypairId)
 		if err == nil {
 			keypair := model.(*SKeypair)
 			configInfo.Keypair = keypair.GetName()
@@ -515,17 +515,17 @@ func (gt *SGuestTemplate) PerformPublic(
 	}
 
 	targetScopeStr := data.Scope
-	targetScope := rbacutils.String2ScopeDefault(targetScopeStr, rbacutils.ScopeSystem)
+	targetScope := rbacscope.String2ScopeDefault(targetScopeStr, rbacscope.ScopeSystem)
 
 	// check if secgroup is public
 	if len(input.SecgroupId) > 0 {
-		model, err := SecurityGroupManager.FetchByIdOrName(userCred, input.SecgroupId)
+		model, err := SecurityGroupManager.FetchByIdOrName(ctx, userCred, input.SecgroupId)
 		if err != nil {
 			return nil, httperrors.NewResourceNotFoundError("there is no such secgroup %s descripted by guest template",
 				input.SecgroupId)
 		}
 		secgroup := model.(*SSecurityGroup)
-		sgScope := rbacutils.String2Scope(secgroup.PublicScope)
+		sgScope := rbacscope.String2Scope(secgroup.PublicScope)
 		if !secgroup.IsPublic || !sgScope.HigherEqual(targetScope) {
 			return nil, gt.genForbiddenError("security group", input.SecgroupId, string(targetScope))
 		}
@@ -535,13 +535,13 @@ func (gt *SGuestTemplate) PerformPublic(
 	if len(input.Networks) > 0 {
 		for i := range input.Networks {
 			str := input.Networks[i].Network
-			model, err := NetworkManager.FetchByIdOrName(userCred, str)
+			model, err := NetworkManager.FetchByIdOrName(ctx, userCred, str)
 			if err != nil {
 				return nil, httperrors.NewResourceNotFoundError(
 					"there is no such secgroup %s descripted by guest template", str)
 			}
 			network := model.(*SNetwork)
-			netScope := rbacutils.String2Scope(network.PublicScope)
+			netScope := rbacscope.String2Scope(network.PublicScope)
 			if !network.IsPublic || !netScope.HigherEqual(targetScope) {
 				return nil, gt.genForbiddenError("network", str, string(targetScope))
 			}
@@ -571,7 +571,7 @@ func (gt *SGuestTemplate) PerformPublic(
 	default:
 		//no arrivals
 	}
-	igScope := rbacutils.String2Scope(publicScope)
+	igScope := rbacscope.String2Scope(publicScope)
 	if !isPublic || !igScope.HigherEqual(targetScope) {
 		return nil, gt.genForbiddenError("image", "", string(targetScope))
 	}
@@ -642,6 +642,23 @@ func (manager *SGuestTemplateManager) ListItemFilter(
 		q, err = manager.SVpcResourceBaseManager.ListItemFilter(ctx, q, userCred, input.VpcFilterListInput)
 		if err != nil {
 			return nil, errors.Wrap(err, "SVpcResourceBaseManager.ListItemFilter")
+		}
+	}
+	if len(input.CloudEnv) > 0 {
+		cloudregions := CloudregionManager.Query().SubQuery()
+		q = q.Join(cloudregions, sqlchemy.Equals(q.Field("cloudregion_id"), cloudregions.Field("id")))
+		switch input.CloudEnv {
+		case api.CLOUD_ENV_PUBLIC_CLOUD:
+			q = q.Filter(sqlchemy.In(cloudregions.Field("provider"), CloudproviderManager.GetPublicProviderProvidersQuery()))
+		case api.CLOUD_ENV_PRIVATE_CLOUD:
+			q = q.Filter(sqlchemy.In(cloudregions.Field("provider"), CloudproviderManager.GetPrivateProviderProvidersQuery()))
+		case api.CLOUD_ENV_ON_PREMISE:
+			q = q.Filter(sqlchemy.Equals(cloudregions.Field("provider"), api.CLOUD_PROVIDER_ONECLOUD))
+		case api.CLOUD_ENV_PRIVATE_ON_PREMISE:
+			q = q.Filter(sqlchemy.OR(
+				sqlchemy.Equals(cloudregions.Field("provider"), api.CLOUD_PROVIDER_ONECLOUD),
+				sqlchemy.In(cloudregions.Field("provider"), CloudproviderManager.GetPrivateProviderProvidersQuery()),
+			))
 		}
 	}
 	if len(input.BillingType) > 0 {
@@ -758,7 +775,7 @@ func (manager *SGuestTemplateManager) ListItemExportKeys(ctx context.Context,
 
 func (g *SGuest) PerformSaveTemplate(ctx context.Context, userCred mcclient.TokenCredential,
 	query jsonutils.JSONObject, input computeapis.GuestSaveToTemplateInput) (jsonutils.JSONObject, error) {
-	g.SetStatus(userCred, computeapis.VM_TEMPLATE_SAVING, "save to template")
+	g.SetStatus(ctx, userCred, computeapis.VM_TEMPLATE_SAVING, "save to template")
 
 	if len(input.Name) == 0 && len(input.GenerateName) == 0 {
 		input.GenerateName = fmt.Sprintf("%s-template", g.Name)
@@ -780,14 +797,14 @@ func (gt *SGuestTemplate) inspect(ctx context.Context, userCred mcclient.TokenCr
 	_, err := GuestTemplateManager.validateContent(ctx, userCred, gt.GetOwnerId(), jsonutils.NewDict(), gt.Content.(*jsonutils.JSONDict))
 	if err == nil {
 		gt.updateCheckTime()
-		gt.SetStatus(userCred, computeapis.GT_READY, "inspect successfully")
+		gt.SetStatus(ctx, userCred, computeapis.GT_READY, "inspect successfully")
 		logclient.AddSimpleActionLog(gt, logclient.ACT_HEALTH_CHECK, "", userCred, true)
 		return nil
 	}
 	// invalid
 	gt.updateCheckTime()
 	reason := fmt.Sprintf("During the inspection, the guest template is not available: %s", err.Error())
-	gt.SetStatus(userCred, computeapis.GT_INVALID, reason)
+	gt.SetStatus(ctx, userCred, computeapis.GT_INVALID, reason)
 	logclient.AddSimpleActionLog(gt, logclient.ACT_HEALTH_CHECK, reason, userCred, false)
 	return nil
 }

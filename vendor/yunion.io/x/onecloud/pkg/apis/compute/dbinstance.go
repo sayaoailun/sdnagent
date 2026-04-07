@@ -220,7 +220,10 @@ type DBInstanceListInput struct {
 	InstanceType string `json:"instance_type"`
 
 	// 通过IP搜索RDS实例
-	IpAddr string `json:"ip_addr"`
+	IpAddr []string `json:"ip_addr"`
+
+	// 通过安全组Id过滤RDS实例
+	SecgroupId string `json:"secgroup_id"`
 }
 
 type DBInstanceBackupListInput struct {
@@ -345,7 +348,8 @@ func (self DBInstanceDetails) GetMetricTags() map[string]string {
 	if len(self.IpAddrs) > 0 {
 		ret["rds_ip"] = strings.ReplaceAll(self.IpAddrs, ",", "|")
 	}
-	return ret
+
+	return AppendMetricTags(ret, self.MetadataResourceInfo, self.ProjectizedResourceInfo)
 }
 
 func (self DBInstanceDetails) GetMetricPairs() map[string]string {

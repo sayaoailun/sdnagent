@@ -16,14 +16,7 @@ package compute
 
 import "yunion.io/x/onecloud/pkg/apis"
 
-type VpcDetails struct {
-	apis.EnabledStatusInfrasResourceBaseDetails
-	ManagedResourceInfo
-	CloudregionResourceInfo
-	GlobalVpcResourceInfo
-
-	SVpc
-
+type VpcUsage struct {
 	// 二层网络数量
 	// example: 1
 	WireCount int `json:"wire_count"`
@@ -40,6 +33,20 @@ type VpcDetails struct {
 	// DnsZone个数
 	// example: 2
 	DnsZoneCount int `json:"dns_zone_count"`
+
+	RequestVpcPeerCount int `json:"request_vpc_peer_count"`
+	AcceptVpcPeerCount  int `json:"accpet_vpc_peer_count"`
+}
+
+type VpcDetails struct {
+	apis.EnabledStatusInfrasResourceBaseDetails
+	ManagedResourceInfo
+	CloudregionResourceInfo
+	GlobalVpcResourceInfo
+
+	SVpc
+
+	VpcUsage
 }
 
 type VpcResourceInfoBase struct {
@@ -48,6 +55,9 @@ type VpcResourceInfoBase struct {
 
 	// VPC外部Id
 	VpcExtId string `json:"vpc_ext_id"`
+
+	// 是否为经典网络
+	IsDefaultVpc bool `json:"is_default_vpc"`
 }
 
 type VpcResourceInfo struct {
@@ -77,6 +87,9 @@ type VpcCreateInput struct {
 	// CIDR_BLOCK
 	CidrBlock string `json:"cidr_block"`
 
+	// CIDR_BLOCK
+	CidrBlock6 string `json:"cidr_block6"`
+
 	// 仅对谷歌云有用，若谷歌云订阅只有一个全局VPC，此参数可不传
 	// 若有多个全局VPC，谷歌云需要指定其中一个全局VPC
 	GlobalvpcId string `json:"globalvpc_id"`
@@ -90,6 +103,12 @@ type VpcUpdateInput struct {
 
 	// Vpc外网访问模式
 	ExternalAccessMode string `json:"external_access_mode"`
+
+	// CIDR BLOCK of IPv4
+	CidrBlock string `json:"cidr_block"`
+
+	// CIDR BLOCK of IPv6
+	CidrBlock6 string `json:"cidr_block6"`
 }
 
 type VpcResourceInput struct {
@@ -104,8 +123,20 @@ type VpcResourceInput struct {
 	ExternalAccessMode string `json:"external_access_mode"`
 }
 
+type VpcListItemInput struct {
+	// 关联VPC(ID或Name)
+	VpcId []string `json:"vpc_id"`
+	// swagger:ignore
+	// Deprecated
+	// filter by vpc Id
+	Vpc []string `json:"vpc" yunion-deprecated-by:"vpc_id"`
+
+	// Vpc外网访问模式
+	ExternalAccessMode string `json:"external_access_mode"`
+}
+
 type VpcFilterListInputBase struct {
-	VpcResourceInput
+	VpcListItemInput
 
 	// 按VPC名称排序
 	// pattern:asc|desc
@@ -122,14 +153,17 @@ type VpcTopologyInput struct {
 }
 
 type NetworkTopologyOutput struct {
-	Name         string                `json:"name"`
-	Status       string                `json:"status"`
-	GuestIpStart string                `json:"guest_ip_start"`
-	GuestIpEnd   string                `json:"guest_ip_end"`
-	GuestIpMask  int8                  `json:"guest_ip_mask"`
-	ServerType   string                `json:"server_type"`
-	VlanId       int                   `json:"vlan_id"`
-	Address      []SNetworkUsedAddress `json:"address"`
+	Name         string `json:"name"`
+	Status       string `json:"status"`
+	GuestIpStart string `json:"guest_ip_start"`
+	GuestIpEnd   string `json:"guest_ip_end"`
+	GuestIpMask  int8   `json:"guest_ip_mask"`
+	VlanId       int    `json:"vlan_id"`
+
+	ServerType TNetworkType `json:"server_type"`
+
+	GetNetworkAddressesOutput
+	// Address      []SNetworkUsedAddress `json:"address"`
 }
 
 type HostnetworkTopologyOutput struct {

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -47,11 +48,14 @@ func init() {
 type SGuestcdrom struct {
 	db.SModelBase
 
-	Id            string    `width:"36" charset:"ascii" primary:"true"`   // = Column(VARCHAR(36, charset='ascii'), primary_key=True)
+	RowId         int64     `primary:"true" auto_increment:"true" list:"user"`
+	Ordinal       int       `nullable:"false" default:"0"`                // = Column(Integer, nullable=False, default=0)
+	Id            string    `width:"36" charset:"ascii"`                  // = Column(VARCHAR(36, charset='ascii'), primary_key=True)
 	ImageId       string    `width:"36" charset:"ascii" nullable:"true"`  // Column(VARCHAR(36, charset='ascii'), nullable=True)
 	Name          string    `width:"64" charset:"ascii" nullable:"true"`  // Column(VARCHAR(64, charset='ascii'), nullable=True)
 	Path          string    `width:"256" charset:"ascii" nullable:"true"` // Column(VARCHAR(256, charset='ascii'), nullable=True)
 	Size          int64     `nullable:"false" default:"0"`                // = Column(Integer, nullable=False, default=0)
+	BootIndex     int8      `nullable:"false" default:"-1" list:"user" update:"user"`
 	UpdatedAt     time.Time `nullable:"false" updated_at:"true" nullable:"false"`
 	UpdateVersion int       `default:"0" nullable:"false" auto_version:"true"`
 }
@@ -75,12 +79,17 @@ func (self *SGuestcdrom) insertIso(imageId string) bool {
 	}
 }
 
-func (self *SGuestcdrom) insertIsoSucc(imageId string, path string, size int64, name string) bool {
+func (self *SGuestcdrom) insertIsoSucc(imageId string, path string, size int64, name string, bootIndex *int8) bool {
 	if self.ImageId == imageId {
 		_, err := db.Update(self, func() error {
 			self.Name = name
 			self.Path = path
 			self.Size = size
+			if bootIndex != nil {
+				self.BootIndex = *bootIndex
+			} else {
+				self.BootIndex = -1
+			}
 			return nil
 		})
 		if err != nil {
@@ -100,6 +109,7 @@ func (self *SGuestcdrom) ejectIso() bool {
 			self.Name = ""
 			self.Path = ""
 			self.Size = 0
+			self.BootIndex = -1
 			return nil
 		})
 		if err != nil {
@@ -110,6 +120,17 @@ func (self *SGuestcdrom) ejectIso() bool {
 	} else {
 		return false
 	}
+}
+
+func (self *SGuestcdrom) GetImage() (*SCachedimage, error) {
+	if len(self.ImageId) == 0 {
+		return nil, fmt.Errorf("empty image_id")
+	}
+	image, err := CachedimageManager.FetchById(self.ImageId)
+	if err != nil {
+		return nil, errors.Wrapf(err, "CachedimageManager.FetchById(%s)", self.ImageId)
+	}
+	return image.(*SCachedimage), nil
 }
 
 func (self *SGuestcdrom) GetDetails() string {
@@ -124,13 +145,23 @@ func (self *SGuestcdrom) GetDetails() string {
 	}
 }
 
+func (self *SGuestcdrom) SetBootIndex(bootIndex int8) error {
+	_, err := db.Update(self, func() error {
+		self.BootIndex = bootIndex
+		return nil
+	})
+	return err
+}
+
 func (self *SGuestcdrom) getJsonDesc() *api.GuestcdromJsonDesc {
 	if len(self.ImageId) > 0 && len(self.Path) > 0 {
 		return &api.GuestcdromJsonDesc{
-			ImageId: self.ImageId,
-			Path:    self.Path,
-			Name:    self.Name,
-			Size:    self.Size,
+			Ordinal:   self.Ordinal,
+			ImageId:   self.ImageId,
+			Path:      self.Path,
+			Name:      self.Name,
+			Size:      self.Size,
+			BootIndex: self.BootIndex,
 		}
 	}
 	return nil

@@ -16,31 +16,36 @@ package models
 
 import (
 	"context"
-	"fmt"
 	"net"
+	"strings"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/util/regutils"
 	"yunion.io/x/pkg/util/secrules"
 	"yunion.io/x/pkg/util/stringutils"
 	"yunion.io/x/sqlchemy"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/logclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
 type SSecurityGroupRuleManager struct {
 	db.SResourceBaseManager
+	db.SStatusResourceBaseManager
+	db.SExternalizedResourceBaseManager
 	SSecurityGroupResourceBaseManager
 }
 
@@ -60,19 +65,18 @@ func init() {
 
 type SSecurityGroupRule struct {
 	db.SResourceBase
+	db.SStatusResourceBase `default:"available"`
+	db.SExternalizedResourceBase
 	SSecurityGroupResourceBase `create:"required"`
 
-	Id             string `width:"128" charset:"ascii" primary:"true" list:"user"`
-	Priority       int64  `default:"1" list:"user" update:"user" list:"user"`
-	Protocol       string `width:"5" charset:"ascii" nullable:"false" list:"user" update:"user" create:"required"`
-	Ports          string `width:"256" charset:"ascii" list:"user" update:"user" create:"optional"`
-	Direction      string `width:"3" charset:"ascii" list:"user" create:"required"`
-	CIDR           string `width:"256" charset:"ascii" list:"user" update:"user" create:"optional"`
-	Action         string `width:"5" charset:"ascii" nullable:"false" list:"user" update:"user" create:"required"`
-	Description    string `width:"256" charset:"utf8" list:"user" update:"user" create:"optional"`
-	PeerSecgroupId string `width:"128" charset:"ascii" create:"optional" list:"user" update:"user"`
-
-	IsDirty bool `nullable:"false" default:"false"`
+	Id          string `width:"128" charset:"ascii" primary:"true" list:"user"`
+	Priority    int    `list:"user" update:"user" list:"user"`
+	Protocol    string `width:"32" charset:"ascii" nullable:"false" list:"user" update:"user" create:"required"`
+	Ports       string `width:"256" charset:"ascii" list:"user" update:"user" create:"optional"`
+	Direction   string `width:"3" charset:"ascii" list:"user" create:"required"`
+	CIDR        string `width:"256" charset:"ascii" list:"user" update:"user" create:"optional"`
+	Action      string `width:"5" charset:"ascii" nullable:"false" list:"user" update:"user" create:"required"`
+	Description string `width:"256" charset:"utf8" list:"user" update:"user" create:"optional"`
 }
 
 func (self *SSecurityGroupRule) GetId() string {
@@ -108,9 +112,9 @@ func (manager *SSecurityGroupRuleManager) FetchOwnerId(ctx context.Context, data
 	return db.FetchProjectInfo(ctx, data)
 }
 
-func (manager *SSecurityGroupRuleManager) FilterByOwner(q *sqlchemy.SQuery, userCred mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
+func (manager *SSecurityGroupRuleManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	sq := SecurityGroupManager.Query("id")
-	sq = db.SharableManagerFilterByOwner(SecurityGroupManager, sq, userCred, scope)
+	sq = db.SharableManagerFilterByOwner(ctx, SecurityGroupManager, sq, userCred, ownerId, scope)
 	return q.In("secgroup_id", sq.SubQuery())
 }
 
@@ -129,6 +133,12 @@ func (manager *SSecurityGroupRuleManager) ListItemFilter(
 	if err != nil {
 		return nil, errors.Wrap(err, "SResourceBaseManager.ListItemFilter")
 	}
+
+	q, err = manager.SExternalizedResourceBaseManager.ListItemFilter(ctx, q, userCred, query.ExternalizedResourceBaseListInput)
+	if err != nil {
+		return nil, errors.Wrap(err, "SExternalizedResourceBaseManager.ListItemFilter")
+	}
+
 	sql, err = manager.SSecurityGroupResourceBaseManager.ListItemFilter(ctx, q, userCred, query.SecgroupFilterListInput)
 	if err != nil {
 		return nil, errors.Wrap(err, "SSecurityGroupResourceBaseManager.ListItemFilter")
@@ -174,7 +184,6 @@ func (manager *SSecurityGroupRuleManager) FetchCustomizeColumns(
 	bRows := manager.SResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	secRows := manager.SSecurityGroupResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	secIds := make([]string, len(objs))
-	peerIds := make([]string, len(objs))
 	for i := range rows {
 		rows[i] = api.SecgroupRuleDetails{
 			ResourceBaseDetails:       bRows[i],
@@ -182,19 +191,12 @@ func (manager *SSecurityGroupRuleManager) FetchCustomizeColumns(
 		}
 		rule := objs[i].(*SSecurityGroupRule)
 		secIds[i] = rule.SecgroupId
-		peerIds[i] = rule.PeerSecgroupId
 	}
 
 	secgroups := make(map[string]SSecurityGroup)
 	err := db.FetchStandaloneObjectsByIds(SecurityGroupManager, secIds, &secgroups)
 	if err != nil {
 		log.Errorf("FetchStandaloneObjectsByIds fail: %v", err)
-		return rows
-	}
-
-	peerMaps, err := db.FetchIdNameMap2(SecurityGroupManager, peerIds)
-	if err != nil {
-		log.Errorf("db.FetchIdNameMap2 fail: %v", err)
 		return rows
 	}
 
@@ -209,7 +211,6 @@ func (manager *SSecurityGroupRuleManager) FetchCustomizeColumns(
 	projRows := SecurityGroupManager.SProjectizedResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, virObjs, fields, isList)
 	for i := range rows {
 		rows[i].ProjectizedResourceInfo = projRows[i]
-		rows[i].PeerSecgroup, _ = peerMaps[peerIds[i]]
 	}
 
 	return rows
@@ -251,6 +252,10 @@ func (manager *SSecurityGroupRuleManager) QueryDistinctExtraField(q *sqlchemy.SQ
 }
 
 func (self *SSecurityGroupRule) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
+	return nil
+}
+
+func (self *SSecurityGroupRule) RealDelete(ctx context.Context, userCred mcclient.TokenCredential) error {
 	return db.DeleteModel(ctx, userCred, self)
 }
 
@@ -260,38 +265,30 @@ func (self *SSecurityGroupRule) BeforeInsert() {
 	}
 }
 
-func (manager *SSecurityGroupRuleManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input api.SSecgroupRuleCreateInput) (api.SSecgroupRuleCreateInput, error) {
-	if input.Priority == nil {
-		return input, httperrors.NewMissingParameterError("priority")
-	}
-	if *input.Priority < 1 || *input.Priority > 100 {
-		return input, httperrors.NewOutOfRangeError("Invalid priority %d, must be in range or 1 ~ 100", input.Priority)
-	}
-
-	_secgroup, err := validators.ValidateModel(userCred, SecurityGroupManager, &input.SecgroupId)
+func (manager *SSecurityGroupRuleManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input *api.SSecgroupRuleCreateInput) (*api.SSecgroupRuleCreateInput, error) {
+	_secgroup, err := validators.ValidateModel(ctx, userCred, SecurityGroupManager, &input.SecgroupId)
 	if err != nil {
 		return input, err
 	}
+
+	input.Status = apis.STATUS_CREATING
 
 	secgroup := _secgroup.(*SSecurityGroup)
 
+	driver, err := secgroup.GetRegionDriver()
+	if err != nil {
+		return nil, err
+	}
+
+	opts := &api.SSecgroupCreateInput{}
+	opts.Rules = []api.SSecgroupRuleCreateInput{*input}
+	_, err = driver.ValidateCreateSecurityGroupInput(ctx, userCred, opts)
+	if err != nil {
+		return nil, err
+	}
+
 	if !secgroup.IsOwner(userCred) && !userCred.HasSystemAdminPrivilege() {
 		return input, httperrors.NewForbiddenError("not enough privilege")
-	}
-
-	if len(input.PeerSecgroupId) > 0 {
-		_, err = validators.ValidateModel(userCred, SecurityGroupManager, &input.PeerSecgroupId)
-		if err != nil {
-			return input, err
-		}
-		if input.PeerSecgroupId == input.SecgroupId {
-			return input, httperrors.NewInputParameterError("peer_secgroup_id can not point to secgroup self")
-		}
-	}
-
-	err = input.Check()
-	if err != nil {
-		return input, err
 	}
 
 	input.ResourceBaseCreateInput, err = manager.SResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.ResourceBaseCreateInput)
@@ -301,45 +298,24 @@ func (manager *SSecurityGroupRuleManager) ValidateCreateData(ctx context.Context
 	return input, nil
 }
 
-func (self *SSecurityGroupRule) ValidateUpdateData(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.SSecgroupRuleUpdateInput) (api.SSecgroupRuleUpdateInput, error) {
-	priority := int(self.Priority)
-	if input.Priority == nil {
-		input.Priority = &priority
-	}
-	if len(input.Direction) == 0 {
-		input.Direction = self.Direction
-	}
-	if len(input.Action) == 0 {
-		input.Action = self.Action
-	}
-	if len(input.Protocol) == 0 {
-		input.Protocol = self.Protocol
-	}
-	if len(input.Ports) == 0 && input.Protocol != string(secrules.PROTO_ANY) && input.Protocol != string(secrules.PROTO_ICMP) {
-		input.Ports = self.Ports
-	}
-
-	if *input.Priority < 1 || *input.Priority > 100 {
-		return input, httperrors.NewOutOfRangeError("Invalid priority %d, must be in range or 1 ~ 100", input.Priority)
-	}
-
-	if len(input.CIDR) == 0 {
-		input.CIDR = self.CIDR
-	}
-
-	if len(input.PeerSecgroupId) > 0 {
-		_, err := validators.ValidateModel(userCred, SecurityGroupManager, &input.PeerSecgroupId)
-		if err != nil {
-			return input, err
-		}
-		if input.PeerSecgroupId == self.Id {
-			return input, httperrors.NewInputParameterError("peer_secgroup_id can not point to secgroup self")
-		}
-	}
-
-	err := input.Check()
+func (self *SSecurityGroupRule) ValidateUpdateData(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input *api.SSecgroupRuleUpdateInput) (*api.SSecgroupRuleUpdateInput, error) {
+	secgrp, err := self.GetSecGroup()
 	if err != nil {
-		return input, err
+		return nil, err
+	}
+
+	if input.CIDR == nil {
+		// input.CIDR = &self.CIDR
+	}
+
+	driver, err := secgrp.GetRegionDriver()
+	if err != nil {
+		return nil, err
+	}
+
+	input, err = driver.ValidateUpdateSecurityGroupRuleInput(ctx, userCred, input)
+	if err != nil {
+		return nil, err
 	}
 
 	input.ResourceBaseUpdateInput, err = self.SResourceBase.ValidateUpdateData(ctx, userCred, query, input.ResourceBaseUpdateInput)
@@ -366,18 +342,25 @@ func (self *SSecurityGroupRule) toRule() (*secrules.SecurityRule, error) {
 		Protocol:    self.Protocol,
 		Description: self.Description,
 	}
-	if regutils.MatchCIDR(self.CIDR) {
+	if regutils.MatchCIDR(self.CIDR) || regutils.MatchCIDR6(self.CIDR) {
 		_, rule.IPNet, _ = net.ParseCIDR(self.CIDR)
-	} else if regutils.MatchIPAddr(self.CIDR) {
+	} else if regutils.MatchIP4Addr(self.CIDR) {
 		rule.IPNet = &net.IPNet{
 			IP:   net.ParseIP(self.CIDR),
 			Mask: net.CIDRMask(32, 32),
 		}
-	} else {
+	} else if regutils.MatchIP6Addr(self.CIDR) {
 		rule.IPNet = &net.IPNet{
+			IP:   net.ParseIP(self.CIDR),
+			Mask: net.CIDRMask(128, 128),
+		}
+	} else {
+		// any
+		rule.IPNet = nil
+		/* &net.IPNet{
 			IP:   net.IPv4zero,
 			Mask: net.CIDRMask(0, 32),
-		}
+		} */
 	}
 
 	err := rule.ParsePorts(self.Ports)
@@ -391,65 +374,63 @@ func (self *SSecurityGroupRule) toRule() (*secrules.SecurityRule, error) {
 func (self *SSecurityGroupRule) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	self.SResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
 
-	db.Update(self, func() error {
-		if len(self.PeerSecgroupId) > 0 {
-			self.CIDR = ""
-		}
-		self.IsDirty = true
-		return nil
-	})
-
 	log.Debugf("POST Create %s", data)
-	if secgroup := self.GetSecGroup(); secgroup != nil {
+	if secgroup, _ := self.GetSecGroup(); secgroup != nil {
 		logclient.AddSimpleActionLog(secgroup, logclient.ACT_ALLOCATE, data, userCred, true)
-		secgroup.DoSync(ctx, userCred)
+		if len(secgroup.ManagerId) == 0 {
+			self.SetStatus(ctx, userCred, apis.STATUS_AVAILABLE, "")
+			secgroup.DoSync(ctx, userCred)
+			return
+		}
+		secgroup.StartSecurityGroupRuleCreateTask(ctx, userCred, self.Id, "")
 	}
 }
 
 func (self *SSecurityGroupRule) PreDelete(ctx context.Context, userCred mcclient.TokenCredential) {
 	self.SResourceBase.PreDelete(ctx, userCred)
 
-	db.Update(self, func() error {
-		self.IsDirty = true
-		return nil
-	})
-
-	if secgroup := self.GetSecGroup(); secgroup != nil {
+	if secgroup, _ := self.GetSecGroup(); secgroup != nil {
 		logclient.AddSimpleActionLog(secgroup, logclient.ACT_DELETE, jsonutils.Marshal(self), userCred, true)
-		secgroup.DoSync(ctx, userCred)
-	}
-}
-
-func (self *SSecurityGroupRule) PreUpdate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) {
-	old := &SSecurityGroupRule{}
-	old.SetModelManager(SecurityGroupRuleManager, old)
-	jsonutils.Update(old, self)
-	old.IsDirty = true
-	old.Deleted = true
-	old.Id = fmt.Sprintf("%s-back", self.Id)
-	err := SecurityGroupRuleManager.TableSpec().InsertOrUpdate(ctx, old)
-	if err != nil {
-		log.Errorf("insert old rule error: %v", err)
+		if len(secgroup.ManagerId) == 0 {
+			self.RealDelete(ctx, userCred)
+			secgroup.DoSync(ctx, userCred)
+			return
+		}
+		self.SetStatus(ctx, userCred, apis.STATUS_DELETING, "")
+		secgroup.StartSecurityGroupRuleDeleteTask(ctx, userCred, self.Id, "")
 	}
 }
 
 func (self *SSecurityGroupRule) PostUpdate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	self.SResourceBase.PostUpdate(ctx, userCred, query, data)
 
-	db.Update(self, func() error {
-		if data.Contains("peer_secgroup_id") {
-			self.CIDR = ""
-		} else if data.Contains("cidr") {
-			self.PeerSecgroupId = ""
-		}
-		return nil
-	})
+	if self.Protocol == secrules.PROTO_ICMP || self.Protocol == secrules.PROTO_ANY {
+		db.Update(self, func() error {
+			self.Ports = ""
+			return nil
+		})
+	}
 
 	log.Debugf("POST Update %s", data)
-	if secgroup := self.GetSecGroup(); secgroup != nil {
+	if secgroup, _ := self.GetSecGroup(); secgroup != nil {
 		logclient.AddSimpleActionLog(secgroup, logclient.ACT_UPDATE, data, userCred, true)
-		secgroup.DoSync(ctx, userCred)
+		if len(secgroup.ManagerId) == 0 {
+			secgroup.DoSync(ctx, userCred)
+			return
+		}
+		self.SetStatus(ctx, userCred, apis.STATUS_SYNC_STATUS, "")
+		secgroup.StartSecurityGroupRuleUpdateTask(ctx, userCred, self.Id, "")
 	}
+}
+
+func (self *SSecurityGroup) StartSecurityGroupRuleUpdateTask(ctx context.Context, userCred mcclient.TokenCredential, ruleId, parentTaskId string) error {
+	params := jsonutils.NewDict()
+	params.Set("rule_id", jsonutils.NewString(ruleId))
+	task, err := taskman.TaskManager.NewTask(ctx, "SecurityGroupRuleUpdateTask", self, userCred, params, parentTaskId, "", nil)
+	if err != nil {
+		return errors.Wrapf(err, "NewTask")
+	}
+	return task.ScheduleRun(nil)
 }
 
 func (manager *SSecurityGroupRuleManager) getRulesBySecurityGroup(secgroup *SSecurityGroup) ([]SSecurityGroupRule, error) {
@@ -461,66 +442,16 @@ func (manager *SSecurityGroupRuleManager) getRulesBySecurityGroup(secgroup *SSec
 	return rules, nil
 }
 
-func (self *SSecurityGroup) newFromCloudSecurityGroupRule(ctx context.Context, userCred mcclient.TokenCredential, rule cloudprovider.SecurityRule) (*SSecurityGroupRule, bool, error) {
-	lockman.LockObject(ctx, self)
-	defer lockman.ReleaseObject(ctx, self)
-
-	isNeedFix := false
-
-	protocol := rule.Protocol
-	if len(protocol) == 0 {
-		protocol = secrules.PROTO_ANY
-	}
-
-	cidr := "0.0.0.0/0"
-	if rule.IPNet != nil && rule.IPNet.String() != "<nil>" {
-		cidr = rule.IPNet.String()
-	}
-
-	if len(rule.PeerSecgroupId) > 0 {
-		cidr = ""
-		cache, _ := db.FetchByExternalId(SecurityGroupCacheManager, rule.PeerSecgroupId)
-		if cache != nil {
-			rule.PeerSecgroupId = cache.(*SSecurityGroupCache).SecgroupId
-		}
-		isNeedFix = true
-	}
-
-	err := rule.ValidateRule()
-	if err != nil {
-		return nil, isNeedFix, errors.Wrapf(err, "ValidateRule %s ", jsonutils.Marshal(rule).String())
-	}
-
-	secrule := &SSecurityGroupRule{
-		Priority:       int64(rule.Priority),
-		Protocol:       protocol,
-		Ports:          rule.GetPortsString(),
-		Direction:      string(rule.Direction),
-		CIDR:           cidr,
-		Action:         string(rule.Action),
-		Description:    rule.Description,
-		PeerSecgroupId: rule.PeerSecgroupId,
-	}
-	secrule.SetModelManager(SecurityGroupRuleManager, secrule)
-	secrule.SecgroupId = self.Id
-
-	err = SecurityGroupRuleManager.TableSpec().Insert(ctx, secrule)
-	if err != nil {
-		return nil, isNeedFix, errors.Wrapf(err, "SecurityGroupRuleManager.Insert")
-	}
-	return secrule, isNeedFix, nil
-}
-
 func (self *SSecurityGroupRule) GetOwnerId() mcclient.IIdentityProvider {
-	secgrp := self.GetSecGroup()
+	secgrp, _ := self.GetSecGroup()
 	if secgrp != nil {
 		return secgrp.GetOwnerId()
 	}
 	return nil
 }
 
-func (manager *SSecurityGroupRuleManager) ResourceScope() rbacutils.TRbacScope {
-	return rbacutils.ScopeProject
+func (manager *SSecurityGroupRuleManager) ResourceScope() rbacscope.TRbacScope {
+	return rbacscope.ScopeProject
 }
 
 func (manager *SSecurityGroupRuleManager) ListItemExportKeys(ctx context.Context,
@@ -538,4 +469,111 @@ func (manager *SSecurityGroupRuleManager) ListItemExportKeys(ctx context.Context
 		return nil, errors.Wrap(err, "SSecurityGroupResourceBaseManager.ListItemExportKeys")
 	}
 	return q, nil
+}
+
+func (self *SSecurityGroup) SyncRules(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	exts []cloudprovider.ISecurityGroupRule,
+) compare.SyncResult {
+	lockman.LockRawObject(ctx, SecurityGroupManager.Keyword(), self.Id)
+	defer lockman.ReleaseRawObject(ctx, SecurityGroupManager.Keyword(), self.Id)
+
+	result := compare.SyncResult{}
+
+	dbRules, err := self.GetSecurityRules()
+	if err != nil {
+		result.Error(err)
+		return result
+	}
+
+	removed := make([]SSecurityGroupRule, 0)
+	commondb := make([]SSecurityGroupRule, 0)
+	commonext := make([]cloudprovider.ISecurityGroupRule, 0)
+	added := make([]cloudprovider.ISecurityGroupRule, 0)
+
+	err = compare.CompareSets(dbRules, exts, &removed, &commondb, &commonext, &added)
+	if err != nil {
+		result.Error(err)
+		return result
+	}
+
+	for i := 0; i < len(removed); i += 1 {
+		err = removed[i].RealDelete(ctx, userCred)
+		if err != nil {
+			result.DeleteError(err)
+			continue
+		}
+		result.Delete()
+	}
+
+	for i := 0; i < len(commondb); i += 1 {
+		err = commondb[i].syncWithCloudRule(ctx, userCred, commonext[i])
+		if err != nil {
+			result.UpdateError(err)
+			continue
+		}
+		result.Update()
+	}
+
+	for i := 0; i < len(added); i += 1 {
+		err := self.newFromCloudRule(ctx, userCred, added[i])
+		if err != nil {
+			result.AddError(err)
+			continue
+		}
+		result.Add()
+	}
+
+	return result
+}
+
+func (rule *SSecurityGroupRule) syncWithCloudRule(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ISecurityGroupRule) error {
+	_, err := db.Update(rule, func() error {
+		rule.Action = string(ext.GetAction())
+		rule.Direction = string(ext.GetDirection())
+		rule.Protocol = string(ext.GetProtocol())
+		rule.Description = string(ext.GetDescription())
+		rule.CIDR = strings.Join(ext.GetCIDRs(), ",")
+		rule.Priority = ext.GetPriority()
+		rule.Ports = ext.GetPorts()
+		rule.Status = apis.STATUS_AVAILABLE
+		return nil
+	})
+	return err
+}
+
+func (self *SSecurityGroup) newFromCloudRule(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ISecurityGroupRule) error {
+	rule := &SSecurityGroupRule{}
+	rule.SetModelManager(SecurityGroupRuleManager, rule)
+	rule.SecgroupId = self.Id
+	rule.Action = string(ext.GetAction())
+	rule.Direction = string(ext.GetDirection())
+	rule.Protocol = string(ext.GetProtocol())
+	rule.Description = string(ext.GetDescription())
+	rule.CIDR = strings.Join(ext.GetCIDRs(), ",")
+	rule.Priority = ext.GetPriority()
+	rule.Ports = ext.GetPorts()
+	rule.ExternalId = ext.GetGlobalId()
+	rule.Status = apis.STATUS_AVAILABLE
+	return SecurityGroupRuleManager.TableSpec().Insert(ctx, rule)
+}
+
+func (self *SSecurityGroupRule) SetStatus(ctx context.Context, userCred mcclient.TokenCredential, status, reason string) error {
+	if self.Status == status {
+		return nil
+	}
+	_, err := db.Update(self, func() error {
+		self.Status = status
+		return nil
+	})
+	return err
+}
+
+func (manager *SSecurityGroupRuleManager) FetchRuleById(id string) (*SSecurityGroupRule, error) {
+	rule, err := db.FetchById(manager, id)
+	if err != nil {
+		return nil, errors.Wrapf(err, "FetchById(%s)", id)
+	}
+	return rule.(*SSecurityGroupRule), nil
 }

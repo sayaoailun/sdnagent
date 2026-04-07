@@ -40,9 +40,10 @@ var (
 	ActionCreateBackupServer SAction = "add_backup_server"
 	ActionDelBackupServer    SAction = "delete_backup_server"
 
-	ActionSyncCreate SAction = "sync_create"
-	ActionSyncUpdate SAction = "sync_update"
-	ActionSyncDelete SAction = "sync_delete"
+	ActionSyncCreate        SAction = "sync_create"
+	ActionSyncUpdate        SAction = "sync_update"
+	ActionSyncDelete        SAction = "sync_delete"
+	ActionSyncAccountStatus SAction = "sync_account_status"
 
 	ActionOffline         SAction = "offline"
 	ActionSystemPanic     SAction = "panic"
@@ -52,7 +53,23 @@ var (
 
 	ActionLock SAction = "lock"
 
-	ActionExceedCount SAction = "exceed_count"
+	ActionExceedCount          SAction = "exceed_count"
+	ActionPasswordExpireSoon   SAction = "password_expire_soon"
+	ActionWorkerBlock          SAction = "woker_block"
+	ActionNetOutOfSync         SAction = "net_out_of_sync"
+	ActionMysqlOutOfSync       SAction = "mysql_out_of_sync"
+	ActionServiceAbnormal      SAction = "service_abnormal"
+	ActionServerPanicked       SAction = "server_panicked"
+	ActionAttach               SAction = "attach"
+	ActionDetach               SAction = "detach"
+	ActionIsolatedDeviceCreate SAction = "isolated_device_create"
+	ActionIsolatedDeviceUpdate SAction = "isolated_device_update"
+	ActionIsolatedDeviceDelete SAction = "isolated_device_delete"
+	ActionStatusChanged        SAction = "status_changed"
+	ActionStart                SAction = "start"
+	ActionStop                 SAction = "stop"
+	ActionReset                SAction = "reset"
+	ActionRestart              SAction = "restart"
 
 	ResultFailed  SResult = "failed"
 	ResultSucceed SResult = "succeed"

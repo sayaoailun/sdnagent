@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
@@ -26,7 +27,6 @@ import (
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
@@ -42,8 +42,8 @@ type SElasticcacheResourceBaseManager struct {
 	SZoneResourceBaseManager
 }
 
-func ValidateElasticcacheResourceInput(userCred mcclient.TokenCredential, input api.ELasticcacheResourceInput) (*SElasticcache, api.ELasticcacheResourceInput, error) {
-	cacheObj, err := ElasticcacheManager.FetchByIdOrName(userCred, input.ElasticcacheId)
+func ValidateElasticcacheResourceInput(ctx context.Context, userCred mcclient.TokenCredential, input api.ELasticcacheResourceInput) (*SElasticcache, api.ELasticcacheResourceInput, error) {
+	cacheObj, err := ElasticcacheManager.FetchByIdOrName(ctx, userCred, input.ElasticcacheId)
 	if err != nil {
 		if errors.Cause(err) == sql.ErrNoRows {
 			return nil, input, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", ElasticcacheManager.Keyword(), input.ElasticcacheId)
@@ -137,7 +137,7 @@ func (manager *SElasticcacheResourceBaseManager) ListItemFilter(
 	query api.ElasticcacheFilterListInput,
 ) (*sqlchemy.SQuery, error) {
 	if len(query.ElasticcacheId) > 0 {
-		dbObj, _, err := ValidateElasticcacheResourceInput(userCred, query.ELasticcacheResourceInput)
+		dbObj, _, err := ValidateElasticcacheResourceInput(ctx, userCred, query.ELasticcacheResourceInput)
 		if err != nil {
 			return nil, errors.Wrap(err, "ValidateElasticcacheResourceInput")
 		}

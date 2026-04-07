@@ -18,10 +18,12 @@ import (
 	"context"
 	"fmt"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
@@ -30,10 +32,8 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -71,8 +71,8 @@ type SMountTarget struct {
 	FileSystemId string `width:"36" charset:"ascii" nullable:"false" create:"required" index:"true" list:"user"`
 }
 
-func (manager *SMountTargetManager) ResourceScope() rbacutils.TRbacScope {
-	return rbacutils.ScopeDomain
+func (manager *SMountTargetManager) ResourceScope() rbacscope.TRbacScope {
+	return rbacscope.ScopeDomain
 }
 
 func (self *SMountTarget) GetFileSystem() (*SFileSystem, error) {
@@ -87,7 +87,7 @@ func (manager *SMountTargetManager) ValidateCreateData(ctx context.Context, user
 	if len(input.FileSystemId) == 0 {
 		return input, httperrors.NewMissingParameterError("file_system_id")
 	}
-	_fs, err := validators.ValidateModel(userCred, FileSystemManager, &input.FileSystemId)
+	_fs, err := validators.ValidateModel(ctx, userCred, FileSystemManager, &input.FileSystemId)
 	if err != nil {
 		return input, err
 	}
@@ -111,7 +111,7 @@ func (manager *SMountTargetManager) ValidateCreateData(ctx context.Context, user
 		if len(input.NetworkId) == 0 {
 			return input, httperrors.NewMissingParameterError("network_id")
 		}
-		_network, err := validators.ValidateModel(userCred, NetworkManager, &input.NetworkId)
+		_network, err := validators.ValidateModel(ctx, userCred, NetworkManager, &input.NetworkId)
 		if err != nil {
 			return input, err
 		}
@@ -131,9 +131,16 @@ func (manager *SMountTargetManager) ValidateCreateData(ctx context.Context, user
 	if len(input.AccessGroupId) == 0 {
 		return input, httperrors.NewMissingParameterError("access_group_id")
 	}
-	_, err = validators.ValidateModel(userCred, AccessGroupManager, &input.AccessGroupId)
+	groupObj, err := validators.ValidateModel(ctx, userCred, AccessGroupManager, &input.AccessGroupId)
 	if err != nil {
 		return input, err
+	}
+	group := groupObj.(*SAccessGroup)
+	if group.ManagerId != fs.ManagerId {
+		return input, httperrors.NewConflictError("access group and filesystem do not belong to the same account")
+	}
+	if group.CloudregionId != fs.CloudregionId {
+		return input, httperrors.NewConflictError("access group and filesystem are not in the same region")
 	}
 	input.StatusStandaloneResourceCreateInput, err = manager.SStatusStandaloneResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.StatusStandaloneResourceCreateInput)
 	if err != nil {
@@ -163,10 +170,10 @@ func (self *SMountTarget) StartCreateTask(ctx context.Context, userCred mcclient
 		return task.ScheduleRun(nil)
 	}()
 	if err != nil {
-		self.SetStatus(userCred, api.MOUNT_TARGET_STATUS_CREATE_FAILED, err.Error())
+		self.SetStatus(ctx, userCred, api.MOUNT_TARGET_STATUS_CREATE_FAILED, err.Error())
 		return nil
 	}
-	self.SetStatus(userCred, api.MOUNT_TARGET_STATUS_CREATING, "")
+	self.SetStatus(ctx, userCred, api.MOUNT_TARGET_STATUS_CREATING, "")
 	return nil
 }
 
@@ -198,7 +205,7 @@ func (manager *SMountTargetManager) ListItemFilter(
 		return nil, errors.Wrapf(err, "SNetworkResourceBaseManager.ListItemFilter")
 	}
 	if len(query.FileSystemId) > 0 {
-		_, err := validators.ValidateModel(userCred, FileSystemManager, &query.FileSystemId)
+		_, err := validators.ValidateModel(ctx, userCred, FileSystemManager, &query.FileSystemId)
 		if err != nil {
 			return nil, err
 		}
@@ -264,11 +271,11 @@ func (self *SMountTarget) GetOwnerId() mcclient.IIdentityProvider {
 	return &db.SOwnerId{DomainId: fs.DomainId}
 }
 
-func (manager *SMountTargetManager) FilterByOwner(q *sqlchemy.SQuery, userCred mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
-	if userCred != nil {
+func (manager *SMountTargetManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	if owner != nil {
 		sq := FileSystemManager.Query("id")
-		if scope == rbacutils.ScopeDomain && len(userCred.GetProjectDomainId()) > 0 {
-			sq = sq.Equals("domain_id", userCred.GetProjectDomainId())
+		if scope == rbacscope.ScopeDomain && len(owner.GetProjectDomainId()) > 0 {
+			sq = sq.Equals("domain_id", owner.GetProjectDomainId())
 			return q.In("file_system_id", sq)
 		}
 	}
@@ -342,7 +349,7 @@ func (self *SMountTarget) ValidateDeleteCondition(ctx context.Context, info json
 	if err != nil {
 		return httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
 	}
-	if utils.IsInStringArray(region.Provider, []string{api.CLOUD_PROVIDER_HUAWEI, api.CLOUD_PROVIDER_HCSO}) {
+	if utils.IsInStringArray(region.Provider, []string{api.CLOUD_PROVIDER_HUAWEI, api.CLOUD_PROVIDER_HCSO, api.CLOUD_PROVIDER_HCS}) {
 		return httperrors.NewNotSupportedError("not allow to delete")
 	}
 	return self.SStatusStandaloneResourceBase.ValidateDeleteCondition(ctx, nil)
@@ -370,10 +377,10 @@ func (self *SMountTarget) StartDeleteTask(ctx context.Context, userCred mcclient
 		return task.ScheduleRun(nil)
 	}()
 	if err != nil {
-		self.SetStatus(userCred, api.MOUNT_TARGET_STATUS_DELETE_FAILED, err.Error())
+		self.SetStatus(ctx, userCred, api.MOUNT_TARGET_STATUS_DELETE_FAILED, err.Error())
 		return err
 	}
-	return self.SetStatus(userCred, api.MOUNT_TARGET_STATUS_DELETING, "")
+	return self.SetStatus(ctx, userCred, api.MOUNT_TARGET_STATUS_DELETING, "")
 }
 
 func (self *SFileSystem) GetMountTargets() ([]SMountTarget, error) {
@@ -386,7 +393,12 @@ func (self *SFileSystem) GetMountTargets() ([]SMountTarget, error) {
 	return mounts, nil
 }
 
-func (self *SFileSystem) SyncMountTargets(ctx context.Context, userCred mcclient.TokenCredential, extMounts []cloudprovider.ICloudMountTarget) compare.SyncResult {
+func (self *SFileSystem) SyncMountTargets(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	extMounts []cloudprovider.ICloudMountTarget,
+	xor bool,
+) compare.SyncResult {
 	lockman.LockRawObject(ctx, self.Id, MountTargetManager.KeywordPlural())
 	lockman.ReleaseRawObject(ctx, self.Id, MountTargetManager.KeywordPlural())
 
@@ -416,13 +428,15 @@ func (self *SFileSystem) SyncMountTargets(ctx context.Context, userCred mcclient
 		}
 		result.Delete()
 	}
-	for i := 0; i < len(commondb); i += 1 {
-		err = commondb[i].SyncWithMountTarget(ctx, userCred, self.ManagerId, commonext[i])
-		if err != nil {
-			result.UpdateError(err)
-			continue
+	if !xor {
+		for i := 0; i < len(commondb); i += 1 {
+			err = commondb[i].SyncWithMountTarget(ctx, userCred, self.ManagerId, commonext[i])
+			if err != nil {
+				result.UpdateError(err)
+				continue
+			}
+			result.Update()
 		}
-		result.Update()
 	}
 	for i := 0; i < len(added); i += 1 {
 		err := self.newFromCloudMountTarget(ctx, userCred, added[i])
@@ -443,12 +457,12 @@ func (self *SMountTarget) SyncWithMountTarget(ctx context.Context, userCred mccl
 		self.DomainName = m.GetDomainName()
 		self.ExternalId = m.GetGlobalId()
 		if groupId := m.GetAccessGroupId(); len(groupId) > 0 {
-			_cache, _ := db.FetchByExternalIdAndManagerId(AccessGroupCacheManager, groupId, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+			_group, _ := db.FetchByExternalIdAndManagerId(AccessGroupManager, groupId, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
 				return q.Equals("manager_id", managerId)
 			})
-			if _cache != nil {
-				cache := _cache.(*SAccessGroupCache)
-				self.AccessGroupId = cache.AccessGroupId
+			if _group != nil {
+				group := _group.(*SAccessGroup)
+				self.AccessGroupId = group.Id
 			}
 		}
 		return nil

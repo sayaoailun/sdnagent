@@ -22,6 +22,7 @@ import (
 	"yunion.io/x/pkg/errors"
 
 	"yunion.io/x/onecloud/pkg/apis"
+	identity_api "yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/cloudcommon/syncman"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -38,21 +39,21 @@ type SInformerSyncManager struct {
 func (manager *SInformerSyncManager) OnAdd(obj *jsonutils.JSONDict) {
 	log.Infof("[CREATED]: \n%s", obj.String())
 	if manager.NeedSync(obj) {
-		manager.SyncOnce()
+		manager.SyncOnce(false, false)
 	}
 }
 
 func (manager *SInformerSyncManager) OnUpdate(oldObj, newObj *jsonutils.JSONDict) {
 	log.Infof("[UPDATED]: \n[NEW]: %s\n[OLD]: %s", newObj.String(), oldObj.String())
 	if manager.NeedSync(oldObj) || manager.NeedSync(newObj) {
-		manager.SyncOnce()
+		manager.SyncOnce(false, false)
 	}
 }
 
 func (manager *SInformerSyncManager) OnDelete(obj *jsonutils.JSONDict) {
 	log.Infof("[DELETED]: \n%s", obj.String())
 	if manager.NeedSync(obj) {
-		manager.SyncOnce()
+		manager.SyncOnce(false, false)
 	}
 }
 
@@ -60,9 +61,9 @@ func (manager *SInformerSyncManager) OnServiceCatalogChange(catalog mcclient.ISe
 	if manager.done {
 		return
 	}
-	url, _ := catalog.GetServiceURL(apis.SERVICE_TYPE_ETCD, consts.GetRegion(), "", "internal")
+	url, _ := mcclient.CatalogGetServiceURL(catalog, apis.SERVICE_TYPE_ETCD, consts.GetRegion(), "", identity_api.EndpointInterfaceInternal)
 	if len(url) == 0 {
-		log.Debugf("[%s] OnServiceCatalogChange: no etcd url found, retry", manager.Name())
+		log.Debugf("[%s] OnServiceCatalogChange: no etcd internal url found, retry", manager.Name())
 		return
 	}
 	err := manager.startWatcher()

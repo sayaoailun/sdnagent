@@ -38,6 +38,7 @@ type DeletePreventableCreateInput struct {
 
 type KeypairListInput struct {
 	apis.UserResourceListInput
+	apis.SharableResourceBaseListInput
 
 	// 加密类型
 	// example: RSA
@@ -46,24 +47,6 @@ type KeypairListInput struct {
 	// 指纹信息
 	// example: 1d:3a:83:4a:a1:f3:75:97:ec:d1:ef:f8:3f:a7:5d:9e
 	Fingerprint []string `json:"fingerprint"`
-}
-
-type CachedimageListInput struct {
-	apis.SharableVirtualResourceListInput
-	apis.ExternalizedResourceBaseListInput
-
-	ManagedResourceListInput
-	ZonalFilterListInput
-
-	// 镜像类型，可能值为: system(公有云公共镜像), customized(自定义镜像)
-	// example: system
-	ImageType []string `json:"image_type"`
-
-	// filter by host schedtag
-	HostSchedtagId string `json:"host_schedtag_id"`
-
-	// valid cachedimage
-	Valid *bool `json:"valid"`
 }
 
 type ExternalProjectListInput struct {
@@ -122,10 +105,6 @@ type BaremetalagentListInput struct {
 	AgentType []string `json:"agent_type"`
 }
 
-type DnsRecordListInput struct {
-	apis.AdminSharableVirtualResourceListInput
-}
-
 type DynamicschedtagListInput struct {
 	apis.StandaloneResourceListInput
 	SchedtagFilterListInput
@@ -161,15 +140,13 @@ type ServiceCatalogListInput struct {
 
 type SnapshotPolicyListInput struct {
 	apis.VirtualResourceListInput
+	apis.ExternalizedResourceBaseListInput
+	ManagedResourceListInput
+	RegionalFilterListInput
 
-	// 是否启用？
-	IsActivated *bool `json:"is_activated"`
-}
-
-type DnsRecordDetails struct {
-	apis.AdminSharableVirtualResourceDetails
-
-	SDnsRecord
+	// 按绑定的磁盘数量排序
+	// pattern:asc|desc
+	OrderByBindDiskCount string `json:"order_by_bind_disk_count"`
 }
 
 type HostnameInput struct {

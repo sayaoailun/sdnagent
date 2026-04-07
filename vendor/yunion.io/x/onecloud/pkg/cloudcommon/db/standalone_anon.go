@@ -16,21 +16,24 @@ package db
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"strings"
+	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/util/stringutils"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/policy"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/mcclient/auth"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 	"yunion.io/x/onecloud/pkg/util/tagutils"
 )
@@ -45,10 +48,10 @@ type SStandaloneAnonResourceBase struct {
 	SResourceBase
 
 	// 资源UUID
-	Id string `width:"128" charset:"ascii" primary:"true" list:"user" json:"id"`
+	Id string `width:"128" charset:"ascii" primary:"true" list:"user" create:"optional" json:"id"`
 
 	// 资源描述信息
-	Description string `width:"256" charset:"utf8" get:"user" list:"user" update:"user" create:"optional" json:"description"`
+	Description string `length:"0" charset:"utf8" get:"user" list:"user" update:"user" create:"optional" json:"description"`
 
 	// 是否是模拟资源, 部分从公有云上同步的资源并不真实存在, 例如宿主机
 	// list 接口默认不会返回这类资源，除非显示指定 is_emulate=true 过滤参数
@@ -101,7 +104,19 @@ func (manager *SStandaloneAnonResourceBaseManager) FilterByNotId(q *sqlchemy.SQu
 	return q.NotEquals("id", idStr)
 }
 
-func (manager *SStandaloneAnonResourceBaseManager) FilterByHiddenSystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
+func (manager *SStandaloneAnonResourceBaseManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	if userCred != nil {
+		result := policy.PolicyManager.Allow(scope, userCred, consts.GetServiceType(), man.KeywordPlural(), policy.PolicyActionList)
+		if !result.ObjectTags.IsEmpty() {
+			policyTagFilters := tagutils.STagFilters{}
+			policyTagFilters.AddFilters(result.ObjectTags)
+			q = ObjectIdQueryWithTagFilters(ctx, q, "id", man.Keyword(), policyTagFilters)
+		}
+	}
+	return q
+}
+
+func (manager *SStandaloneAnonResourceBaseManager) FilterByHiddenSystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	q = manager.SResourceBaseManager.FilterByHiddenSystemAttributes(q, userCred, query, scope)
 	showEmulated := jsonutils.QueryBoolean(query, "show_emulated", false)
 	if showEmulated {
@@ -142,7 +157,7 @@ func (manager *SStandaloneAnonResourceBaseManager) ListItemFilter(
 		q = q.In("id", input.Ids)
 	}
 
-	q = manager.SMetadataResourceBaseModelManager.ListItemFilter(manager.GetIModelManager(), q, input.MetadataResourceListInput)
+	q = manager.SMetadataResourceBaseModelManager.ListItemFilter(ctx, manager.GetIModelManager(), q, input.MetadataResourceListInput)
 
 	return q, nil
 }
@@ -179,7 +194,7 @@ func (model *SStandaloneAnonResourceBase) StandaloneModelManager() IStandaloneMo
 	return model.GetModelManager().(IStandaloneModelManager)
 }
 
-func (model *SStandaloneAnonResourceBase) GetId() string {
+func (model SStandaloneAnonResourceBase) GetId() string {
 	return model.Id
 }
 
@@ -249,38 +264,135 @@ func (model *SStandaloneAnonResourceBase) SetAllMetadata(ctx context.Context, di
 	return nil
 }
 
-func (model *SStandaloneAnonResourceBase) SetUserMetadataValues(ctx context.Context, dictstore map[string]interface{}, userCred mcclient.TokenCredential) error {
-	err := Metadata.SetValuesWithLog(ctx, model, dictstore, userCred)
+func ensurePrefix(input map[string]interface{}, prefix string) (map[string]interface{}, error) {
+	dictStore := make(map[string]interface{}, len(input))
+	for k, v := range input {
+		if !strings.HasPrefix(k, prefix) {
+			k = prefix + k
+		}
+		if len(k) > 64 {
+			return nil, httperrors.NewInputParameterError("input key too long > %d", 64-len(prefix))
+		}
+		if len(v.(string)) > 65535 {
+			return nil, httperrors.NewInputParameterError("input value too long > %d", 65535)
+		}
+		dictStore[k] = v
+	}
+	return dictStore, nil
+}
+
+func ensurePrefixString(input map[string]string, prefix string) (map[string]interface{}, error) {
+	dictStore := make(map[string]interface{}, len(input))
+	for k, v := range input {
+		if !strings.HasPrefix(k, prefix) {
+			k = prefix + k
+		}
+		if len(k) > 64 {
+			return nil, httperrors.NewInputParameterError("input key too long > %d", 64-len(prefix))
+		}
+		if len(v) > 65535 {
+			return nil, httperrors.NewInputParameterError("input value too long > %d", 65535)
+		}
+		dictStore[k] = v
+	}
+	return dictStore, nil
+}
+
+func (model *SStandaloneAnonResourceBase) SetUserMetadataValues(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error {
+	dictStore, err := ensurePrefixString(dictstore, USER_TAG_PREFIX)
+	if err != nil {
+		return errors.Wrapf(err, "ensurePrefixString %s", USER_TAG_PREFIX)
+	}
+	err = Metadata.SetValuesWithLog(ctx, model, dictStore, userCred)
 	if err != nil {
 		return errors.Wrap(err, "SetValuesWithLog")
 	}
-	model.GetIStandaloneModel().OnMetadataUpdated(ctx, userCred)
-	return nil
-}
-
-func (model *SStandaloneAnonResourceBase) SetUserMetadataAll(ctx context.Context, dictstore map[string]interface{}, userCred mcclient.TokenCredential) error {
-	err := Metadata.SetAll(ctx, model, dictstore, userCred, USER_TAG_PREFIX)
-	if err != nil {
-		return errors.Wrap(err, "SetAll")
+	{
+		model.GetModelManager().TableSpec().InformUpdate(ctx, model, jsonutils.Marshal(model).(*jsonutils.JSONDict))
 	}
 	model.GetIStandaloneModel().OnMetadataUpdated(ctx, userCred)
 	return nil
 }
 
-func (model *SStandaloneAnonResourceBase) SetCloudMetadataAll(ctx context.Context, dictstore map[string]interface{}, userCred mcclient.TokenCredential) error {
-	err := Metadata.SetAll(ctx, model, dictstore, userCred, CLOUD_TAG_PREFIX)
+func (model *SStandaloneAnonResourceBase) SetUserMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error {
+	var err error
+	dictStore, err := ensurePrefixString(dictstore, USER_TAG_PREFIX)
+	if err != nil {
+		return errors.Wrap(err, "ensurePrefix")
+	}
+	err = Metadata.SetAll(ctx, model, dictStore, userCred, USER_TAG_PREFIX)
 	if err != nil {
 		return errors.Wrap(err, "SetAll")
+	}
+	{
+		model.GetModelManager().TableSpec().InformUpdate(ctx, model, jsonutils.Marshal(model).(*jsonutils.JSONDict))
+	}
+	model.GetIStandaloneModel().OnMetadataUpdated(ctx, userCred)
+	return nil
+}
+
+func (model *SStandaloneAnonResourceBase) SetCloudMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential, readOnly bool) error {
+	var err error
+	dictStore, err := ensurePrefixString(dictstore, CLOUD_TAG_PREFIX)
+	if err != nil {
+		return errors.Wrap(err, "ensurePrefix")
+	}
+	if readOnly {
+		err = Metadata.SetAllWithoutDelelte(ctx, model, dictStore, userCred)
+		if err != nil {
+			return errors.Wrap(err, "SetAll")
+		}
+	} else {
+		err = Metadata.SetAll(ctx, model, dictStore, userCred, CLOUD_TAG_PREFIX)
+		if err != nil {
+			return errors.Wrap(err, "SetAll")
+		}
 	}
 	userTags := map[string]interface{}{}
 	for k, v := range dictstore {
 		userTags[strings.Replace(k, CLOUD_TAG_PREFIX, USER_TAG_PREFIX, 1)] = v
 	}
+	if readOnly {
+		return Metadata.SetAllWithoutDelelte(ctx, model, userTags, userCred)
+	}
 	return Metadata.SetAll(ctx, model, userTags, userCred, USER_TAG_PREFIX)
 }
 
-func (model *SStandaloneAnonResourceBase) SetClassMetadataValues(ctx context.Context, dictstore map[string]interface{}, userCred mcclient.TokenCredential) error {
-	err := Metadata.SetValuesWithLog(ctx, model, dictstore, userCred)
+func (model *SStandaloneAnonResourceBase) SetOrganizationMetadataAll(ctx context.Context, meta map[string]string, userCred mcclient.TokenCredential) error {
+	{
+		dictStore, err := ensurePrefixString(meta, ORGANIZATION_TAG_PREFIX)
+		if err != nil {
+			return errors.Wrap(err, "ensurePrefix")
+		}
+		err = Metadata.SetAll(ctx, model, dictStore, userCred, ORGANIZATION_TAG_PREFIX)
+		if err != nil {
+			return errors.Wrap(err, "SetAllOrganization")
+		}
+	}
+	{
+		userTags := make(map[string]interface{})
+		for k, _ := range meta {
+			if strings.HasPrefix(k, ORGANIZATION_TAG_PREFIX) {
+				k = k[len(ORGANIZATION_TAG_PREFIX):]
+			}
+			k = USER_TAG_PREFIX + k
+			userTags[k] = "none"
+		}
+		err := Metadata.SetValuesWithLog(ctx, model, userTags, userCred)
+		if err != nil {
+			return errors.Wrap(err, "SetValuesWithLog userTags")
+		}
+	}
+	return nil
+}
+
+func (model *SStandaloneAnonResourceBase) SetClassMetadataValues(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error {
+	var err error
+	dictStore, err := ensurePrefixString(dictstore, CLASS_TAG_PREFIX)
+	if err != nil {
+		return errors.Wrap(err, "ensurePrefixString")
+	}
+	err = Metadata.SetValuesWithLog(ctx, model, dictStore, userCred)
 	if err != nil {
 		return errors.Wrap(err, "SetValuesWithLog")
 	}
@@ -288,23 +400,20 @@ func (model *SStandaloneAnonResourceBase) SetClassMetadataValues(ctx context.Con
 }
 
 func (model *SStandaloneAnonResourceBase) SetClassMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error {
-	afterCheck := make(map[string]interface{}, len(dictstore))
-	for k, v := range dictstore {
-		if !strings.HasPrefix(k, CLASS_TAG_PREFIX) {
-			afterCheck[CLASS_TAG_PREFIX+k] = v
-		} else {
-			afterCheck[k] = v
-		}
+	var err error
+	afterCheck, err := ensurePrefixString(dictstore, CLASS_TAG_PREFIX)
+	if err != nil {
+		return errors.Wrap(err, "ensurePrefix")
 	}
-	err := Metadata.SetAll(ctx, model, afterCheck, userCred, CLASS_TAG_PREFIX)
+	err = Metadata.SetAll(ctx, model, afterCheck, userCred, CLASS_TAG_PREFIX)
 	if err != nil {
 		return errors.Wrap(err, "SetAll")
 	}
 	return nil
 }
 
-func (model *SStandaloneAnonResourceBase) InheritTo(ctx context.Context, dest IClassMetadataSetter) error {
-	return InheritFromTo(ctx, model, dest)
+func (model *SStandaloneAnonResourceBase) InheritTo(ctx context.Context, userCred mcclient.TokenCredential, dest IClassMetadataSetter) error {
+	return InheritFromTo(ctx, userCred, model, dest)
 }
 
 type IClassMetadataSetter interface {
@@ -314,7 +423,7 @@ type IClassMetadataSetter interface {
 	SetClassMetadataAll(context.Context, map[string]string, mcclient.TokenCredential) error
 }
 
-func InheritFromTo(ctx context.Context, src IClassMetadataOwner, dest IClassMetadataSetter) error {
+func InheritFromTo(ctx context.Context, userCred mcclient.TokenCredential, src IClassMetadataOwner, dest IClassMetadataSetter) error {
 	metadata, err := src.GetAllClassMetadata()
 	if err != nil {
 		return errors.Wrap(err, "GetAllClassMetadata")
@@ -332,15 +441,17 @@ func InheritFromTo(ctx context.Context, src IClassMetadataOwner, dest IClassMeta
 			if sv, ok := metadata[k]; ok {
 				if sv != v {
 					// duplicate value for identical key
-					return errors.Wrapf(httperrors.ErrConflict, "destination has another value for class key %s", k)
+					// return errors.Wrapf(httperrors.ErrConflict, "destination has another value for class key %s", k)
+					log.Warningf("replace class metadata %s from %s to %s", k, v, sv)
 				}
 			} else {
 				// no such class key
-				return errors.Wrapf(httperrors.ErrConflict, "destination has extra class key %s", k)
+				metadata[k] = "None"
+				// return errors.Wrapf(httperrors.ErrConflict, "destination has extra class key %s", k)
 			}
 		}
 	}
-	userCred := auth.AdminCredential()
+	// userCred := auth.AdminCredential()
 	return dest.SetClassMetadataAll(ctx, metadata, userCred)
 }
 
@@ -403,8 +514,16 @@ func (model *SStandaloneAnonResourceBase) IsInSameClass(ctx context.Context, pMo
 	return IsInSameClass(ctx, model, pModel)
 }
 
-func (model *SStandaloneAnonResourceBase) SetSysCloudMetadataAll(ctx context.Context, dictstore map[string]interface{}, userCred mcclient.TokenCredential) error {
-	err := Metadata.SetAll(ctx, model, dictstore, userCred, SYS_CLOUD_TAG_PREFIX)
+func (model *SStandaloneAnonResourceBase) SetSysCloudMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential, readOnly bool) error {
+	dictStore, err := ensurePrefixString(dictstore, SYS_CLOUD_TAG_PREFIX)
+	if err != nil {
+		return errors.Wrap(err, "ensurePrefixString")
+	}
+	if readOnly {
+		err = Metadata.SetAllWithoutDelelte(ctx, model, dictStore, userCred)
+	} else {
+		err = Metadata.SetAll(ctx, model, dictStore, userCred, SYS_CLOUD_TAG_PREFIX)
+	}
 	if err != nil {
 		return errors.Wrap(err, "SetAll")
 	}
@@ -467,6 +586,18 @@ func (model *SStandaloneAnonResourceBase) GetAllClassMetadata() (map[string]stri
 	return ret, nil
 }
 
+func (model *SStandaloneAnonResourceBase) GetAllOrganizationMetadata() (map[string]string, error) {
+	meta, err := Metadata.GetAll(nil, model, nil, ORGANIZATION_TAG_PREFIX, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "Metadata.GetAll")
+	}
+	ret := make(map[string]string)
+	for k, v := range meta {
+		ret[k[len(ORGANIZATION_TAG_PREFIX):]] = v
+	}
+	return ret, nil
+}
+
 // 获取资源标签（元数据）
 func (model *SStandaloneAnonResourceBase) GetDetailsMetadata(ctx context.Context, userCred mcclient.TokenCredential, input apis.GetMetadataInput) (apis.GetMetadataOutput, error) {
 	val, err := Metadata.GetAll(ctx, model, input.Field, input.Prefix, userCred)
@@ -489,7 +620,7 @@ func (model *SStandaloneAnonResourceBase) PerformMetadata(ctx context.Context, u
 	dictStore := make(map[string]interface{})
 	for k, v := range input {
 		// 已双下滑线开头的metadata是系统内置，普通用户不可添加，只能查看
-		if strings.HasPrefix(k, SYS_TAG_PREFIX) && (userCred == nil || !IsAllowPerform(ctx, rbacutils.ScopeSystem, userCred, model, "metadata")) {
+		if strings.HasPrefix(k, SYS_TAG_PREFIX) && (userCred == nil || !IsAllowPerform(ctx, rbacscope.ScopeSystem, userCred, model, "metadata")) {
 			return nil, httperrors.NewForbiddenError("not allow to set system key, please remove the underscore at the beginning")
 		}
 		dictStore[k] = v
@@ -504,11 +635,7 @@ func (model *SStandaloneAnonResourceBase) PerformMetadata(ctx context.Context, u
 // 更新资源的用户标签
 // +onecloud:swagger-gen-ignore
 func (model *SStandaloneAnonResourceBase) PerformUserMetadata(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformUserMetadataInput) (jsonutils.JSONObject, error) {
-	dictStore := make(map[string]interface{})
-	for k, v := range input {
-		dictStore[USER_TAG_PREFIX+k] = v
-	}
-	err := model.SetUserMetadataValues(ctx, dictStore, userCred)
+	err := model.SetUserMetadataValues(ctx, input, userCred)
 	if err != nil {
 		return nil, errors.Wrap(err, "SetUserMetadataValues")
 	}
@@ -517,17 +644,7 @@ func (model *SStandaloneAnonResourceBase) PerformUserMetadata(ctx context.Contex
 
 // 全量替换资源的所有用户标签
 func (model *SStandaloneAnonResourceBase) PerformSetUserMetadata(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformSetUserMetadataInput) (jsonutils.JSONObject, error) {
-	dictStore := make(map[string]interface{})
-	for k, v := range input {
-		if len(k) > 64-len(USER_TAG_PREFIX) {
-			return nil, httperrors.NewInputParameterError("input key too long > %d", 64-len(USER_TAG_PREFIX))
-		}
-		if len(v) > 65535 {
-			return nil, httperrors.NewInputParameterError("input value too long > %d", 65535)
-		}
-		dictStore[USER_TAG_PREFIX+k] = v
-	}
-	err := model.SetUserMetadataAll(ctx, dictStore, userCred)
+	err := model.SetUserMetadataAll(ctx, input, userCred)
 	if err != nil {
 		return nil, errors.Wrap(err, "SetUserMetadataAll")
 	}
@@ -536,11 +653,7 @@ func (model *SStandaloneAnonResourceBase) PerformSetUserMetadata(ctx context.Con
 
 // 更新资源的 class 标签
 func (model *SStandaloneAnonResourceBase) PerformClassMetadata(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformClassMetadataInput) (jsonutils.JSONObject, error) {
-	dictStore := make(map[string]interface{})
-	for k, v := range input {
-		dictStore[CLASS_TAG_PREFIX+k] = v
-	}
-	err := model.SetUserMetadataValues(ctx, dictStore, userCred)
+	err := model.SetClassMetadataValues(ctx, input, userCred)
 	if err != nil {
 		return nil, errors.Wrap(err, "SetUserMetadataValues")
 	}
@@ -549,25 +662,42 @@ func (model *SStandaloneAnonResourceBase) PerformClassMetadata(ctx context.Conte
 
 // 全量替换资源的所有 class 标签
 func (model *SStandaloneAnonResourceBase) PerformSetClassMetadata(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformSetClassMetadataInput) (jsonutils.JSONObject, error) {
-	dictStore := make(map[string]string)
-	for k, v := range input {
-		if len(k) > 64-len(CLASS_TAG_PREFIX) {
-			return nil, httperrors.NewInputParameterError("input key too long > %d", 64-len(CLASS_TAG_PREFIX))
-		}
-		if len(v) > 65535 {
-			return nil, httperrors.NewInputParameterError("input value too long > %d", 65535)
-		}
-		dictStore[k] = v
-	}
-	err := model.SetClassMetadataAll(ctx, dictStore, userCred)
+	err := model.SetClassMetadataAll(ctx, input, userCred)
 	if err != nil {
 		return nil, errors.Wrap(err, "SetUserMetadataAll")
 	}
 	return nil, nil
 }
 
+// 全量替换资源的所有 class 标签
+func (model *SStandaloneAnonResourceBase) PerformSetOrgMetadata(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformSetClassMetadataInput) (jsonutils.JSONObject, error) {
+	err := model.SetOrganizationMetadataAll(ctx, input, userCred)
+	if err != nil {
+		return nil, errors.Wrap(err, "SetUserMetadataAll")
+	}
+	return nil, nil
+}
+
+func validateDictStore(input map[string]string, prefix string) (map[string]string, error) {
+	dictStore := make(map[string]string, len(input))
+	for k, v := range input {
+		if len(k) > 64-len(prefix) {
+			return nil, httperrors.NewInputParameterError("input key too long > %d", 64-len(prefix))
+		}
+		if len(v) > 65535 {
+			return nil, httperrors.NewInputParameterError("input value too long > %d", 65535)
+		}
+		dictStore[k] = v
+	}
+	return dictStore, nil
+}
+
 func (model *SStandaloneAnonResourceBase) GetDetailsClassMetadata(ctx context.Context, userCred mcclient.TokenCredential, input apis.GetClassMetadataInput) (apis.GetClassMetadataOutput, error) {
 	return model.GetAllClassMetadata()
+}
+
+func (model *SStandaloneAnonResourceBase) GetDetailsOrgMetadata(ctx context.Context, userCred mcclient.TokenCredential, input apis.GetClassMetadataInput) (apis.GetClassMetadataOutput, error) {
+	return model.GetAllOrganizationMetadata()
 }
 
 type sPolicyTags struct {
@@ -579,24 +709,21 @@ type sPolicyTags struct {
 func (model *SStandaloneAnonResourceBase) PostUpdate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	model.SResourceBase.PostUpdate(ctx, userCred, query, data)
 
-	meta := make(map[string]string)
-	err := data.Unmarshal(&meta, "__meta__")
-	if err == nil {
-		model.PerformMetadata(ctx, userCred, nil, meta)
-	}
-
-	model.applyPolicyTags(ctx, userCred, data)
+	model.TrySaveMetadataInput(ctx, userCred, data)
 }
 
 func (model *SStandaloneAnonResourceBase) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	model.SResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
 
+	model.TrySaveMetadataInput(ctx, userCred, data)
+}
+
+func (model *SStandaloneAnonResourceBase) TrySaveMetadataInput(ctx context.Context, userCred mcclient.TokenCredential, data jsonutils.JSONObject) {
 	meta := make(map[string]string)
 	err := data.Unmarshal(&meta, "__meta__")
 	if err == nil {
 		model.PerformMetadata(ctx, userCred, nil, meta)
 	}
-
 	model.applyPolicyTags(ctx, userCred, data)
 }
 
@@ -605,12 +732,12 @@ func (model *SStandaloneAnonResourceBase) applyPolicyTags(ctx context.Context, u
 	data.Unmarshal(&tags)
 	log.Debugf("applyPolicyTags: %s", jsonutils.Marshal(tags))
 	if len(tags.PolicyObjectTags) > 0 {
-		model.PerformMetadata(ctx, userCred, nil, tagutils.Tagset2MapString(tags.PolicyObjectTags.Flattern()))
+		model.PerformMetadata(ctx, userCred, nil, tagutils.TagsetMap2MapString(tags.PolicyObjectTags.Flattern()))
 	}
 	if model.Keyword() == "project" && len(tags.PolicyProjectTags) > 0 {
-		model.PerformMetadata(ctx, userCred, nil, tagutils.Tagset2MapString(tags.PolicyProjectTags.Flattern()))
+		model.PerformMetadata(ctx, userCred, nil, tagutils.TagsetMap2MapString(tags.PolicyProjectTags.Flattern()))
 	} else if model.Keyword() == "domain" && len(tags.PolicyDomainTags) > 0 {
-		model.PerformMetadata(ctx, userCred, nil, tagutils.Tagset2MapString(tags.PolicyDomainTags.Flattern()))
+		model.PerformMetadata(ctx, userCred, nil, tagutils.TagsetMap2MapString(tags.PolicyDomainTags.Flattern()))
 	}
 }
 
@@ -827,6 +954,7 @@ func (manager *SStandaloneAnonResourceBaseManager) GetPropertyTagValueTree(
 		manager.GetIStandaloneModelManager(),
 		manager.Keyword(),
 		"id",
+		"",
 		ctx,
 		userCred,
 		query,
@@ -837,6 +965,7 @@ func GetPropertyTagValueTree(
 	manager IModelManager,
 	tagObjType string,
 	tagIdField string,
+	sumField string,
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
 	query jsonutils.JSONObject,
@@ -847,30 +976,7 @@ func GetPropertyTagValueTree(
 		return nil, errors.Wrap(err, "Unmarshal")
 	}
 
-	objSubQ := manager.Query().SubQuery()
-	objQ := objSubQ.Query(objSubQ.Field(tagIdField), sqlchemy.COUNT("_sub_count_"))
-	objQ, err = ListItemQueryFilters(manager, ctx, objQ, userCred, query, policy.PolicyActionList)
-	if err != nil {
-		return nil, errors.Wrap(err, "ListItemQueryFilters")
-	}
-	objQ = objQ.GroupBy(objSubQ.Field(tagIdField))
-	q := objQ.SubQuery().Query(sqlchemy.SUM(tagValueCountKey, objQ.Field("_sub_count_")))
-	metadataSQ := Metadata.Query().Equals("obj_type", tagObjType).In("key", input.Keys).SubQuery()
-	groupBy := make([]interface{}, 0)
-	for i, key := range input.Keys {
-		valueFieldName := tagValueKey(i)
-		subq := metadataSQ.Query().Equals("key", key).SubQuery()
-		q = q.LeftJoin(subq, sqlchemy.Equals(q.Field(tagIdField), subq.Field("obj_id")))
-		q = q.AppendField(
-			sqlchemy.NewFunction(
-				sqlchemy.NewCase().When(sqlchemy.IsNull(subq.Field("value")), sqlchemy.NewStringField(tagutils.NoValue)).Else(subq.Field("value")),
-				valueFieldName,
-			),
-		)
-		groupBy = append(groupBy, q.Field(valueFieldName))
-	}
-	q = q.GroupBy(groupBy...)
-	valueMap, err := q.AllStringMap()
+	valueMap, err := GetTagValueCountMap(manager, tagObjType, tagIdField, sumField, input.Keys, ctx, userCred, query)
 	if err != nil {
 		return nil, errors.Wrap(err, "AllStringAmp")
 	}
@@ -881,4 +987,127 @@ func GetPropertyTagValueTree(
 
 	tree := constructTree(valueMap, input.Keys)
 	return jsonutils.Marshal(tree), nil
+}
+
+func GetTagValueCountMap(
+	manager IModelManager,
+	tagObjType string,
+	tagIdField string,
+	sumField string,
+	keys []string,
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+) ([]map[string]string, error) {
+	var err error
+	objQ := manager.NewQuery(ctx, userCred, query, false)
+	objQ, err = ListItemQueryFilters(manager, ctx, objQ, userCred, query, policy.PolicyActionList)
+	if err != nil {
+		return nil, errors.Wrap(err, "ListItemQueryFilters")
+	}
+	objSubQ := objQ.SubQuery().Query()
+	objSubQ = objSubQ.AppendField(objSubQ.Field(tagIdField))
+	objSubQ = objSubQ.GroupBy(objSubQ.Field(tagIdField))
+	var sumFieldQ sqlchemy.IQueryField
+	if len(sumField) > 0 {
+		sumFieldQ = sqlchemy.SUM("_sub_count_", objSubQ.Field(sumField))
+	} else {
+		sumFieldQ = sqlchemy.COUNT("_sub_count_")
+	}
+	objSubQ = objSubQ.AppendField(sumFieldQ)
+
+	objSubQ.DebugQuery2("GetTagValueCountMap objSubQ")
+
+	q := objSubQ.SubQuery().Query()
+	q = q.AppendField(sqlchemy.SUM(tagValueCountKey, q.Field("_sub_count_")))
+
+	metadataMan := GetMetadaManagerInContext(ctx)
+	metadataSQ := metadataMan.Query().Equals("obj_type", tagObjType).In("key", keys).SubQuery()
+	groupBy := make([]interface{}, 0)
+	for i, key := range keys {
+		valueFieldName := TagValueKey(i)
+		subq := metadataSQ.Query().Equals("key", key).SubQuery()
+		q = q.LeftJoin(subq, sqlchemy.Equals(q.Field(tagIdField), subq.Field("obj_id")))
+		q = q.AppendField(
+			sqlchemy.NewFunction(
+				sqlchemy.NewCase().When(sqlchemy.IsNull(subq.Field("value")), sqlchemy.NewStringField(tagutils.NoValue)).Else(subq.Field("value")),
+				valueFieldName,
+				false,
+			),
+		)
+		groupBy = append(groupBy, q.Field(valueFieldName))
+	}
+	q = q.GroupBy(groupBy...)
+
+	q.DebugQuery2("GetTagValueCountMap")
+
+	valueMap, err := q.AllStringMap()
+	if err != nil {
+		return nil, errors.Wrap(err, "AllStringAmp")
+	}
+	return valueMap, nil
+}
+
+func (manager *SStandaloneAnonResourceBaseManager) HistoryDataClean(ctx context.Context, timeBefor time.Time) (int, error) {
+	q := manager.RawQuery("id").IsTrue("deleted").LE("deleted_at", timeBefor)
+	rows, err := q.Rows()
+	if err != nil {
+		if errors.Cause(err) == sql.ErrNoRows {
+			return 0, nil
+		}
+		return 0, errors.Wrap(err, "Query")
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		err := rows.Scan(&id)
+		if err != nil {
+			return 0, errors.Wrap(err, "rows.Scan")
+		}
+		ids = append(ids, id)
+	}
+	var purge = func(ids []string) error {
+		vars := []interface{}{}
+		placeholders := make([]string, len(ids))
+		for i := range placeholders {
+			placeholders[i] = "?"
+			vars = append(vars, ids[i])
+		}
+		placeholder := strings.Join(placeholders, ",")
+		sql := fmt.Sprintf(
+			"delete from %s where id in (%s)",
+			manager.TableSpec().Name(), placeholder,
+		)
+		lockman.LockRawObject(ctx, manager.Keyword(), "purge")
+		defer lockman.ReleaseRawObject(ctx, manager.Keyword(), "purge")
+
+		_, err = sqlchemy.GetDB().Exec(
+			sql, vars...,
+		)
+		if err != nil {
+			return errors.Wrapf(err, strings.ReplaceAll(sql, "?", "%s"), vars...)
+		}
+		return nil
+	}
+
+	var splitByLen = func(data []string, splitLen int) [][]string {
+		var result [][]string
+		for i := 0; i < len(data); i += splitLen {
+			end := i + splitLen
+			if end > len(data) {
+				end = len(data)
+			}
+			result = append(result, data[i:end])
+		}
+		return result
+	}
+	idsArr := splitByLen(ids, 100)
+	for i := range idsArr {
+		err = purge(idsArr[i])
+		if err != nil {
+			return 0, err
+		}
+	}
+	return len(ids), nil
 }

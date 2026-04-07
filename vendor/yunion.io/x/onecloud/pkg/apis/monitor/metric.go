@@ -31,6 +31,7 @@ const (
 	METRIC_RES_TYPE_STORAGE      = "storage"
 	METRIC_RES_TYPE_ELB          = "elb"
 	METRIC_RES_TYPE_K8S          = "k8s"
+	METRIC_RES_TYPE_CONTAINER    = "container"
 
 	//ext is prefix！
 	METRIC_RES_TYPE_JENKINS      = "ext_jenkins"
@@ -40,6 +41,7 @@ const (
 
 	METRIC_UNIT_PERCENT = "%"
 	METRIC_UNIT_BPS     = "bps"
+	METRIC_UNIT_PPS     = "pps"
 	METRIC_UNIT_MBPS    = "Mbps"
 	METRIC_UNIT_BYTEPS  = "Bps"
 	METRIC_UNIT_CPS     = "cps"
@@ -47,8 +49,8 @@ const (
 	METRIC_UNIT_MS      = "ms"
 	METRIC_UNIT_SEC     = "s"
 	METRIC_UNIT_BYTE    = "byte"
-	METRIC_UNIT_RMB     = "RMB"
 	METRIC_UNIT_MB      = "Mb"
+	METRIC_UNIT_NULL    = "NULL"
 
 	METRIC_DATABASE_TELE  = "telegraf"
 	METRIC_DATABASE_METER = "meter_db"
@@ -58,7 +60,7 @@ var (
 	MetricResType = []string{METRIC_RES_TYPE_GUEST, METRIC_RES_TYPE_HOST, METRIC_RES_TYPE_REDIS, METRIC_RES_TYPE_OSS,
 		METRIC_RES_TYPE_RDS, METRIC_RES_TYPE_CLOUDACCOUNT}
 	MetricUnit = []string{METRIC_UNIT_PERCENT, METRIC_UNIT_BPS, METRIC_UNIT_MBPS, METRIC_UNIT_BYTEPS, "count/s",
-		METRIC_UNIT_COUNT, METRIC_UNIT_MS, METRIC_UNIT_BYTE, METRIC_UNIT_RMB}
+		METRIC_UNIT_COUNT, METRIC_UNIT_MS, METRIC_UNIT_BYTE, METRIC_UNIT_NULL}
 	ResTypeScoreMap = map[string]float64{
 		METRIC_RES_TYPE_GUEST:        1,
 		METRIC_RES_TYPE_AGENT:        1.1,
@@ -160,4 +162,18 @@ type MetricFieldDetail struct {
 	DisplayName string `json:"display_name"`
 	Unit        string `json:"unit"`
 	Id          string `json:"id"`
+}
+
+type InfluxMeasurement struct {
+	apis.Meta
+	Database               string
+	Measurement            string
+	MeasurementDisplayName string
+	ResType                string
+	Score                  int
+	TagKey                 []string
+	TagValue               map[string][]string
+	FieldKey               []string
+	FieldDescriptions      map[string]MetricFieldDetail
+	Unit                   []string
 }

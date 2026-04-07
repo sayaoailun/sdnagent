@@ -19,18 +19,18 @@ import (
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
 type SSharableVirtualResourceBase struct {
 	SVirtualResourceBase
-	SSharableBaseResource `"is_public=>create":"optional" "public_scope=>create":"optional"`
+	SSharableBaseResource `"is_public->create":"optional" "public_scope->create":"optional"`
 	// IsPublic    bool   `default:"false" nullable:"false" create:"domain_optional" list:"user" json:"is_public"`
 	// PublicScope string `width:"16" charset:"ascii" nullable:"false" default:"system" create:"domain_optional" list:"user" json:"public_scope"`
 }
@@ -48,8 +48,8 @@ func (manager *SSharableVirtualResourceBaseManager) GetISharableVirtualModelMana
 	return manager.GetVirtualObject().(ISharableVirtualModelManager)
 }
 
-func (manager *SSharableVirtualResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery, owner mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
-	return SharableManagerFilterByOwner(manager.GetISharableVirtualModelManager(), q, owner, scope)
+func (manager *SSharableVirtualResourceBaseManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	return SharableManagerFilterByOwner(ctx, manager.GetISharableVirtualModelManager(), q, userCred, owner, scope)
 }
 
 func (model *SSharableVirtualResourceBase) IsSharable(reqUsrId mcclient.IIdentityProvider) bool {
@@ -60,20 +60,12 @@ func (model *SSharableVirtualResourceBase) IsShared() bool {
 	return SharableModelIsShared(model)
 }
 
-func (model *SSharableVirtualResourceBase) AllowPerformPublic(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPublicProjectInput) bool {
-	return true
-}
-
 func (model *SSharableVirtualResourceBase) PerformPublic(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPublicProjectInput) (jsonutils.JSONObject, error) {
 	err := SharablePerformPublic(model.GetISharableVirtualModel(), ctx, userCred, input)
 	if err != nil {
 		return nil, errors.Wrap(err, "SharablePerformPublic")
 	}
 	return nil, nil
-}
-
-func (model *SSharableVirtualResourceBase) AllowPerformPrivate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPrivateInput) bool {
-	return true
 }
 
 func (model *SSharableVirtualResourceBase) PerformPrivate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPrivateInput) (jsonutils.JSONObject, error) {
@@ -204,20 +196,20 @@ func (model *SSharableVirtualResourceBase) Delete(ctx context.Context, userCred 
 func (model *SSharableVirtualResourceBase) GetSharedInfo() apis.SShareInfo {
 	ret := apis.SShareInfo{}
 	ret.IsPublic = model.IsPublic
-	ret.PublicScope = rbacutils.String2ScopeDefault(model.PublicScope, rbacutils.ScopeNone)
+	ret.PublicScope = rbacscope.String2ScopeDefault(model.PublicScope, rbacscope.ScopeNone)
 	ret.SharedDomains = model.GetSharedDomains()
 	ret.SharedProjects = model.GetSharedProjects()
 	// fix
 	if len(ret.SharedDomains) > 0 {
-		ret.PublicScope = rbacutils.ScopeDomain
+		ret.PublicScope = rbacscope.ScopeDomain
 		ret.SharedProjects = nil
 		ret.IsPublic = true
 	} else if len(ret.SharedProjects) > 0 {
-		ret.PublicScope = rbacutils.ScopeProject
+		ret.PublicScope = rbacscope.ScopeProject
 		ret.SharedDomains = nil
 		ret.IsPublic = true
 	} else if !ret.IsPublic {
-		ret.PublicScope = rbacutils.ScopeNone
+		ret.PublicScope = rbacscope.ScopeNone
 	}
 	return ret
 }

@@ -19,6 +19,7 @@ import (
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
 
 	identityapi "yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -41,7 +42,7 @@ func init() {
 
 	RegionUsageManager = &SQuotaManager{
 		SQuotaBaseManager: quotas.NewQuotaUsageManager(RegionQuota,
-			rbacutils.ScopeProject,
+			rbacscope.ScopeProject,
 			"region_quota_usage_tbl",
 			"region_quota_usage",
 			"region_quota_usages",
@@ -49,7 +50,7 @@ func init() {
 	}
 	RegionPendingUsageManager = &SQuotaManager{
 		SQuotaBaseManager: quotas.NewQuotaUsageManager(RegionQuota,
-			rbacutils.ScopeProject,
+			rbacscope.ScopeProject,
 			"region_quota_pending_usage_tbl",
 			"region_quota_pending_usage",
 			"region_quota_pending_usages",
@@ -57,7 +58,7 @@ func init() {
 	}
 	RegionQuotaManager = &SQuotaManager{
 		SQuotaBaseManager: quotas.NewQuotaBaseManager(RegionQuota,
-			rbacutils.ScopeProject,
+			rbacscope.ScopeProject,
 			"region_quota_tbl",
 			RegionPendingUsageManager,
 			RegionUsageManager,
@@ -109,14 +110,14 @@ func (self *SRegionQuota) FetchSystemQuota() {
 		base = -1
 	case commonOptions.DefaultQuotaZero:
 		base = 0
-		if keys.Scope() == rbacutils.ScopeDomain { // domain level quota
+		if keys.Scope() == rbacscope.ScopeDomain { // domain level quota
 			base = 10
 		} else if keys.DomainId == identityapi.DEFAULT_DOMAIN_ID && keys.ProjectId == auth.AdminCredential().GetProjectId() {
 			base = 1
 		}
 	case commonOptions.DefaultQuotaDefault:
 		base = 1
-		if keys.Scope() == rbacutils.ScopeDomain {
+		if keys.Scope() == rbacscope.ScopeDomain {
 			base = 10
 		}
 	}
@@ -184,7 +185,7 @@ func (self *SRegionQuota) FetchUsage(ctx context.Context) error {
 
 	lbnic, _ := totalLBNicCount(scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv)
 
-	eipUsage := ElasticipManager.TotalCount(scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
+	eipUsage := ElasticipManager.TotalCount(ctx, scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
 
 	self.Eip = eipUsage.Total()
 	self.Port = net.InternalNicCount + net.InternalVirtualNicCount + lbnic
@@ -192,24 +193,24 @@ func (self *SRegionQuota) FetchUsage(ctx context.Context) error {
 	// self.Bw = net.InternalBandwidth
 	// self.Ebw = net.ExternalBandwidth
 
-	snapshotCount, _ := TotalSnapshotCount(scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
+	snapshotCount, _ := TotalSnapshotCount(ctx, scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
 	self.Snapshot = snapshotCount
 
-	instanceSnapshotCount, _ := TotalInstanceSnapshotCount(scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
+	instanceSnapshotCount, _ := TotalInstanceSnapshotCount(ctx, scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
 	self.InstanceSnapshot = instanceSnapshotCount
 
-	bucketUsage := BucketManager.TotalCount(scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
+	bucketUsage := BucketManager.TotalCount(ctx, scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
 	self.Bucket = bucketUsage.Buckets
 	self.ObjectGB = int(bucketUsage.Bytes / 1000 / 1000 / 1000)
 	self.ObjectCnt = bucketUsage.Objects
 
-	rdsUsage, _ := DBInstanceManager.TotalCount(scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
+	rdsUsage, _ := DBInstanceManager.TotalCount(ctx, scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
 	self.Rds = rdsUsage.TotalRdsCount
-	self.Cache, _ = ElasticcacheManager.TotalCount(scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
-	mongodbUsage, _ := MongoDBManager.TotalCount(scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
+	self.Cache, _ = ElasticcacheManager.TotalCount(ctx, scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
+	mongodbUsage, _ := MongoDBManager.TotalCount(ctx, scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
 	self.Mongodb = mongodbUsage.TotalMongodbCount
 
-	self.Loadbalancer, _ = LoadbalancerManager.TotalCount(scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
+	self.Loadbalancer, _ = LoadbalancerManager.TotalCount(ctx, scope, ownerId, rangeObjs, providers, brands, regionKeys.CloudEnv, rbacutils.SPolicyResult{})
 
 	return nil
 }

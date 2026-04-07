@@ -19,7 +19,6 @@ import (
 	"strconv"
 
 	"yunion.io/x/jsonutils"
-	"yunion.io/x/log"
 	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/utils"
 )
@@ -121,12 +120,24 @@ type IColumnSpec interface {
 	IsString() bool
 
 	IsDateTime() bool
+
+	// index of column, to preserve the column position
+	GetColIndex() int
+	// setter of column index
+	SetColIndex(idx int)
+}
+
+type iColumnInternal interface {
+	IColumnSpec
+
+	Oldname() string
 }
 
 // SBaseColumn is the base structure represents a column
 type SBaseColumn struct {
 	name          string
 	dbName        string
+	oldName       string
 	sqlType       string
 	defaultString string
 	isPointer     bool
@@ -136,6 +147,7 @@ type SBaseColumn struct {
 	isIndex       bool
 	isAllowZero   bool
 	tags          map[string]string
+	colIndex      int
 }
 
 // IsPointer implementation of SBaseColumn for IColumnSpec
@@ -149,6 +161,11 @@ func (c *SBaseColumn) Name() string {
 		return c.dbName
 	}
 	return c.name
+}
+
+// Name implementation of SBaseColumn for IColumnSpec
+func (c *SBaseColumn) Oldname() string {
+	return c.oldName
 }
 
 // ColType implementation of SBaseColumn for IColumnSpec
@@ -279,6 +296,14 @@ func (c *SBaseColumn) IsDateTime() bool {
 	return false
 }
 
+func (c *SBaseColumn) GetColIndex() int {
+	return c.colIndex
+}
+
+func (c *SBaseColumn) SetColIndex(idx int) {
+	c.colIndex = idx
+}
+
 // NewBaseColumn returns an instance of SBaseColumn
 func NewBaseColumn(name string, sqltype string, tagmap map[string]string, isPointer bool) SBaseColumn {
 	var val string
@@ -287,6 +312,11 @@ func NewBaseColumn(name string, sqltype string, tagmap map[string]string, isPoin
 	tagmap, val, ok = utils.TagPop(tagmap, TAG_NAME)
 	if ok {
 		dbName = val
+	}
+	oldName := ""
+	tagmap, val, ok = utils.TagPop(tagmap, TAG_OLD_NAME)
+	if ok {
+		oldName = val
 	}
 	defStr := ""
 	tagmap, val, ok = utils.TagPop(tagmap, TAG_DEFAULT)
@@ -324,6 +354,7 @@ func NewBaseColumn(name string, sqltype string, tagmap map[string]string, isPoin
 	return SBaseColumn{
 		name:          name,
 		dbName:        dbName,
+		oldName:       oldName,
 		sqlType:       sqltype,
 		defaultString: defStr,
 		isNullable:    isNullable,
@@ -333,6 +364,7 @@ func NewBaseColumn(name string, sqltype string, tagmap map[string]string, isPoin
 		tags:          tagmap,
 		isPointer:     isPointer,
 		isAllowZero:   isAllowZero,
+		colIndex:      -1,
 	}
 }
 
@@ -370,7 +402,6 @@ type SBaseCompoundColumn struct{}
 func (c *SBaseCompoundColumn) ConvertFromString(str string) interface{} {
 	json, err := jsonutils.ParseString(str)
 	if err != nil {
-		log.Errorf("ParseString fail %s", err)
 		json = jsonutils.JSONNull
 	}
 	return json.String()

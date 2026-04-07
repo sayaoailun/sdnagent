@@ -16,10 +16,12 @@ package models
 
 import (
 	"fmt"
+	"sort"
 
 	"yunion.io/x/log"
 
 	compute_models "yunion.io/x/onecloud/pkg/compute/models"
+	"yunion.io/x/onecloud/pkg/util/netutils2"
 )
 
 type Vpc struct {
@@ -64,11 +66,12 @@ func (el *Wire) Copy() *Wire {
 type Network struct {
 	compute_models.SNetwork
 
-	Vpc           *Vpc          `json:"-"`
-	Wire          *Wire         `json:"-"`
-	Guestnetworks Guestnetworks `json:"-"`
-	Groupnetworks Groupnetworks `json:"-"`
-	Elasticips    Elasticips    `json:"-"`
+	Vpc                  *Vpc                 `json:"-"`
+	Wire                 *Wire                `json:"-"`
+	Guestnetworks        Guestnetworks        `json:"-"`
+	Groupnetworks        Groupnetworks        `json:"-"`
+	LoadbalancerNetworks LoadbalancerNetworks `json:"-"`
+	Elasticips           Elasticips           `json:"-"`
 }
 
 func (el *Network) Copy() *Network {
@@ -133,6 +136,42 @@ func (el *Guest) GetVips() []string {
 	return ret
 }
 
+type GuestnetworkList []*Guestnetwork
+
+func (a GuestnetworkList) Len() int           { return len(a) }
+func (a GuestnetworkList) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a GuestnetworkList) Less(i, j int) bool { return a[i].Index < a[j].Index }
+
+func (el *Guest) FixIsDefaults() {
+	gns := make([]*Guestnetwork, 0, len(el.Guestnetworks))
+	for _, v := range el.Guestnetworks {
+		gns = append(gns, v)
+	}
+	sort.Sort(GuestnetworkList(gns))
+	defaultCnt := 0
+	nics := netutils2.SNicInfoList{}
+	for _, gn := range gns {
+		if gn.Network == nil {
+			log.Debugf("guest %s %s", gn.GuestId, gn.NetworkId)
+			continue
+		}
+		if gn.IsDefault {
+			defaultCnt++
+		}
+		nics = nics.Add(gn.IpAddr, gn.MacAddr, gn.Network.GuestGateway)
+	}
+	if defaultCnt != 1 {
+		gwMac, _ := nics.FindDefaultNicMac()
+		for _, gn := range gns {
+			if gn.MacAddr == gwMac {
+				gn.IsDefault = true
+			} else {
+				gn.IsDefault = false
+			}
+		}
+	}
+}
+
 type Host struct {
 	compute_models.SHost
 }
@@ -187,9 +226,10 @@ func (el *SecurityGroupRule) Copy() *SecurityGroupRule {
 type Elasticip struct {
 	compute_models.SElasticip
 
-	Network      *Network      `json:"-"`
-	Guestnetwork *Guestnetwork `json:"-"`
-	Groupnetwork *Groupnetwork `json:"-"`
+	Network             *Network             `json:"-"`
+	Guestnetwork        *Guestnetwork        `json:"-"`
+	Groupnetwork        *Groupnetwork        `json:"-"`
+	LoadbalancerNetwork *LoadbalancerNetwork `json:"-"`
 }
 
 func (el *Elasticip) Copy() *Elasticip {
@@ -200,11 +240,25 @@ func (el *Elasticip) Copy() *Elasticip {
 
 type DnsRecord struct {
 	compute_models.SDnsRecord
+
+	DnsZone *DnsZone
 }
 
 func (el *DnsRecord) Copy() *DnsRecord {
 	return &DnsRecord{
 		SDnsRecord: el.SDnsRecord,
+	}
+}
+
+type DnsZone struct {
+	compute_models.SDnsZone
+
+	Records DnsRecords
+}
+
+func (el *DnsZone) Copy() *DnsZone {
+	return &DnsZone{
+		SDnsZone: el.SDnsZone,
 	}
 }
 
@@ -268,5 +322,52 @@ type Group struct {
 func (el *Group) Copy() *Group {
 	return &Group{
 		SGroup: el.SGroup,
+	}
+}
+
+type LoadbalancerNetwork struct {
+	compute_models.SLoadbalancerNetwork
+
+	Network               *Network              `json:"-"`
+	Elasticip             *Elasticip            `json:"-"`
+	LoadbalancerListeners LoadbalancerListeners `json:"-"`
+}
+
+func (el *LoadbalancerNetwork) Copy() *LoadbalancerNetwork {
+	return &LoadbalancerNetwork{
+		SLoadbalancerNetwork: el.SLoadbalancerNetwork,
+	}
+}
+
+func (el *LoadbalancerNetwork) OrderedLoadbalancerListeners() []*LoadbalancerListener {
+	lblisteners := make([]*LoadbalancerListener, 0, len(el.LoadbalancerListeners))
+	for _, lblistener := range el.LoadbalancerListeners {
+		lblisteners = append(lblisteners, lblistener)
+	}
+	sort.Slice(lblisteners, func(i, j int) bool {
+		return lblisteners[i].Id < lblisteners[j].Id
+	})
+	return lblisteners
+}
+
+type LoadbalancerListener struct {
+	compute_models.SLoadbalancerListener
+
+	LoadbalancerAcl *LoadbalancerAcl `json:"-"`
+}
+
+func (el *LoadbalancerListener) Copy() *LoadbalancerListener {
+	return &LoadbalancerListener{
+		SLoadbalancerListener: el.SLoadbalancerListener,
+	}
+}
+
+type LoadbalancerAcl struct {
+	compute_models.SLoadbalancerAcl
+}
+
+func (el *LoadbalancerAcl) Copy() *LoadbalancerAcl {
+	return &LoadbalancerAcl{
+		SLoadbalancerAcl: el.SLoadbalancerAcl,
 	}
 }

@@ -139,6 +139,8 @@ func optionsStructRvToParams(rv reflect.Value) (*jsonutils.JSONDict, error) {
 			// TODO
 			msg := fmt.Sprintf("do not know what to do with non-anonymous struct field: %s", ft.Name)
 			panic(msg)
+		case reflect.Map:
+			p.Set(name, jsonutils.Marshal(f.Interface()))
 		case reflect.Slice, reflect.Array:
 			l := f.Len()
 			for i := 0; i < l; i++ {
@@ -238,9 +240,12 @@ type BaseListOptions struct {
 	DomainTags    []string `help:"filter by domain project tags, key and value separated by \"=\", keyvalue pairs separated by \";\"" json:"-"`
 	NoDomainTags  []string `help:"filter by no these domain tags, key and value separated by \"=\", keyvalue pairs separated by \";\"" json:"-"`
 
-	Manager      string   `help:"List objects belonging to the cloud provider" json:"manager,omitempty"`
+	ProjectOrganizations []string `help:"filter by projects of specified organizations"`
+	DomainOrganizations  []string `help:"filter by domains of specified organizations"`
+
+	Manager      []string `help:"List objects belonging to the cloud provider" json:"manager,omitempty"`
 	Account      string   `help:"List objects belonging to the cloud account" json:"account,omitempty"`
-	Provider     []string `help:"List objects from the provider" choices:"OneCloud|VMware|Aliyun|Apsara|Qcloud|Azure|Aws|Huawei|OpenStack|Ucloud|ZStack|Google|Ctyun|Cloudpods|Nutanix|BingoCloud|IncloudSphere|JDcloud" json:"provider,omitempty"`
+	Provider     []string `help:"List objects from the provider" choices:"OneCloud|VMware|Aliyun|Apsara|Qcloud|Azure|Aws|Huawei|OpenStack|Ucloud|VolcEngine|ZStack|Google|Ctyun|Cloudpods|Nutanix|BingoCloud|IncloudSphere|JDcloud|Proxmox|Ceph|CephFS|Ecloud|HCSO|HCS|HCSOP|H3C|S3|RemoteFile|Ksyun|Baidu|QingCloud|OracleCloud|SangFor" json:"provider,omitempty"`
 	Brand        []string `help:"List objects belonging to a special brand"`
 	CloudEnv     string   `help:"Cloud environment" choices:"public|private|onpremise|private_or_onpremise" json:"cloud_env,omitempty"`
 	PublicCloud  *bool    `help:"List objects belonging to public cloud" json:"public_cloud"`
@@ -254,6 +259,9 @@ type BaseListOptions struct {
 	OrderByTag string `help:"Order results by tag values, composed by a tag key and order, e.g user:部门:ASC"`
 
 	Delete string `help:"show deleted records"`
+
+	Id []string `help:"filter by id"`
+	// Name []string `help:"fitler by name"`
 }
 
 func (opts *BaseListOptions) addTag(keyPrefix, tagstr string, idx int, params *jsonutils.JSONDict) error {
@@ -376,6 +384,9 @@ func (opts *BaseListOptions) Params() (*jsonutils.JSONDict, error) {
 		}
 		noProjTagIdx++
 	}
+	for i, orgId := range opts.ProjectOrganizations {
+		params.Add(jsonutils.NewString(orgId), fmt.Sprintf("project_organizations.%d", i))
+	}
 	domainTagIdx := 0
 	for _, tag := range opts.DomainTags {
 		err := opts.addTagInternal("", "domain_tags", tag, domainTagIdx, params)
@@ -391,6 +402,9 @@ func (opts *BaseListOptions) Params() (*jsonutils.JSONDict, error) {
 			return nil, errors.Wrap(err, "NoDomainTags")
 		}
 		noDomainTagIdx++
+	}
+	for i, orgId := range opts.DomainOrganizations {
+		params.Add(jsonutils.NewString(orgId), fmt.Sprintf("domain_organizations.%d", i))
 	}
 	return params, nil
 }
@@ -433,8 +447,8 @@ func (o *MultiArchListOptions) Params() (*jsonutils.JSONDict, error) {
 }
 
 type BaseUpdateOptions struct {
-	ID   string `help:"ID or Name of resource to update"`
-	Name string `help:"Name of resource to update"`
+	ID   string `help:"ID or Name of resource to update" json:"-"`
+	Name string `help:"Name of resource to update" json:"name"`
 	Desc string `metavar:"<DESCRIPTION>" help:"Description" json:"description"`
 }
 
@@ -454,9 +468,10 @@ func (opts *BaseUpdateOptions) Params() (jsonutils.JSONObject, error) {
 }
 
 type BasePublicOptions struct {
-	ID            string   `help:"ID or name of resource" json:"-"`
-	Scope         string   `help:"sharing scope" choices:"system|domain"`
-	SharedDomains []string `help:"share to domains"`
+	ID             string   `help:"ID or name of resource" json:"-"`
+	Scope          string   `help:"sharing scope" choices:"system|domain|project"`
+	SharedDomains  []string `help:"share to domains"`
+	SharedProjects []string `help:"share to projects"`
 }
 
 func (opts *BasePublicOptions) GetId() string {

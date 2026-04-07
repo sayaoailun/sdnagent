@@ -25,6 +25,7 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/tristate"
+	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/sqlchemy"
 
 	cloudproxy_api "yunion.io/x/onecloud/pkg/apis/cloudproxy"
@@ -37,7 +38,6 @@ import (
 	ansible_modules "yunion.io/x/onecloud/pkg/mcclient/modules/ansible"
 	cloudproxy_module "yunion.io/x/onecloud/pkg/mcclient/modules/cloudproxy"
 	"yunion.io/x/onecloud/pkg/util/ansible"
-	"yunion.io/x/onecloud/pkg/util/httputils"
 	ssh_util "yunion.io/x/onecloud/pkg/util/ssh"
 )
 
@@ -137,7 +137,7 @@ func (guest *SGuest) sshableTryEach(
 	var gnInfos []gnInfo
 	for i := range gns {
 		gn := &gns[i]
-		network := gn.GetNetwork()
+		network, _ := gn.GetNetwork()
 		if network == nil {
 			continue
 		}
@@ -519,9 +519,9 @@ func (guest *SGuest) GetDetailsMakeSshableCmd(
 	}
 
 	varVals := [][2]string{
-		[2]string{"user", "cloudroot"},
-		[2]string{"adminpub", strings.TrimSpace(adminPublicKey)},
-		[2]string{"projpub", strings.TrimSpace(projectPublicKey)},
+		{"user", "cloudroot"},
+		{"adminpub", strings.TrimSpace(adminPublicKey)},
+		{"projpub", strings.TrimSpace(projectPublicKey)},
 	}
 	shellCmd := ""
 	for i := range varVals {

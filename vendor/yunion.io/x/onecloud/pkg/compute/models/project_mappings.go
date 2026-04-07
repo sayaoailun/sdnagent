@@ -99,8 +99,12 @@ func (manager *SProjectMappingManager) ValidateCreateData(
 	var tenant *db.STenant
 	for i := range input.Rules {
 		if len(input.Rules[i].ProjectId) > 0 {
-			projectInput := apis.ProjectizedResourceInput{ProjectId: input.Rules[i].ProjectId}
-			tenant, projectInput, err = db.ValidateProjectizedResourceInput(ctx, projectInput)
+			projectInput := apis.ProjectizedResourceCreateInput{
+				ProjectizedResourceInput: apis.ProjectizedResourceInput{
+					ProjectId: input.Rules[i].ProjectId,
+				},
+			}
+			tenant, _, err = db.ValidateProjectizedResourceInput(ctx, projectInput)
 			if err != nil {
 				return input, err
 			}
@@ -109,6 +113,7 @@ func (manager *SProjectMappingManager) ValidateCreateData(
 			input.Rules[i].Project = tenant.Name
 		}
 	}
+	input.Rules = input.Rules.Rules()
 	input.SetEnabled()
 	input.Status = api.PROJECT_MAPPING_STATUS_AVAILABLE
 	input.EnabledStatusInfrasResourceBaseCreateInput, err = manager.SEnabledStatusInfrasResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.EnabledStatusInfrasResourceBaseCreateInput)
@@ -231,8 +236,12 @@ func (self *SProjectMapping) ValidateUpdateData(ctx context.Context, userCred mc
 	var tenant *db.STenant
 	for i := range input.Rules {
 		if len(input.Rules[i].ProjectId) > 0 {
-			projectInput := apis.ProjectizedResourceInput{ProjectId: input.Rules[i].ProjectId}
-			tenant, projectInput, err = db.ValidateProjectizedResourceInput(ctx, projectInput)
+			projectInput := apis.ProjectizedResourceCreateInput{
+				ProjectizedResourceInput: apis.ProjectizedResourceInput{
+					ProjectId: input.Rules[i].ProjectId,
+				},
+			}
+			tenant, _, err = db.ValidateProjectizedResourceInput(ctx, projectInput)
 			if err != nil {
 				return input, err
 			}
@@ -241,6 +250,7 @@ func (self *SProjectMapping) ValidateUpdateData(ctx context.Context, userCred mc
 			input.Rules[i].Project = tenant.Name
 		}
 	}
+	input.Rules = input.Rules.Rules()
 	input.EnabledStatusInfrasResourceBaseUpdateInput, err = self.SEnabledStatusInfrasResourceBase.ValidateUpdateData(ctx, userCred, query, input.EnabledStatusInfrasResourceBaseUpdateInput)
 	return input, err
 }

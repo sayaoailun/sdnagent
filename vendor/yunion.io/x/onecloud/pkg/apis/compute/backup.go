@@ -20,8 +20,12 @@ import (
 	"yunion.io/x/onecloud/pkg/apis"
 )
 
+type TBackupStorageType string
+
 const (
-	BACKUPSTORAGE_TYPE_NFS       = "nfs"
+	BACKUPSTORAGE_TYPE_NFS            = TBackupStorageType("nfs")
+	BACKUPSTORAGE_TYPE_OBJECT_STORAGE = TBackupStorageType("object")
+
 	BACKUPSTORAGE_STATUS_ONLINE  = "online"
 	BACKUPSTORAGE_STATUS_OFFLINE = "offline"
 
@@ -55,31 +59,35 @@ type BackupStorageCreateInput struct {
 	// enum: nfs
 	StorageType string `json:"storage_type"`
 
-	// description: host of nfs, storage_type 为 nfs 时, 此参数必传
-	// example: 192.168.222.2
-	NfsHost string `json:"nfs_host"`
-
-	// description: shared dir of nfs, storage_type 为 nfs 时, 此参数必传
-	// example: /nfs_root/
-	NfsSharedDir string `json:"nfs_shared_dir"`
+	SBackupStorageAccessInfo
 
 	// description: Capacity size in MB
 	CapacityMb int `json:"capacity_mb"`
 }
 
-type BackupStorageAccessInfo struct {
-	AccessUrl string
+type BackupStorageUpdateInput struct {
+	apis.EnabledStatusInfrasResourceBaseUpdateInput
+
+	SBackupStorageAccessInfo
 }
+
+/*type BackupStorageAccessInfo struct {
+	AccessUrl string
+}*/
 
 type BackupStorageDetails struct {
 	apis.EnabledStatusInfrasResourceBaseDetails
 
-	NfsHost      string
-	NfsSharedDir string
+	SBackupStorageAccessInfo
 }
 
 type BackupStorageListInput struct {
 	apis.EnabledStatusInfrasResourceBaseListInput
+
+	// filter by server_id
+	ServerId string `json:"server_id"`
+	// filter by disk_id
+	DiskId string `json:"disk_id"`
 }
 
 type DiskBackupListInput struct {
@@ -93,6 +101,8 @@ type DiskBackupListInput struct {
 	BackupStorageId string `json:"backup_storage_id"`
 	// description: 是否为主机备份的一部分
 	IsInstanceBackup *bool `json:"is_instance_backup"`
+	// 按硬盘名称排序
+	OrderByDiskName string `json:"order_by_disk_name"`
 }
 
 type DiskBackupDetails struct {
@@ -107,6 +117,15 @@ type DiskBackupDetails struct {
 	BackupStorageName string `json:"backup_storage_name"`
 	// description: 是否是子备份
 	IsSubBackup bool `json:"is_sub_backup"`
+
+	SDiskBackup
+}
+
+type DiskBackupAsTarInput struct {
+	IncludeFiles       []string `json:"include_files"`
+	ExcludeFiles       []string `json:"exclude_files"`
+	ContainerId        string   `json:"container_id"`
+	IgnoreNotExistFile bool     `json:"ignore_not_exist_file"`
 }
 
 type DiskBackupCreateInput struct {
@@ -115,12 +134,15 @@ type DiskBackupCreateInput struct {
 
 	// description: disk id
 	DiskId string `json:"disk_id"`
+	// swagger: ignore
+	BackStorageId string `json:"back_storage_id" yunion-deprecated-by:"backup_storage_id"`
 	// description: backup storage id
-	BackupStorageId string `json:"back_storage_id"`
+	BackupStorageId string `json:"backup_storage_id"`
 	// swagger: ignore
 	CloudregionId string `json:"cloudregion_id"`
 	// swagger:ignore
-	ManagerId string `json:"manager_id"`
+	ManagerId   string                `json:"manager_id"`
+	BackupAsTar *DiskBackupAsTarInput `json:"backup_as_tar"`
 }
 
 type DiskBackupRecoveryInput struct {
@@ -159,4 +181,39 @@ type InstanceBackupPackMetadata struct {
 }
 
 type InstanceBackupManagerSyncstatusInput struct {
+}
+
+type SBackupStorageAccessInfo struct {
+	// description: host of nfs, storage_type 为 nfs 时, 此参数必传
+	// example: 192.168.222.2
+	NfsHost string `json:"nfs_host"`
+
+	// description: shared dir of nfs, storage_type 为 nfs 时, 此参数必传
+	// example: /nfs_root/
+	NfsSharedDir string `json:"nfs_shared_dir"`
+
+	// description: access url of object storage bucket
+	// example: https://qxxxxxo.tos-cn-beijing.volces.com
+	ObjectBucketUrl string `json:"object_bucket_url"`
+	// description: access key of object storage
+	ObjectAccessKey string `json:"object_access_key"`
+	// description: secret of object storage
+	ObjectSecret string `json:"object_secret"`
+}
+
+func (ba *SBackupStorageAccessInfo) String() string {
+	return jsonutils.Marshal(ba).String()
+}
+
+func (ba *SBackupStorageAccessInfo) IsZero() bool {
+	return ba == nil
+}
+
+type ServerCreateInstanceBackupInput struct {
+	// 主机备份名称
+	Name string `json:"name"`
+	// 主机备份的生成名称
+	GenerateName string `json:"generate_name"`
+	// 备份存储ID
+	BackupStorageId string `json:"backup_storage_id"`
 }

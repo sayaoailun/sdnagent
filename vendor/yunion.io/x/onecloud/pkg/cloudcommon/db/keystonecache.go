@@ -26,11 +26,13 @@ type SKeystoneCacheObjectManager struct {
 
 type SKeystoneCacheObject struct {
 	SStandaloneResourceBase
+	SPendingDeletedBase
 
 	DomainId string `width:"128" charset:"ascii" nullable:"true"`
 	Domain   string `width:"128" charset:"utf8" nullable:"true"`
 
 	LastCheck time.Time `nullable:"true"`
+	Lang      string    `width:"8" charset:"ascii" nullable:"true" list:"domain" update:"domain" create:"domain_optional"`
 }
 
 func NewKeystoneCacheObjectManager(dt interface{}, tableName string, keyword string, keywordPlural string) SKeystoneCacheObjectManager {

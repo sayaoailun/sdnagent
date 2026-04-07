@@ -17,24 +17,26 @@ package compute
 import (
 	"time"
 
+	"yunion.io/x/cloudmux/pkg/apis/compute"
+
 	"yunion.io/x/onecloud/pkg/apis"
 )
 
 const (
 	// 可用
-	NAS_STATUS_AVAILABLE = "available"
+	NAS_STATUS_AVAILABLE = compute.NAS_STATUS_AVAILABLE
 	// 不可用
-	NAS_STATUS_UNAVAILABLE = "unavailable"
+	NAS_STATUS_UNAVAILABLE = compute.NAS_STATUS_UNAVAILABLE
 	// 扩容中
-	NAS_STATUS_EXTENDING = "extending"
+	NAS_STATUS_EXTENDING = compute.NAS_STATUS_EXTENDING
 	// 创建中
-	NAS_STATUS_CREATING = "creating"
+	NAS_STATUS_CREATING = compute.NAS_STATUS_CREATING
 	// 创建失败
-	NAS_STATUS_CREATE_FAILED = "create_failed"
+	NAS_STATUS_CREATE_FAILED = compute.NAS_STATUS_CREATE_FAILED
 	// 未知
-	NAS_STATUS_UNKNOWN = "unknown"
+	NAS_STATUS_UNKNOWN = compute.NAS_STATUS_UNKNOWN
 	// 删除中
-	NAS_STATUS_DELETING      = "deleting"
+	NAS_STATUS_DELETING      = compute.NAS_STATUS_DELETING
 	NAS_STATUS_DELETE_FAILED = "delete_failed"
 
 	NAS_UPDATE_TAGS        = "update_tags"
@@ -42,7 +44,7 @@ const (
 )
 
 type FileSystemListInput struct {
-	apis.StatusInfrasResourceBaseListInput
+	apis.VirtualResourceListInput
 	apis.ExternalizedResourceBaseListInput
 	ManagedResourceListInput
 
@@ -50,7 +52,7 @@ type FileSystemListInput struct {
 }
 
 type FileSystemCreateInput struct {
-	apis.StatusInfrasResourceBaseCreateInput
+	apis.VirtualResourceCreateInput
 	// 协议类型
 	// enum: NFS, SMB, CPFS
 	Protocol string `json:"protocol"`
@@ -99,7 +101,7 @@ type FileSystemSyncstatusInput struct {
 }
 
 type FileSystemDetails struct {
-	apis.StatusInfrasResourceBaseDetails
+	apis.VirtualResourceDetails
 	ManagedResourceInfo
 	CloudregionResourceInfo
 

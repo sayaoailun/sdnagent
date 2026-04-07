@@ -31,9 +31,10 @@ const (
 	ErrActionNotFound   = errors.Error("ActionNotFoundError")
 	ErrTenantNotFound   = errors.Error("TenantNotFoundError")
 
-	ErrServerStatus  = errors.Error("ServerStatusError")
-	ErrInvalidStatus = errors.ErrInvalidStatus
-	ErrInvalidFormat = errors.Error("InvalidFormatError")
+	ErrServerStatus     = errors.Error("ServerStatusError")
+	ErrInvalidStatus    = errors.ErrInvalidStatus
+	ErrInvalidIdpStatus = errors.Error("InvalidIdpStatus")
+	ErrInvalidFormat    = errors.ErrInvalidFormat
 
 	ErrInputParameter   = errors.Error("InputParameterError")
 	ErrWeakPassword     = errors.Error("WeakPasswordError")
@@ -83,7 +84,7 @@ const (
 	ErrTooManyAttempts = errors.Error("TooManyFailedAttempts")
 	ErrTooManyRequests = errors.Error("TooManyRequests")
 
-	ErrUnsupportedProtocol = errors.Error("UnsupportedProtocol")
+	ErrUnsupportedProtocol = errors.ErrUnsupportedProtocol
 
 	ErrPolicyDefinition = errors.Error("PolicyDefinitionError")
 
@@ -124,6 +125,8 @@ var (
 		ErrServerStatus:  400,
 		ErrInvalidStatus: 400,
 		ErrInvalidFormat: 400,
+
+		ErrInvalidIdpStatus: 400,
 
 		ErrInputParameter:   400,
 		ErrWeakPassword:     400,

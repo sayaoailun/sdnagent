@@ -41,14 +41,14 @@ type SBaremetalagent struct {
 	db.SStandaloneResourceBase
 	SZoneResourceBase `width:"128" charset:"ascii" nullable:"false" list:"admin" update:"admin" create:"admin_required"`
 
-	Status     string `width:"36" charset:"ascii" nullable:"false" default:"disable" list:"user" create:"optional"`
+	Status     string `width:"36" charset:"ascii" nullable:"false" default:"disable" create:"optional"`
 	AccessIp   string `width:"16" charset:"ascii" nullable:"false" list:"admin" update:"admin" create:"admin_required"`
 	ManagerUri string `width:"256" charset:"ascii" nullable:"true" list:"admin" update:"admin" create:"admin_required"`
 	// ZoneId     string `width:"128" charset:"ascii" nullable:"false" list:"admin" update:"admin" create:"admin_required"`
 
 	AgentType string `width:"32" charset:"ascii" nullable:"true" default:"baremetal" list:"admin" update:"admin" create:"admin_optional"`
 
-	Version string `width:"64" charset:"ascii" list:"admin" update:"admin" create:"admin_optional"` // Column(VARCHAR(64, charset='ascii'))
+	Version string `width:"128" charset:"ascii" list:"admin" update:"admin" create:"admin_optional"` // Column(VARCHAR(64, charset='ascii'))
 
 	StoragecacheId    string `width:"36" charset:"ascii" nullable:"true" list:"admin" get:"admin" update:"admin" create:"admin_optional"`
 	DisableImageCache bool   `default:"false" list:"admin" create:"admin_optional" update:"admin"`
@@ -94,7 +94,7 @@ func (self *SBaremetalagent) ValidateUpdateData(ctx context.Context, userCred mc
 		}
 	}
 	if len(input.ZoneId) > 0 {
-		_, input.ZoneResourceInput, err = ValidateZoneResourceInput(userCred, input.ZoneResourceInput)
+		_, input.ZoneResourceInput, err = ValidateZoneResourceInput(ctx, userCred, input.ZoneResourceInput)
 		if err != nil {
 			return input, errors.Wrap(err, "ValidateZoneResourceInput")
 		}
@@ -122,7 +122,7 @@ func (manager *SBaremetalagentManager) ValidateCreateData(ctx context.Context, u
 	if len(input.ZoneId) == 0 {
 		return input, errors.Wrap(httperrors.ErrMissingParameter, "zone/zone_id")
 	}
-	_, input.ZoneResourceInput, err = ValidateZoneResourceInput(userCred, input.ZoneResourceInput)
+	_, input.ZoneResourceInput, err = ValidateZoneResourceInput(ctx, userCred, input.ZoneResourceInput)
 	if err != nil {
 		return input, errors.Wrap(err, "ValidateZoneResourceInput")
 	}
@@ -225,7 +225,11 @@ func (manager *SBaremetalagentManager) FetchCustomizeColumns(
 }
 
 func (manager *SBaremetalagentManager) GetAgent(agentType api.TAgentType, zoneId string) *SBaremetalagent {
-	q := manager.Query().Equals("agent_type", agentType).Equals("zone_id", zoneId).Asc("created_at")
+	q := manager.Query().Equals("agent_type", agentType)
+	if len(zoneId) > 0 {
+		q = q.Equals("zone_id", zoneId)
+	}
+	q = q.Asc("created_at")
 	agents := make([]SBaremetalagent, 0)
 	err := db.FetchModelObjects(manager, q, &agents)
 	if err != nil {

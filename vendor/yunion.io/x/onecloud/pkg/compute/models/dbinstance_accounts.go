@@ -19,10 +19,12 @@ import (
 	"database/sql"
 	"fmt"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
@@ -30,10 +32,8 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/seclib2"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
@@ -74,8 +74,8 @@ func (manager *SDBInstanceAccountManager) GetContextManagers() [][]db.IModelMana
 	}
 }
 
-func (manager *SDBInstanceAccountManager) ResourceScope() rbacutils.TRbacScope {
-	return rbacutils.ScopeProject
+func (manager *SDBInstanceAccountManager) ResourceScope() rbacscope.TRbacScope {
+	return rbacscope.ScopeProject
 }
 
 func (self *SDBInstanceAccount) GetOwnerId() mcclient.IIdentityProvider {
@@ -99,15 +99,15 @@ func (manager *SDBInstanceAccountManager) FetchOwnerId(ctx context.Context, data
 	return db.FetchProjectInfo(ctx, data)
 }
 
-func (manager *SDBInstanceAccountManager) FilterByOwner(q *sqlchemy.SQuery, userCred mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
-	if userCred != nil {
+func (manager *SDBInstanceAccountManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	if owner != nil {
 		sq := DBInstanceManager.Query("id")
 		switch scope {
-		case rbacutils.ScopeProject:
-			sq = sq.Equals("tenant_id", userCred.GetProjectId())
+		case rbacscope.ScopeProject:
+			sq = sq.Equals("tenant_id", owner.GetProjectId())
 			return q.In("dbinstance_id", sq.SubQuery())
-		case rbacutils.ScopeDomain:
-			sq = sq.Equals("domain_id", userCred.GetProjectDomainId())
+		case rbacscope.ScopeDomain:
+			sq = sq.Equals("domain_id", owner.GetProjectDomainId())
 			return q.In("dbinstance_id", sq.SubQuery())
 		}
 	}
@@ -293,7 +293,7 @@ func (manager *SDBInstanceAccountManager) ValidateCreateData(ctx context.Context
 	if len(input.DBInstance) == 0 {
 		return nil, httperrors.NewMissingParameterError("dbinstance")
 	}
-	_instance, err := DBInstanceManager.FetchByIdOrName(userCred, input.DBInstance)
+	_instance, err := DBInstanceManager.FetchByIdOrName(ctx, userCred, input.DBInstance)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, httperrors.NewResourceNotFoundError("failed to found dbinstance %s", input.DBInstance)
@@ -359,7 +359,7 @@ func (self *SDBInstanceAccount) PostCreate(ctx context.Context, userCred mcclien
 }
 
 func (self *SDBInstanceAccount) StartDBInstanceAccountCreateTask(ctx context.Context, userCred mcclient.TokenCredential, data *jsonutils.JSONDict, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_USER_CREATING, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_USER_CREATING, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceAccountCreateTask", self, userCred, data, parentTaskId, "", nil)
 	if err != nil {
 		return err
@@ -460,7 +460,7 @@ func (self *SDBInstanceAccount) PerformSetPrivileges(ctx context.Context, userCr
 }
 
 func (self *SDBInstanceAccount) StartSetPrivilegesTask(ctx context.Context, userCred mcclient.TokenCredential, data jsonutils.JSONObject) error {
-	self.SetStatus(userCred, api.DBINSTANCE_USER_SET_PRIVILEGE, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_USER_SET_PRIVILEGE, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceAccountSetPrivilegesTask", self, userCred, data.(*jsonutils.JSONDict), "", "", nil)
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
@@ -471,7 +471,7 @@ func (self *SDBInstanceAccount) StartSetPrivilegesTask(ctx context.Context, user
 }
 
 func (self *SDBInstanceAccount) StartGrantPrivilegeTask(ctx context.Context, userCred mcclient.TokenCredential, database string, privilege string, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_USER_GRANT_PRIVILEGE, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_USER_GRANT_PRIVILEGE, "")
 	params := jsonutils.NewDict()
 	params.Add(jsonutils.NewString(database), "database")
 	params.Add(jsonutils.NewString(privilege), "privilege")
@@ -518,7 +518,7 @@ func (self *SDBInstanceAccount) PerformRevokePrivilege(ctx context.Context, user
 }
 
 func (self *SDBInstanceAccount) StartRevokePrivilegeTask(ctx context.Context, userCred mcclient.TokenCredential, database string, privilege string, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_USER_REVOKE_PRIVILEGE, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_USER_REVOKE_PRIVILEGE, "")
 	params := jsonutils.NewDict()
 	params.Add(jsonutils.NewString(database), "database")
 	params.Add(jsonutils.NewString(privilege), "privilege")
@@ -560,7 +560,7 @@ func (self *SDBInstanceAccount) StartDBInstanceAccountResetPasswordTask(ctx cont
 	} else {
 		params.Add(jsonutils.NewString(seclib2.RandomPassword2(20)), "password")
 	}
-	self.SetStatus(userCred, api.DBINSTANCE_USER_RESET_PASSWD, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_USER_RESET_PASSWD, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceAccountResetPasswordTask", self, userCred, params, "", "", nil)
 	if err != nil {
 		return errors.Wrapf(err, "NewTask")
@@ -654,7 +654,7 @@ func (manager *SDBInstanceAccountManager) SyncDBInstanceAccounts(ctx context.Con
 				if passwd, err := locals[i].GetPassword(); err == nil && len(passwd) > 0 {
 					password = passwd
 				}
-				err := locals[i].Purge(ctx, userCred)
+				err := locals[i].RealDelete(ctx, userCred)
 				if err != nil {
 					result.DeleteError(err)
 					continue
@@ -671,7 +671,7 @@ func (manager *SDBInstanceAccountManager) SyncDBInstanceAccounts(ctx context.Con
 		_, ok := remoteMaps[key]
 		if !ok {
 			for i := range accounts {
-				err := accounts[i].Purge(ctx, userCred)
+				err := accounts[i].RealDelete(ctx, userCred)
 				if err != nil {
 					result.DeleteError(err)
 					continue
@@ -728,7 +728,7 @@ func (self *SDBInstanceAccount) CustomizeDelete(ctx context.Context, userCred mc
 }
 
 func (self *SDBInstanceAccount) StartDBInstanceAccountDeleteTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_USER_DELETING, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_USER_DELETING, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceAccountDeleteTask", self, userCred, nil, parentTaskId, "", nil)
 	if err != nil {
 		return err
@@ -766,7 +766,7 @@ func (manager *SDBInstanceAccountManager) InitializeData() error {
 		return errors.Wrapf(err, "db.FetchModelObjects")
 	}
 	for i := range accounts {
-		err = accounts[i].Purge(context.Background(), nil)
+		err = accounts[i].RealDelete(context.Background(), nil)
 		if err != nil {
 			return errors.Wrapf(err, "purge %s", accounts[i].Id)
 		}

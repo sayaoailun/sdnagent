@@ -28,6 +28,7 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-ignore
 type SGuestsecgroupManager struct {
 	SGuestJointsManager
 	SSecurityGroupResourceBaseManager
@@ -50,6 +51,7 @@ func init() {
 	})
 }
 
+// +onecloud:model-api-gen
 type SGuestsecgroup struct {
 	SGuestJointsBase
 
@@ -73,6 +75,10 @@ func (self *SGuestsecgroup) getSecgroup() *SSecurityGroup {
 
 func (self *SGuestsecgroup) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
 	return db.DeleteModel(ctx, userCred, self)
+}
+
+func (self *SGuestsecgroup) Detach(ctx context.Context, userCred mcclient.TokenCredential) error {
+	return db.DetachJoint(ctx, userCred, self)
 }
 
 func (manager *SGuestsecgroupManager) ListItemFilter(

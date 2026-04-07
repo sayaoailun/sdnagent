@@ -17,9 +17,9 @@ package identity
 import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
 
 	"yunion.io/x/onecloud/pkg/apis"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/tagutils"
 )
 
@@ -42,8 +42,7 @@ type IdentityBaseResourceListInput struct {
 type EnabledIdentityBaseResourceListInput struct {
 	IdentityBaseResourceListInput
 
-	// filter by enabled status
-	Enabled *bool `json:"enabled"`
+	apis.EnabledResourceBaseListInput
 }
 
 type ProjectFilterListInput struct {
@@ -157,11 +156,17 @@ type ProjectListInput struct {
 	UserFilterListInput
 	GroupFilterListInput
 
+	// filter projects by Identity Provider
+	IdpId string `json:"idp_id"`
+
 	// 过滤出指定用户或者组可以加入的项目
 	Jointable *bool `json:"jointable"`
 
 	// project tags filter imposed by policy
 	PolicyProjectTags tagutils.TTagSetList `json:"policy_project_tags"`
+
+	// 通过项目管理员id过滤
+	AdminId []string `json:"admin_id"`
 }
 
 type DomainListInput struct {
@@ -185,6 +190,11 @@ type UserListInput struct {
 	GroupFilterListInput
 	ProjectFilterListInput
 	RoleFilterListInput
+
+	// 角色生效所在的域
+	RoleAssignmentDomainId string `json:"role_assignment_domain_id"`
+	// 角色生效所在的项目
+	RoleAssignmentProjectId string `json:"role_assignment_project_id"`
 
 	// email
 	Email string `json:"email"`
@@ -222,6 +232,8 @@ type EndpointListInput struct {
 type SJoinProjectsInput struct {
 	Projects []string `json:"projects"`
 	Roles    []string `json:"roles"`
+	// 启用用户, 仅用户禁用时生效
+	Enabled bool
 }
 
 func (input SJoinProjectsInput) Validate() error {
@@ -259,9 +271,10 @@ func (input SLeaveProjectsInput) Validate() error {
 }
 
 type SProjectAddUserGroupInput struct {
-	Users  []string
-	Groups []string
-	Roles  []string
+	Users          []string
+	Groups         []string
+	Roles          []string
+	EnableAllUsers bool
 }
 
 func (input SProjectAddUserGroupInput) Validate() error {
@@ -327,7 +340,7 @@ type IdentityProviderListInput struct {
 
 	// 过滤支持SSO的认证源，如果值为all，则列出所有的全局认证源，否则可出sso为域ID的域认证源
 	// example: all
-	SsoDomain string `json:"sso"`
+	SsoDomain string `json:"sso_domain"`
 
 	AutoCreateProject *bool `json:"auto_create_project"`
 	AutoCreateUser    *bool `json:"auto_create_user"`
@@ -419,11 +432,14 @@ type IdentityProviderUpdateInput struct {
 
 type PolicyTagInput struct {
 	// 匹配的资源标签
-	ObjectTags tagutils.TTagSet `json:"object_tags"`
+	ObjectTags tagutils.TTagSet `json:"object_tags,allowempty"`
 	// 匹配的项目标签
-	ProjectTags tagutils.TTagSet `json:"project_tags"`
+	ProjectTags tagutils.TTagSet `json:"project_tags,allowempty"`
 	// 匹配的域标签
-	DomainTags tagutils.TTagSet `json:"domain_tags"`
+	DomainTags tagutils.TTagSet `json:"domain_tags,allowempty"`
+
+	// 组织架构节点ID
+	OrgNodeId []string `json:"org_node_id,allowempty"`
 }
 
 type PolicyUpdateInput struct {
@@ -437,7 +453,7 @@ type PolicyUpdateInput struct {
 	Blob jsonutils.JSONObject `json:"blob"`
 
 	// 生效范围，project|domain|system
-	Scope rbacutils.TRbacScope `json:"scope"`
+	Scope rbacscope.TRbacScope `json:"scope"`
 
 	// 是否为系统权限
 	IsSystem *bool `json:"is_system"`
@@ -539,17 +555,12 @@ type PolicyCreateInput struct {
 	Blob jsonutils.JSONObject `json:"blob"`
 
 	// 生效范围，project|domain|system
-	Scope rbacutils.TRbacScope `json:"scope"`
+	Scope rbacscope.TRbacScope `json:"scope"`
 
 	// 是否为系统权限
 	IsSystem *bool `json:"is_system"`
 
-	// 匹配的资源标签
-	ResourceTags tagutils.TTagSet `json:"resource_tags"`
-	// 匹配的项目标签
-	ProjectTags tagutils.TTagSet `json:"project_tags"`
-	// 匹配的域标签
-	DomainTags tagutils.TTagSet `json:"domain_tags"`
+	PolicyTagInput
 }
 
 type RoleCreateInput struct {
@@ -580,3 +591,7 @@ type UserLinkIdpInput struct {
 }
 
 type UserUnlinkIdpInput UserLinkIdpInput
+
+type SProjectSetAdminInput struct {
+	UserId string
+}

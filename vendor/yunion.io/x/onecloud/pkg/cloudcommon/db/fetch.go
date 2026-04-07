@@ -19,9 +19,13 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
+	"strings"
+	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
@@ -94,7 +98,7 @@ func FetchById(manager IModelManager, idStr string) (IModel, error) {
 	}
 }
 
-func FetchByName(manager IModelManager, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
+func FetchByName(ctx context.Context, manager IModelManager, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
 	q := manager.Query()
 	q = manager.FilterByName(q, idStr)
 	count, err := q.CountWithError()
@@ -102,7 +106,7 @@ func FetchByName(manager IModelManager, userCred mcclient.IIdentityProvider, idS
 		return nil, err
 	}
 	if count > 0 && userCred != nil {
-		q = manager.FilterByOwner(q, userCred, manager.NamespaceScope())
+		q = manager.FilterByOwner(ctx, q, manager, nil, userCred, manager.NamespaceScope())
 		q = manager.FilterBySystemAttributes(q, nil, nil, manager.ResourceScope())
 		count, err = q.CountWithError()
 		if err != nil {
@@ -127,13 +131,13 @@ func FetchByName(manager IModelManager, userCred mcclient.IIdentityProvider, idS
 	}
 }
 
-func FetchByIdOrName(manager IModelManager, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
+func FetchByIdOrName(ctx context.Context, manager IModelManager, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
 	if stringutils2.IsUtf8(idStr) {
-		return FetchByName(manager, userCred, idStr)
+		return FetchByName(ctx, manager, userCred, idStr)
 	}
 	obj, err := FetchById(manager, idStr)
 	if err == sql.ErrNoRows {
-		return FetchByName(manager, userCred, idStr)
+		return FetchByName(ctx, manager, userCred, idStr)
 	} else {
 		return obj, err
 	}
@@ -188,7 +192,14 @@ func fetchItemByName(manager IModelManager, ctx context.Context, userCred mcclie
 		return nil, err
 	}
 	if count > 0 {
-		q = manager.FilterByOwner(q, userCred, manager.NamespaceScope())
+		if gotypes.IsNil(query) {
+			query = jsonutils.NewDict()
+		}
+		ownerId, _, err, _ := FetchCheckQueryOwnerScope(ctx, userCred, query, manager, rbacutils.ActionGet, true)
+		if err != nil {
+			return nil, httperrors.NewGeneralError(err)
+		}
+		q = manager.FilterByOwner(ctx, q, manager, userCred, ownerId, manager.NamespaceScope())
 		q = manager.FilterBySystemAttributes(q, nil, nil, manager.ResourceScope())
 		count, err = q.CountWithError()
 		if err != nil {
@@ -227,7 +238,10 @@ func fetchItem(manager IModelManager, ctx context.Context, userCred mcclient.Tok
 }
 
 func FetchUserInfo(ctx context.Context, data jsonutils.JSONObject) (mcclient.IIdentityProvider, error) {
-	userStr, key := jsonutils.GetAnyString2(data, []string{"user", "user_id"})
+	userStr, key := jsonutils.GetAnyString2(data, []string{
+		"user_id",
+		"user",
+	})
 	if len(userStr) > 0 {
 		data.(*jsonutils.JSONDict).Remove(key)
 		u, err := DefaultUserFetcher(ctx, userStr)
@@ -248,11 +262,27 @@ func FetchUserInfo(ctx context.Context, data jsonutils.JSONObject) (mcclient.IId
 	return FetchProjectInfo(ctx, data)
 }
 
+var (
+	ProjectFetchKeys = []string{
+		"project_id",
+		"tenant_id",
+		"project",
+		"tenant",
+	}
+	DomainFetchKeys = []string{
+		"project_domain_id",
+		"domain_id",
+		"project_domain",
+		// "domain",
+	}
+)
+
 func FetchProjectInfo(ctx context.Context, data jsonutils.JSONObject) (mcclient.IIdentityProvider, error) {
-	tenantId, key := jsonutils.GetAnyString2(data, []string{"project", "project_id", "tenant", "tenant_id"})
+	tenantId, key := jsonutils.GetAnyString2(data, ProjectFetchKeys)
 	if len(tenantId) > 0 {
 		data.(*jsonutils.JSONDict).Remove(key)
-		t, err := DefaultProjectFetcher(ctx, tenantId)
+		domainId, _ := jsonutils.GetAnyString2(data, DomainFetchKeys)
+		t, err := DefaultProjectFetcher(ctx, tenantId, domainId)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2("project", tenantId)
@@ -274,7 +304,7 @@ func FetchProjectInfo(ctx context.Context, data jsonutils.JSONObject) (mcclient.
 }
 
 func FetchDomainInfo(ctx context.Context, data jsonutils.JSONObject) (mcclient.IIdentityProvider, error) {
-	domainId, key := jsonutils.GetAnyString2(data, []string{"domain_id", "project_domain", "project_domain_id"})
+	domainId, key := jsonutils.GetAnyString2(data, DomainFetchKeys)
 	if len(domainId) > 0 {
 		data.(*jsonutils.JSONDict).Remove(key)
 		domain, err := DefaultDomainFetcher(ctx, domainId)
@@ -297,22 +327,30 @@ func (m *sUsageManager) KeywordPlural() string {
 	return "usages"
 }
 
-func (m *sUsageManager) ResourceScope() rbacutils.TRbacScope {
-	return rbacutils.ScopeProject
+func (m *sUsageManager) ResourceScope() rbacscope.TRbacScope {
+	return rbacscope.ScopeProject
 }
 
 func (m *sUsageManager) FetchOwnerId(ctx context.Context, data jsonutils.JSONObject) (mcclient.IIdentityProvider, error) {
 	return FetchProjectInfo(ctx, data)
 }
 
-func FetchUsageOwnerScope(ctx context.Context, userCred mcclient.TokenCredential, data jsonutils.JSONObject) (mcclient.IIdentityProvider, rbacutils.TRbacScope, error, rbacutils.SPolicyResult) {
+func FetchUsageOwnerScope(ctx context.Context, userCred mcclient.TokenCredential, data jsonutils.JSONObject) (mcclient.IIdentityProvider, rbacscope.TRbacScope, error, rbacutils.SPolicyResult) {
 	return FetchCheckQueryOwnerScope(ctx, userCred, data, &sUsageManager{}, policy.PolicyActionGet, true)
 }
 
 type IScopedResourceManager interface {
 	KeywordPlural() string
-	ResourceScope() rbacutils.TRbacScope
+	ResourceScope() rbacscope.TRbacScope
 	FetchOwnerId(ctx context.Context, data jsonutils.JSONObject) (mcclient.IIdentityProvider, error)
+}
+
+func UsagePolicyCheck(userCred mcclient.TokenCredential, manager IScopedResourceManager, scope rbacscope.TRbacScope) rbacutils.SPolicyResult {
+	allowScope, policyTagFilters := policy.PolicyManager.AllowScope(userCred, consts.GetServiceType(), manager.KeywordPlural(), policy.PolicyActionList)
+	if scope.HigherThan(allowScope) {
+		return rbacutils.SPolicyResult{Result: rbacutils.Deny}
+	}
+	return policyTagFilters
 }
 
 func FetchCheckQueryOwnerScope(
@@ -322,12 +360,12 @@ func FetchCheckQueryOwnerScope(
 	manager IScopedResourceManager,
 	action string,
 	doCheckRbac bool,
-) (mcclient.IIdentityProvider, rbacutils.TRbacScope, error, rbacutils.SPolicyResult) {
-	var scope rbacutils.TRbacScope
+) (mcclient.IIdentityProvider, rbacscope.TRbacScope, error, rbacutils.SPolicyResult) {
+	var scope rbacscope.TRbacScope
 
-	var allowScope rbacutils.TRbacScope
-	var requireScope rbacutils.TRbacScope
-	var queryScope rbacutils.TRbacScope
+	var allowScope rbacscope.TRbacScope
+	var requireScope rbacscope.TRbacScope
+	var queryScope rbacscope.TRbacScope
 	var policyTagFilters rbacutils.SPolicyResult
 
 	resScope := manager.ResourceScope()
@@ -340,40 +378,44 @@ func FetchCheckQueryOwnerScope(
 	}
 	if ownerId != nil {
 		switch resScope {
-		case rbacutils.ScopeProject, rbacutils.ScopeDomain:
+		case rbacscope.ScopeProject, rbacscope.ScopeDomain:
 			if len(ownerId.GetProjectId()) > 0 {
-				queryScope = rbacutils.ScopeProject
+				queryScope = rbacscope.ScopeProject
 				if ownerId.GetProjectId() == userCred.GetProjectId() {
-					requireScope = rbacutils.ScopeProject
+					requireScope = rbacscope.ScopeProject
 				} else if ownerId.GetProjectDomainId() == userCred.GetProjectDomainId() {
-					requireScope = rbacutils.ScopeDomain
+					requireScope = rbacscope.ScopeDomain
 				} else {
-					requireScope = rbacutils.ScopeSystem
+					requireScope = rbacscope.ScopeSystem
 				}
 			} else if len(ownerId.GetProjectDomainId()) > 0 {
-				queryScope = rbacutils.ScopeDomain
+				queryScope = rbacscope.ScopeDomain
 				if ownerId.GetProjectDomainId() == userCred.GetProjectDomainId() {
-					requireScope = rbacutils.ScopeDomain
+					requireScope = rbacscope.ScopeDomain
 				} else {
-					requireScope = rbacutils.ScopeSystem
+					requireScope = rbacscope.ScopeSystem
 				}
 			}
-		case rbacutils.ScopeUser:
-			queryScope = rbacutils.ScopeUser
+		case rbacscope.ScopeUser:
+			queryScope = rbacscope.ScopeUser
 			if ownerId.GetUserId() == userCred.GetUserId() {
-				requireScope = rbacutils.ScopeUser
+				requireScope = rbacscope.ScopeUser
 			} else {
-				requireScope = rbacutils.ScopeSystem
+				requireScope = rbacscope.ScopeSystem
 			}
 		}
 	} else {
 		ownerId = userCred
 		reqScopeStr, _ := data.GetString("scope")
 		if len(reqScopeStr) > 0 {
-			queryScope = rbacutils.String2Scope(reqScopeStr)
+			if reqScopeStr == "max" || reqScopeStr == "maxallowed" {
+				queryScope = allowScope
+			} else {
+				queryScope = rbacscope.String2Scope(reqScopeStr)
+			}
 		} else if data.Contains("admin") {
 			isAdmin := jsonutils.QueryBoolean(data, "admin", false)
-			if isAdmin && allowScope.HigherThan(rbacutils.ScopeProject) {
+			if isAdmin && allowScope.HigherThan(rbacscope.ScopeProject) {
 				queryScope = allowScope
 			}
 		} else if action == policy.PolicyActionGet {
@@ -529,8 +571,11 @@ func FetchStandaloneObjectsByIds(modelManager IModelManager, ids []string, targe
 	return FetchModelObjectsByIds(modelManager, "id", ids, targets)
 }
 
-func FetchDistinctField(modelManager IModelManager, field string) ([]string, error) {
-	q := modelManager.Query(field).Distinct()
+func FetchField(modelMan IModelManager, field string, qCallback func(q *sqlchemy.SQuery) *sqlchemy.SQuery) ([]string, error) {
+	q := modelMan.Query(field)
+	if qCallback != nil {
+		q = qCallback(q)
+	}
 	rows, err := q.Rows()
 	if err != nil {
 		if errors.Cause(err) == sql.ErrNoRows {
@@ -552,4 +597,66 @@ func FetchDistinctField(modelManager IModelManager, field string) ([]string, err
 		}
 	}
 	return values, nil
+}
+
+func FetchDistinctField(modelManager IModelManager, field string) ([]string, error) {
+	return FetchField(modelManager, field, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+		return q.Distinct()
+	})
+}
+
+func Purge(modelManager IModelManager, field string, ids []string, forceDelete bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	var splitByLen = func(data []string, splitLen int) [][]string {
+		var result [][]string
+		for i := 0; i < len(data); i += splitLen {
+			end := i + splitLen
+			if end > len(data) {
+				end = len(data)
+			}
+			result = append(result, data[i:end])
+		}
+		return result
+	}
+
+	var purge = func(ids []string) error {
+		vars := []interface{}{}
+		placeholders := make([]string, len(ids))
+		for i := range placeholders {
+			placeholders[i] = "?"
+			vars = append(vars, ids[i])
+		}
+		placeholder := strings.Join(placeholders, ",")
+		sql := fmt.Sprintf(
+			"delete from %s where %s in (%s)",
+			modelManager.TableSpec().Name(), field, placeholder,
+		)
+
+		if !forceDelete {
+			sql = fmt.Sprintf(
+				"update %s set deleted=1, deleted_at= ? where %s in (%s)",
+				modelManager.TableSpec().Name(), field, placeholder,
+			)
+			vars = append([]interface{}{time.Now()}, vars...)
+		}
+		_, err := sqlchemy.GetDB().Exec(
+			sql, vars...,
+		)
+		if err != nil {
+			return errors.Wrapf(err, strings.ReplaceAll(sql, "?", "%s"), vars...)
+		}
+		return nil
+	}
+
+	idsArr := splitByLen(ids, 100)
+	for i := range idsArr {
+		err := purge(idsArr[i])
+		if err != nil {
+			return errors.Wrapf(err, "purge")
+		}
+	}
+	return nil
 }

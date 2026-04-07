@@ -25,6 +25,7 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/sqlchemy"
 
 	identityapi "yunion.io/x/onecloud/pkg/apis/identity"
@@ -34,13 +35,12 @@ import (
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/identity"
-	"yunion.io/x/onecloud/pkg/util/httputils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 	"yunion.io/x/onecloud/pkg/util/tagutils"
 )
 
 var (
-	DefaultProjectFetcher  func(ctx context.Context, id string) (*STenant, error)
+	DefaultProjectFetcher  func(ctx context.Context, id string, domainId string) (*STenant, error)
 	DefaultDomainFetcher   func(ctx context.Context, id string) (*STenant, error)
 	DefaultProjectsFetcher func(ctx context.Context, idList []string, isDomain bool) map[string]STenant
 	DefaultDomainQuery     func(fields ...string) *sqlchemy.SQuery
@@ -83,14 +83,14 @@ func init() {
 		SKeystoneCacheObjectManager: NewKeystoneCacheObjectManager(
 			STenant{},
 			"tenant_cache_tbl",
-			"tenant",
-			"tenants",
+			"tenant_cache",
+			"tenant_caches",
 		)}
 	// log.Debugf("Initialize tenant cache manager %s %s", TenantCacheManager.KeywordPlural(), TenantCacheManager)
 
 	TenantCacheManager.SetVirtualObject(TenantCacheManager)
 
-	DefaultProjectFetcher = TenantCacheManager.FetchTenantByIdOrName
+	DefaultProjectFetcher = TenantCacheManager.FetchTenantByIdOrNameInDomain
 	DefaultDomainFetcher = TenantCacheManager.FetchDomainByIdOrName
 	DefaultProjectsFetcher = fetchProjects
 	DefaultDomainQuery = TenantCacheManager.GetDomainQuery
@@ -144,12 +144,15 @@ func (manager *STenantCacheManager) GetDomainQuery(fields ...string) *sqlchemy.S
 	return manager.Query(fields...).Equals("domain_id", identityapi.KeystoneDomainRoot)
 }
 
-func (manager *STenantCacheManager) fetchTenant(ctx context.Context, idStr string, isDomain bool, noExpireCheck bool, filter func(q *sqlchemy.SQuery) *sqlchemy.SQuery) (*STenant, error) {
+func (manager *STenantCacheManager) fetchTenant(ctx context.Context, idStr string, domainId string, isDomain bool, noExpireCheck bool, filter func(q *sqlchemy.SQuery) *sqlchemy.SQuery) (*STenant, error) {
 	var q *sqlchemy.SQuery
 	if isDomain {
 		q = manager.GetDomainQuery()
 	} else {
 		q = manager.GetTenantQuery()
+		if len(domainId) > 0 {
+			q = q.Equals("domain_id", domainId)
+		}
 	}
 	q = filter(q)
 	caches := []STenant{}
@@ -172,7 +175,7 @@ func (manager *STenantCacheManager) fetchTenant(ctx context.Context, idStr strin
 	if isDomain {
 		return manager.fetchDomainFromKeystone(ctx, idStr)
 	} else {
-		return manager.fetchTenantFromKeystone(ctx, idStr)
+		return manager.fetchTenantFromKeystone(ctx, idStr, domainId)
 	}
 }
 
@@ -187,8 +190,16 @@ func (t *STenant) IsExpired() bool {
 	return false
 }
 
-func (manager *STenantCacheManager) FetchTenantByIdOrName(ctx context.Context, idStr string) (*STenant, error) {
-	return manager.fetchTenant(ctx, idStr, false, false, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+func (manager *STenantCacheManager) FetchTenantByIdOrNameInDomain(ctx context.Context, idStr string, domainId string) (*STenant, error) {
+	if !stringutils2.IsUtf8(idStr) {
+		t, err := manager.FetchTenantById(ctx, idStr)
+		if t != nil {
+			return t, nil
+		} else if err != nil && errors.Cause(err) != sql.ErrNoRows {
+			return nil, errors.Wrap(err, "FetchTenantById")
+		}
+	}
+	return manager.fetchTenant(ctx, idStr, domainId, false, false, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
 		if stringutils2.IsUtf8(idStr) {
 			return q.Equals("name", idStr)
 		} else {
@@ -210,18 +221,18 @@ func (manager *STenantCacheManager) FetchTenantByIdWithoutExpireCheck(ctx contex
 }
 
 func (manager *STenantCacheManager) fetchTenantById(ctx context.Context, idStr string, noExpireCheck bool) (*STenant, error) {
-	return manager.fetchTenant(ctx, idStr, false, noExpireCheck, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+	return manager.fetchTenant(ctx, idStr, "", false, noExpireCheck, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
 		return q.Filter(sqlchemy.Equals(q.Field("id"), idStr))
 	})
 }
 
-func (manager *STenantCacheManager) FetchTenantByName(ctx context.Context, idStr string) (*STenant, error) {
-	return manager.fetchTenant(ctx, idStr, false, false, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+func (manager *STenantCacheManager) FetchTenantByNameInDomain(ctx context.Context, idStr string, domainId string) (*STenant, error) {
+	return manager.fetchTenant(ctx, idStr, domainId, false, false, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
 		return q.Filter(sqlchemy.Equals(q.Field("name"), idStr))
 	})
 }
 
-func (manager *STenantCacheManager) fetchTenantFromKeystone(ctx context.Context, idStr string) (*STenant, error) {
+func (manager *STenantCacheManager) fetchTenantFromKeystone(ctx context.Context, idStr string, domainId string) (*STenant, error) {
 	if len(idStr) == 0 {
 		log.Debugf("fetch empty tenant!!!!\n%s", debug.Stack())
 		return nil, fmt.Errorf("Empty idStr")
@@ -230,6 +241,10 @@ func (manager *STenantCacheManager) fetchTenantFromKeystone(ctx context.Context,
 	// It is to query all domain's project.
 	query := jsonutils.NewDict()
 	query.Set("scope", jsonutils.NewString("system"))
+	if len(domainId) > 0 {
+		query.Set("domain_id", jsonutils.NewString(domainId))
+	}
+	query.Set("pending_delete", jsonutils.NewString("all"))
 
 	s := auth.GetAdminSession(ctx, consts.GetRegion())
 	tenant, err := modules.Projects.GetById(s, idStr, query)
@@ -249,7 +264,7 @@ func (manager *STenantCacheManager) fetchTenantFromKeystone(ctx context.Context,
 }
 
 func (manager *STenantCacheManager) FetchDomainByIdOrName(ctx context.Context, idStr string) (*STenant, error) {
-	return manager.fetchTenant(ctx, idStr, true, false, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+	return manager.fetchTenant(ctx, idStr, "", true, false, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
 		if stringutils2.IsUtf8(idStr) {
 			return q.Equals("name", idStr)
 		} else {
@@ -270,13 +285,13 @@ func (manager *STenantCacheManager) FetchDomainByIdWithoutExpireCheck(ctx contex
 }
 
 func (manager *STenantCacheManager) fetchDomainById(ctx context.Context, idStr string, noExpireCheck bool) (*STenant, error) {
-	return manager.fetchTenant(ctx, idStr, true, noExpireCheck, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+	return manager.fetchTenant(ctx, idStr, "", true, noExpireCheck, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
 		return q.Filter(sqlchemy.Equals(q.Field("id"), idStr))
 	})
 }
 
 func (manager *STenantCacheManager) FetchDomainByName(ctx context.Context, idStr string) (*STenant, error) {
-	return manager.fetchTenant(ctx, idStr, true, false, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+	return manager.fetchTenant(ctx, idStr, "", true, false, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
 		return q.Filter(sqlchemy.Equals(q.Field("name"), idStr))
 	})
 }
@@ -329,12 +344,24 @@ func (manager *STenantCacheManager) Save(ctx context.Context, item SCachedTenant
 		log.Errorf("FetchTenantbyId fail %s", err)
 		return nil, errors.Wrapf(err, "TenantCache FetchById %s", item.Id)
 	}
+	// clean cache metadata
+	if item.PendingDeleted && saveMeta {
+		for k := range item.Metadata {
+			if strings.HasPrefix(k, USER_TAG_PREFIX) {
+				item.Metadata[k] = "none"
+			}
+		}
+	}
 	now := time.Now().UTC()
 	if err == nil {
 		obj := objo.(*STenant)
 		if obj.Id == item.Id && obj.Name == item.Name && obj.Domain == item.ProjectDomain && obj.DomainId == item.DomainId {
 			Update(obj, func() error {
 				obj.LastCheck = now
+				obj.PendingDeleted = item.PendingDeleted
+				if obj.PendingDeleted {
+					obj.PendingDeletedAt = item.PendingDeletedAt
+				}
 				return nil
 			})
 			if saveMeta {
@@ -348,6 +375,10 @@ func (manager *STenantCacheManager) Save(ctx context.Context, item SCachedTenant
 			obj.Domain = item.ProjectDomain
 			obj.DomainId = item.DomainId
 			obj.LastCheck = now
+			obj.PendingDeleted = item.PendingDeleted
+			if obj.PendingDeleted {
+				obj.PendingDeletedAt = item.PendingDeletedAt
+			}
 			return nil
 		})
 		if err != nil {
@@ -366,6 +397,10 @@ func (manager *STenantCacheManager) Save(ctx context.Context, item SCachedTenant
 		obj.Domain = item.ProjectDomain
 		obj.DomainId = item.DomainId
 		obj.LastCheck = now
+		obj.PendingDeleted = item.PendingDeleted
+		if obj.PendingDeleted {
+			obj.PendingDeletedAt = item.PendingDeletedAt
+		}
 		err = manager.TableSpec().InsertOrUpdate(ctx, obj)
 		if err != nil {
 			return nil, errors.Wrap(err, "InsertOrUpdate")
@@ -404,7 +439,7 @@ func (tenant *STenant) GetDomainId() string {
 }*/
 
 func (manager *STenantCacheManager) findFirstProjectOfDomain(domainId string) (*STenant, error) {
-	q := manager.Query().Equals("domain_id", domainId)
+	q := manager.Query().Equals("domain_id", domainId).Asc("created_at")
 	tenant := STenant{}
 	tenant.SetModelManager(manager, &tenant)
 	err := q.First(&tenant)
@@ -425,6 +460,7 @@ func (manager *STenantCacheManager) fetchDomainTenantsFromKeystone(ctx context.C
 	params := jsonutils.NewDict()
 	params.Add(jsonutils.NewString(domainId), "domain_id")
 	params.Add(jsonutils.JSONTrue, "details")
+	params.Add(jsonutils.NewString("all"), "pending_delete")
 	tenants, err := modules.Projects.List(s, params)
 	if err != nil {
 		return errors.Wrap(err, "Projects.List")
@@ -541,6 +577,32 @@ func (tenant *STenant) GetAllClassMetadata() (map[string]string, error) {
 			continue
 		}
 		ret[k[len(CLASS_TAG_PREFIX):]] = v
+	}
+	return ret, nil
+}
+
+func (manager *STenantCacheManager) ConvertIds(ids []string, isDomain bool) ([]string, error) {
+	var q *sqlchemy.SQuery
+	if isDomain {
+		q = manager.GetDomainQuery("id")
+	} else {
+		q = manager.GetTenantQuery("id")
+	}
+	q = q.Filter(sqlchemy.OR(
+		sqlchemy.In(q.Field("id"), stringutils2.RemoveUtf8Strings(ids)),
+		sqlchemy.In(q.Field("name"), ids),
+	))
+	q = q.Distinct()
+	results := []struct {
+		Id string
+	}{}
+	err := q.All(&results)
+	if err != nil {
+		return nil, errors.Wrap(err, "query")
+	}
+	ret := make([]string, len(results))
+	for i := range results {
+		ret[i] = results[i].Id
 	}
 	return ret, nil
 }

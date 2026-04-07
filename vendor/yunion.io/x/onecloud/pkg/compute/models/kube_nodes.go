@@ -17,10 +17,12 @@ package models
 import (
 	"context"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
@@ -28,10 +30,8 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -68,8 +68,8 @@ func (manager *SKubeNodeManager) GetContextManagers() [][]db.IModelManager {
 	}
 }
 
-func (manager *SKubeNodeManager) ResourceScope() rbacutils.TRbacScope {
-	return rbacutils.ScopeDomain
+func (manager *SKubeNodeManager) ResourceScope() rbacscope.TRbacScope {
+	return rbacscope.ScopeDomain
 }
 
 func (self *SKubeNode) GetCloudproviderId() string {
@@ -110,12 +110,12 @@ func (manager *SKubeNodeManager) FetchOwnerId(ctx context.Context, data jsonutil
 	return db.FetchProjectInfo(ctx, data)
 }
 
-func (manager *SKubeNodeManager) FilterByOwner(q *sqlchemy.SQuery, userCred mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
-	if userCred != nil {
+func (manager *SKubeNodeManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	if ownerId != nil {
 		sq := KubeClusterManager.Query("id")
 		switch scope {
-		case rbacutils.ScopeDomain, rbacutils.ScopeProject:
-			sq = sq.Equals("domain_id", userCred.GetProjectDomainId())
+		case rbacscope.ScopeDomain, rbacscope.ScopeProject:
+			sq = sq.Equals("domain_id", ownerId.GetProjectDomainId())
 			return q.In("cloud_kube_cluster_id", sq.SubQuery())
 		}
 	}
@@ -299,7 +299,12 @@ func (self *SKubeNode) SyncWithCloudKubeNode(ctx context.Context, userCred mccli
 		return errors.Wrapf(err, "UpdateWithLock")
 	}
 
-	syncMetadata(ctx, userCred, self, ext)
+	cluster, err := self.GetKubeCluster()
+	if err == nil {
+		if account := cluster.GetCloudaccount(); account != nil {
+			syncMetadata(ctx, userCred, self, ext, account.ReadOnly)
+		}
+	}
 
 	return nil
 }
@@ -340,14 +345,14 @@ func (self *SKubeCluster) newFromCloudKubeNode(ctx context.Context, userCred mcc
 		return nil, errors.Wrapf(err, "Insert")
 	}
 
-	syncMetadata(ctx, userCred, &node, ext)
+	syncMetadata(ctx, userCred, &node, ext, false)
 
 	return &node, nil
 }
 
 func (self *SKubeNode) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
 	log.Infof("kube node delete do nothing")
-	return self.SetStatus(userCred, apis.STATUS_DELETING, "")
+	return self.SetStatus(ctx, userCred, apis.STATUS_DELETING, "")
 }
 
 func (self *SKubeNode) RealDelete(ctx context.Context, userCred mcclient.TokenCredential) error {

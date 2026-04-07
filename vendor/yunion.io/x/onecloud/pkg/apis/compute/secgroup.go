@@ -17,7 +17,6 @@ package compute
 import (
 	"fmt"
 
-	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/regutils"
 	"yunion.io/x/pkg/util/secrules"
@@ -82,11 +81,9 @@ type SSecgroupRuleResource struct {
 	// requried: false
 	// example: test to create rule
 	Description string `json:"description"`
-
-	// 对端安全组Id, 此参数和cidr参数互斥，并且优先级高于cidr, 同时peer_secgroup_id不能和它所在的安全组ID相同
-	// required: false
-	PeerSecgroupId string `json:"peer_secgroup_id"`
 }
+
+type SSecgroupRuleResourceSet []SSecgroupRuleResource
 
 type SSecgroupRuleCreateInput struct {
 	apis.ResourceBaseCreateInput
@@ -94,6 +91,9 @@ type SSecgroupRuleCreateInput struct {
 
 	// swagger:ignore
 	Secgroup string `json:"secgroup"  yunion-deprecated-by:"secgroup_id"`
+
+	// swagger: ignore
+	Status string `json:"status"`
 
 	// 安全组ID
 	// required: true
@@ -103,7 +103,37 @@ type SSecgroupRuleCreateInput struct {
 type SSecgroupRuleUpdateInput struct {
 	apis.ResourceBaseUpdateInput
 
-	SSecgroupRuleResource
+	Priority *int    `json:"priority"`
+	Ports    *string `json:"ports"`
+	// ip或cidr地址, 若指定peer_secgroup_id此参数不生效
+	// example: 192.168.222.121
+	CIDR *string `json:"cidr"`
+
+	// 协议
+	// required: true
+	//
+	//
+	//
+	// | protocol | name    |
+	// | -------- | ----    |
+	// | any      | 所有协议|
+	// | tcp      | TCP     |
+	// | icmp     | ICMP    |
+	// | udp      | UDP     |
+	// enum: any, tcp, udp, icmp
+	Protocol *string `json:"protocol"`
+
+	// 行为
+	// deny: 拒绝
+	// allow: 允许
+	// enum: deny, allow
+	// required: true
+	Action *string `json:"action"`
+
+	// 规则描述信息
+	// requried: false
+	// example: test to create rule
+	Description string `json:"description"`
 }
 
 func (input *SSecgroupRuleResource) Check() error {
@@ -129,11 +159,12 @@ func (input *SSecgroupRuleResource) Check() error {
 	}
 
 	if len(input.CIDR) > 0 {
-		if !regutils.MatchCIDR(input.CIDR) && !regutils.MatchIPAddr(input.CIDR) {
+		if !regutils.MatchCIDR(input.CIDR) && !regutils.MatchIP4Addr(input.CIDR) && !regutils.MatchCIDR6(input.CIDR) && !regutils.MatchIP6Addr(input.CIDR) {
 			return fmt.Errorf("invalid ip address: %s", input.CIDR)
 		}
 	} else {
-		input.CIDR = "0.0.0.0/0"
+		// empty CIDR means both IPv4 and IPv6
+		// input.CIDR = "0.0.0.0/0"
 	}
 
 	return rule.ValidateRule()
@@ -142,6 +173,17 @@ func (input *SSecgroupRuleResource) Check() error {
 type SSecgroupCreateInput struct {
 	apis.SharableVirtualResourceCreateInput
 
+	// vpc id
+	// defualt: default
+	VpcResourceInput
+	// swagger: ignore
+	CloudproviderResourceInput
+	// swagger: ignore
+	CloudregionResourceInput
+
+	// swagger: ignore
+	GlobalvpcId string `json:"globalvpc_id"`
+
 	// 规则列表
 	// required: false
 	Rules []SSecgroupRuleCreateInput `json:"rules"`
@@ -149,18 +191,12 @@ type SSecgroupCreateInput struct {
 
 type SecgroupListInput struct {
 	apis.SharableVirtualResourceListInput
+	apis.ExternalizedResourceBaseListInput
 
 	ServerResourceInput
 
 	DBInstanceResourceInput
 	ELasticcacheResourceInput
-
-	// equals
-	Equals string
-
-	// 按缓存数量排序
-	// pattern:asc|desc
-	OrderByCacheCnt string `json:"order_by_cache_cnt"`
 
 	// 按缓存关联主机数排序
 	// pattern:asc|desc
@@ -179,25 +215,16 @@ type SecgroupListInput struct {
 	// example: in
 	Direction string `json:"direction"`
 
+	VpcId string `json:"vpc_id"`
+
+	LoadbalancerId string `json:"loadbalancer_id"`
 	RegionalFilterListInput
-
 	ManagedResourceListInput
-	WithCache bool `json:"witch_cache"`
-}
-
-type SecurityGroupCacheListInput struct {
-	apis.StatusStandaloneResourceListInput
-	apis.ExternalizedResourceBaseListInput
-
-	ManagedResourceListInput
-	RegionalFilterListInput
-
-	VpcFilterListInput
-	SecgroupFilterListInput
 }
 
 type SecurityGroupRuleListInput struct {
 	apis.ResourceBaseListInput
+	apis.ExternalizedResourceBaseListInput
 	SecgroupFilterListInput
 
 	Projects []string `json:"projects"`
@@ -237,6 +264,9 @@ type SecgroupDetails struct {
 	apis.SharableVirtualResourceDetails
 	SSecurityGroup
 
+	VpcResourceInfo
+	GlobalVpcResourceInfo
+
 	// 关联云主机数量, 不包含回收站云主机
 	GuestCnt int `json:"guest_cnt,allowempty"`
 
@@ -246,16 +276,16 @@ type SecgroupDetails struct {
 	// admin_secgrp_id为此安全组的云主机数量, , 不包含回收站云主机
 	AdminGuestCnt int `json:"admin_guest_cnt,allowempty"`
 
-	// 安全组缓存数量
-	CacheCnt int `json:"cache_cnt,allowempty"`
-	// 规则信息
-	Rules []SecgroupRuleDetails `json:"rules"`
-	// 入方向规则信息
-	InRules []SecgroupRuleDetails `json:"in_rules"`
-	// 出方向规则信息
-	OutRules []SecgroupRuleDetails `json:"out_rules"`
+	// 关联LB数量
+	LoadbalancerCnt int `json:"loadbalancer_cnt,allowempty"`
 
-	CloudCaches []jsonutils.JSONObject `json:"cloud_caches"`
+	// 关联RDS数量
+	RdsCnt int `json:"rds_cnt,allowempty"`
+	// 关联Redis数量
+	RedisCnt int `json:"redis_cnt,allowempty"`
+
+	// 所有关联的资源数量
+	TotalCnt int `json:"total_cnt,allowempty"`
 }
 
 type SecurityGroupResourceInfo struct {
@@ -296,18 +326,6 @@ type ElasticcachesecgroupDetails struct {
 	Secgroup string `json:"secgroup"`
 }
 
-type SecgroupMergeInput struct {
-	// 安全组id列表
-	SecgroupIds []string `json:"secgroup_ids"`
-
-	// swagger:ignore
-	// Deprecated
-	Secgroups []string `json:"secgroup" yunion-deprecated-by:"secgroup_ids"`
-}
-
-type SecurityGroupPurgeInput struct {
-}
-
 type SecurityGroupCloneInput struct {
 	Name        string
 	Description string
@@ -323,13 +341,17 @@ type SecgroupJsonDesc struct {
 }
 
 type SSecurityGroupRef struct {
-	GuestCnt      int `json:"guest_cnt"`
-	AdminGuestCnt int `json:"admin_guest_cnt"`
-	RdsCnt        int `json:"rds_cnt"`
-	RedisCnt      int `json:"redis_cnt"`
-	TotalCnt      int `json:"total_cnt"`
+	GuestCnt        int `json:"guest_cnt"`
+	AdminGuestCnt   int `json:"admin_guest_cnt"`
+	RdsCnt          int `json:"rds_cnt"`
+	RedisCnt        int `json:"redis_cnt"`
+	LoadbalancerCnt int `json:"loadbalancer_cnt"`
+	TotalCnt        int `json:"total_cnt"`
 }
 
 func (self *SSecurityGroupRef) Sum() {
-	self.TotalCnt = self.GuestCnt + self.AdminGuestCnt + self.RdsCnt + self.RedisCnt
+	self.TotalCnt = self.GuestCnt + self.AdminGuestCnt + self.RdsCnt + self.RedisCnt + self.LoadbalancerCnt
+}
+
+type SecurityGroupSyncstatusInput struct {
 }

@@ -18,13 +18,13 @@ import (
 	"fmt"
 	"reflect"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/apis"
 	proxyapi "yunion.io/x/onecloud/pkg/apis/cloudcommon/proxy"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 )
 
@@ -132,6 +132,12 @@ type CloudaccountResourceInfo struct {
 	// 云账号名称
 	// example: google-account
 	Account string `json:"account,omitempty"`
+
+	// 云账号状态
+	AccountStatus string `json:"account_status,omitempty"`
+	// 云账号监控状态
+	AccountHealthStatus string `json:"account_health_status,omitempty"`
+	AccountReadOnly     bool   `json:"account_read_only,omitempty"`
 }
 
 type CloudaccountCreateInput struct {
@@ -206,6 +212,26 @@ type CloudaccountCreateInput struct {
 	SubAccounts *cloudprovider.SubAccounts
 
 	ReadOnly bool `json:"read_only"`
+
+	SProjectMappingResourceInput
+
+	// 是否立即开始同步资源
+	StartSync *bool `json:"start_sync"`
+
+	// 跳过指定资源同步
+	SkipSyncResources SkipSyncResources `json:"skip_sync_resources"`
+
+	// 货币类型
+	// enmu: CNY, USD
+	Currency string `json:"currency"`
+
+	EnableAutoSyncResource *bool `json:"enable_auto_sync_resource"`
+}
+
+type SProjectMappingResourceInput struct {
+	ProjectMappingId   string `json:"project_mapping_id"`
+	EnableProjectSync  bool   `json:"enable_project_sync"`
+	EnableResourceSync bool   `json:"enable_resource_sync"`
 }
 
 type CloudaccountShareModeInput struct {
@@ -236,6 +262,8 @@ type CloudaccountListInput struct {
 	// 账号健康状态
 	HealthStatus []string `json:"health_status"`
 
+	ReadOnly *bool `json:"read_only"`
+
 	// 共享模式
 	ShareMode []string `json:"share_mode"`
 
@@ -243,6 +271,13 @@ type CloudaccountListInput struct {
 	ProxySetting string `json:"proxy_setting"`
 	// swagger:ignore
 	ProxySettingId string `json:"proxy_setting_id" yunion-deprecated-by:"proxy_setting"`
+
+	// 按宿主机数量排序
+	// pattern:asc|desc
+	OrderByHostCount string `json:"order_by_host_count"`
+	// 按虚拟机数量排序
+	// pattern:asc|desc
+	OrderByGuestCount string `json:"order_by_guest_count"`
 }
 
 type ProviderProject struct {
@@ -255,31 +290,7 @@ type ProviderProject struct {
 	TenantId string `json:"tenant_id"`
 }
 
-type CloudaccountDetail struct {
-	apis.EnabledStatusInfrasResourceBaseDetails
-	SCloudaccount
-
-	// 子订阅项目信息
-	Projects []ProviderProject `json:"projects"`
-
-	// 同步时间间隔
-	// example: 3600
-	SyncIntervalSeconds int `json:"sync_interval_seconds"`
-
-	// 同步状态
-	SyncStatus2 string `json:"sync_stauts2"`
-
-	// 云账号环境类型
-	// public: 公有云
-	// private: 私有云
-	// onpremise: 本地IDC
-	// example: public
-	CloudEnv string `json:"cloud_env"`
-
-	// 云账号项目名称
-	// example: system
-	Tenant string `json:"tenant"`
-
+type SAccountUsage struct {
 	// 弹性公网Ip数量
 	// example: 2
 	EipCount int `json:"eip_count,allowempty"`
@@ -308,6 +319,10 @@ type CloudaccountDetail struct {
 	// example: 1
 	ProviderCount int `json:"provider_count,allowempty"`
 
+	// 启用的子订阅数量
+	// example: 1
+	EnabledProviderCount int `json:"enabled_provider_count,allowempty"`
+
 	// 路由表数量
 	// example: 0
 	RoutetableCount int `json:"routetable_count,allowempty"`
@@ -316,9 +331,38 @@ type CloudaccountDetail struct {
 	// example: 10
 	StoragecacheCount int `json:"storagecache_count,allowempty"`
 
+	// 并发同步数量
+	SyncCount int `json:"sync_count,allowempty"`
+}
+
+type CloudaccountDetail struct {
+	apis.EnabledStatusInfrasResourceBaseDetails
+	SCloudaccount
+
+	// 同步时间间隔
+	// example: 3600
+	SyncIntervalSeconds int `json:"sync_interval_seconds"`
+
+	// 同步状态
+	SyncStatus2 string `json:"sync_stauts2"`
+
+	// 云账号环境类型
+	// public: 公有云
+	// private: 私有云
+	// onpremise: 本地IDC
+	// example: public
+	CloudEnv string `json:"cloud_env"`
+
+	apis.ProjectizedResourceInfo
+
+	SAccountUsage
+
 	ProxySetting proxyapi.SProxySetting `json:"proxy_setting"`
 
 	ProjectMappingResourceInfo
+
+	// 上次同步耗时
+	LastSyncCost string
 }
 
 func (self CloudaccountDetail) GetMetricTags() map[string]string {
@@ -329,8 +373,9 @@ func (self CloudaccountDetail) GetMetricTags() map[string]string {
 		"brand":             self.Brand,
 		"domain_id":         self.DomainId,
 		"project_domain":    self.ProjectDomain,
+		"currency":          self.Currency,
 	}
-	return ret
+	return AppendMetricTags(ret, self.MetadataResourceInfo, self.ProjectizedResourceInfo)
 }
 
 func (self CloudaccountDetail) GetMetricPairs() map[string]string {
@@ -355,7 +400,15 @@ type CloudaccountUpdateInput struct {
 	// 临时清除缺失的权限提示，云账号权限缺失依然会自动刷新
 	CleanLakeOfPermissions bool `json:"clean_lake_of_permissions"`
 
+	SkipSyncResources       *SkipSyncResources `json:"skip_sync_resources"`
+	AddSkipSyncResources    []string           `json:"add_skip_sync_resources"`
+	RemoveSkipSyncResources []string           `json:"remove_skip_sync_resources"`
+
 	ReadOnly bool `json:"read_only"`
+
+	Currency string `json:"currency"`
+
+	EnableAutoSyncResource *bool `json:"enable_auto_sync_resource"`
 }
 
 type CloudaccountPerformPublicInput struct {
@@ -376,9 +429,9 @@ type CloudaccountPerformPrepareNetsInput struct {
 type CloudaccountPerformPrepareNetsOutput struct {
 	CAWireNets []CAWireNet  `json:"wire_networks"`
 	Hosts      []CAGuestNet `json:"hosts"`
-	Guests     []CAGuestNet `json:"guests"`
-	Wires      []CAPWire    `json:"wires"`
-	VSwitchs   []VSwitch    `json:"vswitchs"`
+	// Guests     []CAGuestNet `json:"guests"`
+	Wires    []CAPWire `json:"wires"`
+	VSwitchs []VSwitch `json:"vswitchs"`
 }
 
 type CloudaccountSyncVMwareNetworkInput struct {
@@ -413,10 +466,10 @@ type CAWireNet struct {
 	SuitableWire  string      `json:"suitable_wire,allowempty"`
 	Hosts         []CAHostNet `json:"hosts"`
 	// description: 没有合适的已有网络，推荐的网络配置
-	HostSuggestedNetworks []CANetConf  `json:"host_suggested_networks"`
-	Guests                []CAGuestNet `json:"guests"`
+	HostSuggestedNetworks []CANetConf `json:"host_suggested_networks"`
+	// Guests                []CAGuestNet `json:"guests"`
 	// description: 没有合适的已有网络，推荐的网络配置
-	GuestSuggestedNetworks []CANetConf `json:"guest_suggested_networks"`
+	// GuestSuggestedNetworks []CANetConf `json:"guest_suggested_networks"`
 }
 
 type CAWireConf struct {
@@ -480,19 +533,6 @@ type SubscriptonCreateInput struct {
 type EnrollmentAccountQuery struct {
 }
 
-type GetCloudaccountSamlOutput struct {
-	// cloudaccount SAML ServiceProvider entity ID
-	EntityId string `json:"entity_id,allowempty"`
-	// redirect login URL for this cloudaccount
-	RedirectLoginUrl string `json:"redirect_login_url,allowempty"`
-	// redirect logout URL for this cloudaccount
-	RedirectLogoutUrl string `json:"redirect_logout_url,allowempty"`
-	// metadata URL for this cloudaccount
-	MetadataUrl string `json:"metadata_url,allowempty"`
-	// initial SAML SSO login URL for this cloudaccount
-	InitLoginUrl string `json:"init_login_url,allowempty"`
-}
-
 type CloudaccountSyncSkusInput struct {
 	Resource string
 	Force    bool
@@ -502,27 +542,74 @@ type CloudaccountSyncSkusInput struct {
 }
 
 type CloudaccountProjectMappingInput struct {
+	AutoCreateProject            bool `json:"auto_create_project"`
+	AutoCreateProjectForProvider bool `json:"auto_create_project_for_provider"`
+
+	ProjectId string `json:"project_id"`
+
 	// 同步策略Id, 若不传此参数则解绑
 	// 绑定同步策略要求当前云账号此刻未绑定其他同步策略
 	ProjectMappingId string `json:"project_mapping_id"`
+
+	EnableProjectSync  *bool `json:"enable_project_sync"`
+	EnableResourceSync *bool `json:"enable_resource_sync"`
 }
 
 type SyncRangeInput struct {
 	Force    bool `json:"force"`
 	FullSync bool `json:"full_sync"`
 	DeepSync bool `json:"deep_sync"`
+	// 极速模式(差量更新)
+	Xor bool `json:"xor"`
 
 	Region []string `json:"region"`
 	Zone   []string `json:"zone"`
 	Host   []string `json:"host"`
 
+	// swagger: ignore
+	SkipSyncResources []string `json:"skip_sync_resources"`
+
 	// 按资源类型同步，可输入多个
-	// enmu: compute, network, loadbalancer, objectstore, rds, cache, nat, nas, waf, mongodb, es, kafka, app, container
-	Resources []string `json:"resources" choices:"compute|network|loadbalancer|objectstore|rds|cache|nat|nas|waf|mongodb|es|kafka|app|container|eip|tablestore"`
+	// enmu: project, compute, network, eip, loadbalancer, objectstore, rds, cache, event, cloudid, dnszone, public_ip, intervpcnetwork, saml_auth, quota, nat, nas, waf, mongodb, es, kafka, app, cdn, container, ipv6_gateway, tablestore, modelarts, vpcpeer, misc
+	Resources []string `json:"resources" choices:"project|compute|network|eip|loadbalancer|objectstore|rds|cache|event|cloudid|dnszone|public_ip|intervpcnetwork|saml_auth|quota|nat|nas|waf|mongodb|es|kafka|app|cdn|container|ipv6_gateway|tablestore|modelarts|vpcpeer|misc"`
+}
+
+type iRes interface {
+	Keyword() string
+}
+
+func (self *SyncRangeInput) IsNotSkipSyncResource(res iRes) bool {
+	return !utils.IsInStringArray(res.Keyword(), self.SkipSyncResources)
 }
 
 type SAccountPermission struct {
 	Permissions []string
+}
+
+type SkipSyncResources []string
+
+func (s SkipSyncResources) String() string {
+	return jsonutils.Marshal(s).String()
+}
+
+func (s *SkipSyncResources) Add(res string) {
+	if !utils.IsInStringArray(res, *s) {
+		*s = append(*s, res)
+	}
+}
+
+func (s *SkipSyncResources) Remove(res string) {
+	ret := []string{}
+	for _, r := range *s {
+		if r != res {
+			ret = append(ret, r)
+		}
+	}
+	*s = ret
+}
+
+func (s SkipSyncResources) IsZero() bool {
+	return len(s) == 0
 }
 
 type SAccountPermissions map[string]SAccountPermission
@@ -538,5 +625,9 @@ func (s SAccountPermissions) IsZero() bool {
 func init() {
 	gotypes.RegisterSerializable(reflect.TypeOf(&SAccountPermissions{}), func() gotypes.ISerializable {
 		return &SAccountPermissions{}
+	})
+
+	gotypes.RegisterSerializable(reflect.TypeOf(&SkipSyncResources{}), func() gotypes.ISerializable {
+		return &SkipSyncResources{}
 	})
 }

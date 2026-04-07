@@ -55,6 +55,37 @@ func init() {
 			Action: ActionUpdate,
 		})
 	})
+
+	db.SetCustomizeNotifyHook(func(ctx context.Context, userCred mcclient.TokenCredential, action string, obj db.IModel, moreDetails jsonutils.JSONObject) {
+		_, ok := notifyDBHookResources.Load(obj.KeywordPlural())
+		if !ok {
+			return
+		}
+		EventNotify(ctx, userCred, SEventNotifyParam{
+			Obj:    obj,
+			Action: api.SAction(action),
+			ObjDetailsDecorator: func(ctx context.Context, details *jsonutils.JSONDict) {
+				if moreDetails != nil {
+					details.Set("customize_details", moreDetails)
+				}
+			},
+		})
+	})
+
+	db.SetStatusChangedNotifyHook(func(ctx context.Context, userCred mcclient.TokenCredential, oldStatus, newStatus string, obj db.IModel) {
+		_, ok := notifyDBHookResources.Load(obj.KeywordPlural())
+		if !ok {
+			return
+		}
+		EventNotify(ctx, userCred, SEventNotifyParam{
+			Obj:    obj,
+			Action: api.ActionStatusChanged,
+			ObjDetailsDecorator: func(ctx context.Context, details *jsonutils.JSONDict) {
+				details.Set("old_status", jsonutils.NewString(oldStatus))
+				details.Set("new_status", jsonutils.NewString(newStatus))
+			},
+		})
+	})
 }
 
 func AddNotifyDBHookResources(keywordPlurals ...string) {
@@ -313,6 +344,33 @@ func EventNotify(ctx context.Context, userCred mcclient.TokenCredential, ep SEve
 		Priority:        string(npk.NotifyPriorityNormal),
 		ProjectId:       projectId,
 		ProjectDomainId: projectDomainId,
+		ResourceType:    ep.ResourceType,
+		Action:          ep.Action,
+	}
+	t := eventTask{
+		params: params,
+	}
+	notifyClientWorkerMan.Run(&t, nil, nil)
+}
+
+func EventNotifyServiceAbnormal(ctx context.Context, userCred mcclient.TokenCredential, service, method, path string, body jsonutils.JSONObject, err error) {
+	event := api.Event.WithAction(api.ActionServiceAbnormal).WithResourceType(api.TOPIC_RESOURCE_SERVICE)
+	obj := jsonutils.NewDict()
+	if body != nil {
+		obj.Set("body", jsonutils.NewString(body.PrettyString()))
+	}
+	obj.Set("method", jsonutils.NewString(method))
+	obj.Set("path", jsonutils.NewString(path))
+	obj.Set("error", jsonutils.NewString(err.Error()))
+	obj.Set("service_name", jsonutils.NewString(service))
+	params := api.NotificationManagerEventNotifyInput{
+		ReceiverIds:     []string{userCred.GetUserId()},
+		ResourceDetails: obj,
+		Event:           event.String(),
+		AdvanceDays:     0,
+		Priority:        string(npk.NotifyPriorityNormal),
+		ResourceType:    api.TOPIC_RESOURCE_SERVICE,
+		Action:          api.ActionServiceAbnormal,
 	}
 	t := eventTask{
 		params: params,
@@ -405,4 +463,10 @@ func FetchNotifyAdminRecipients(ctx context.Context, region string, users []stri
 			notifyAdminGroups = append(notifyAdminGroups, gId)
 		}
 	}
+}
+
+func NotifyVmIntegrity(ctx context.Context, name string) {
+	data := jsonutils.NewDict()
+	data.Add(jsonutils.NewString(name), "name")
+	SystemExceptionNotifyWithResult(ctx, api.ActionChecksumTest, api.TOPIC_RESOURCE_VM_INTEGRITY_CHECK, api.ResultFailed, data)
 }

@@ -20,10 +20,12 @@ import (
 	"strings"
 	"time"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
 
 	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
@@ -32,7 +34,7 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
+	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
@@ -256,7 +258,13 @@ func (self *SCloudregion) GetKafkas(managerId string) ([]SKafka, error) {
 	return ret, nil
 }
 
-func (self *SCloudregion) SyncKafkas(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, exts []cloudprovider.ICloudKafka) compare.SyncResult {
+func (self *SCloudregion) SyncKafkas(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	provider *SCloudprovider,
+	exts []cloudprovider.ICloudKafka,
+	xor bool,
+) compare.SyncResult {
 	lockman.LockRawObject(ctx, KafkaManager.KeywordPlural(), fmt.Sprintf("%s-%s", provider.Id, self.Id))
 	defer lockman.ReleaseRawObject(ctx, KafkaManager.KeywordPlural(), fmt.Sprintf("%s-%s", provider.Id, self.Id))
 
@@ -289,14 +297,16 @@ func (self *SCloudregion) SyncKafkas(ctx context.Context, userCred mcclient.Toke
 		result.Delete()
 	}
 
-	// 和云上资源属性进行同步
-	for i := 0; i < len(commondb); i++ {
-		err := commondb[i].SyncWithCloudKafka(ctx, userCred, commonext[i])
-		if err != nil {
-			result.UpdateError(err)
-			continue
+	if !xor {
+		// 和云上资源属性进行同步
+		for i := 0; i < len(commondb); i++ {
+			err := commondb[i].SyncWithCloudKafka(ctx, userCred, commonext[i])
+			if err != nil {
+				result.UpdateError(err)
+				continue
+			}
+			result.Update()
 		}
-		result.Update()
 	}
 
 	// 创建本地没有的云上资源
@@ -317,7 +327,8 @@ type SKafkaCountStat struct {
 }
 
 func (man *SKafkaManager) TotalCount(
-	scope rbacutils.TRbacScope,
+	ctx context.Context,
+	scope rbacscope.TRbacScope,
 	ownerId mcclient.IIdentityProvider,
 	rangeObjs []db.IStandaloneModel,
 	providers []string, brands []string, cloudEnv string,
@@ -327,7 +338,7 @@ func (man *SKafkaManager) TotalCount(
 	kq = scopeOwnerIdFilter(kq, scope, ownerId)
 	kq = CloudProviderFilter(kq, kq.Field("manager_id"), providers, brands, cloudEnv)
 	kq = RangeObjectsFilter(kq, rangeObjs, kq.Field("cloudregion_id"), nil, kq.Field("manager_id"), nil, nil)
-	kq = db.ObjectIdQueryWithPolicyResult(kq, man, policyResult)
+	kq = db.ObjectIdQueryWithPolicyResult(ctx, kq, man, policyResult)
 
 	sq := kq.SubQuery()
 	q := sq.Query(sqlchemy.COUNT("total_kafka_count"),
@@ -364,7 +375,7 @@ func (self *SKafka) StartDeleteTask(ctx context.Context, userCred mcclient.Token
 	if err != nil {
 		return err
 	}
-	self.SetStatus(userCred, api.KAFKA_STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, api.KAFKA_STATUS_DELETING, "")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -407,7 +418,13 @@ func (self *SKafka) syncRemoveCloudKafka(ctx context.Context, userCred mcclient.
 // 同步资源属性
 func (self *SKafka) SyncWithCloudKafka(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudKafka) error {
 	diff, err := db.UpdateWithLock(ctx, self, func() error {
-		self.ExternalId = ext.GetGlobalId()
+		if options.Options.EnableSyncName {
+			newName, _ := db.GenerateAlterName(self, ext.GetName())
+			if len(newName) > 0 {
+				self.Name = newName
+			}
+		}
+
 		self.Status = ext.GetStatus()
 		self.InstanceType = ext.GetInstanceType()
 		self.Version = ext.GetVersion()
@@ -487,10 +504,11 @@ func (self *SKafka) SyncWithCloudKafka(ctx context.Context, userCred mcclient.To
 			Action: notifyclient.ActionSyncUpdate,
 		})
 	}
-
-	syncVirtualResourceMetadata(ctx, userCred, self, ext)
+	if account := self.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, self, ext, account.ReadOnly)
+	}
 	if provider := self.GetCloudprovider(); provider != nil {
-		SyncCloudProject(userCred, self, provider.GetOwnerId(), ext, provider.Id)
+		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider)
 	}
 	db.OpsLog.LogSyncUpdate(self, diff, userCred)
 	return nil
@@ -592,9 +610,9 @@ func (self *SCloudregion) newFromCloudKafka(ctx context.Context, userCred mcclie
 	})
 
 	// 同步标签
-	syncVirtualResourceMetadata(ctx, userCred, &kafka, ext)
+	syncVirtualResourceMetadata(ctx, userCred, &kafka, ext, false)
 	// 同步项目归属
-	SyncCloudProject(userCred, &kafka, provider.GetOwnerId(), ext, provider.Id)
+	SyncCloudProject(ctx, userCred, &kafka, provider.GetOwnerId(), ext, provider)
 
 	db.OpsLog.LogEvent(&kafka, db.ACT_CREATE, kafka.GetShortDesc(ctx), userCred)
 
@@ -630,7 +648,7 @@ func (manager *SKafkaManager) ListItemExportKeys(ctx context.Context,
 	return q, nil
 }
 
-//同步Kafka实例状态
+// 同步Kafka实例状态
 func (self *SKafka) PerformSyncstatus(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {
 	var openTask = true
 	count, err := taskman.TaskManager.QueryTasksOfObject(self, time.Now().Add(-3*time.Minute), &openTask).CountWithError()
@@ -644,6 +662,10 @@ func (self *SKafka) PerformSyncstatus(ctx context.Context, userCred mcclient.Tok
 	return nil, StartResourceSyncStatusTask(ctx, userCred, self, "KafkaSyncstatusTask", "")
 }
 
+func (self *SKafka) StartKafkaSyncTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
+	return StartResourceSyncStatusTask(ctx, userCred, self, "KafkaSyncstatusTask", parentTaskId)
+}
+
 // 获取Kafka Topic列表
 func (self *SKafka) GetDetailsTopics(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) ([]cloudprovider.SKafkaTopic, error) {
 	iKafka, err := self.GetIKafka(ctx)
@@ -651,4 +673,31 @@ func (self *SKafka) GetDetailsTopics(ctx context.Context, userCred mcclient.Toke
 		return nil, httperrors.NewGeneralError(errors.Wrapf(err, "GetIKafka"))
 	}
 	return iKafka.GetTopics()
+}
+
+func (self *SKafka) StartRemoteUpdateTask(ctx context.Context, userCred mcclient.TokenCredential, replaceTags bool, parentTaskId string) error {
+	data := jsonutils.NewDict()
+	if replaceTags {
+		data.Add(jsonutils.JSONTrue, "replace_tags")
+	}
+	if task, err := taskman.TaskManager.NewTask(ctx, "KafkaRemoteUpdateTask", self, userCred, data, parentTaskId, "", nil); err != nil {
+		return errors.Wrap(err, "Start ElasticSearchRemoteUpdateTask")
+	} else {
+		self.SetStatus(ctx, userCred, api.ELASTIC_SEARCH_UPDATE_TAGS, "StartRemoteUpdateTask")
+		task.ScheduleRun(nil)
+	}
+	return nil
+}
+
+func (self *SKafka) OnMetadataUpdated(ctx context.Context, userCred mcclient.TokenCredential) {
+	if len(self.ExternalId) == 0 || options.Options.KeepTagLocalization {
+		return
+	}
+	if account := self.GetCloudaccount(); account != nil && account.ReadOnly {
+		return
+	}
+	err := self.StartRemoteUpdateTask(ctx, userCred, true, "")
+	if err != nil {
+		log.Errorf("StartRemoteUpdateTask fail: %s", err)
+	}
 }

@@ -63,8 +63,11 @@ const (
 	IsoTimeFormat2         = "2006-01-02 15:04:05Z07:00"
 	IsoNoSecondTimeFormat2 = "2006-01-02 15:04Z07:00"
 	FullIsoNanoTimeFormat2 = "2006-01-02 15:04:05.000000000Z07:00"
+	FullIsoNanoTimeFormat3 = "2006-01-02 15:04:05.000000000"
 
 	RFC2882Format = time.RFC1123
+
+	CephTimeFormat = "Mon Jan _2 15:04:05 2006"
 )
 
 func IsoTime(now time.Time) string {
@@ -97,6 +100,10 @@ func CompactTime(now time.Time) string {
 
 func RFC2882Time(now time.Time) string {
 	return Utcify(now).Format(RFC2882Format)
+}
+
+func CephTime(now time.Time) string {
+	return Utcify(now).Format(CephTimeFormat)
 }
 
 func DateStr(now time.Time) string {
@@ -151,7 +158,7 @@ func toFullIsoNanoTimeFormat(str string) string {
 		}
 	}
 	if pos < 0 { //避免-1越界
-		return str
+		pos = len(subsecStr)
 	}
 	leftOver := subsecStr[pos:]
 	subsecStr = subsecStr[:pos]
@@ -167,6 +174,10 @@ func ParseFullIsoTime(str string) (time.Time, error) {
 
 func ParseFullIsoTime2(str string) (time.Time, error) {
 	return time.Parse(FullIsoNanoTimeFormat2, toFullIsoNanoTimeFormat(str))
+}
+
+func ParseFullIsoTime3(str string) (time.Time, error) {
+	return time.Parse(FullIsoNanoTimeFormat3, toFullIsoNanoTimeFormat(str))
 }
 
 func ParseMysqlTime(str string) (time.Time, error) {
@@ -191,6 +202,10 @@ func ParseCompactTime(str string) (time.Time, error) {
 
 func ParseRFC2882Time(str string) (time.Time, error) {
 	return time.Parse(RFC2882Format, str)
+}
+
+func ParseCephTime(str string) (time.Time, error) {
+	return time.Parse(CephTimeFormat, str)
 }
 
 func ParseDate(str string) (time.Time, error) {
@@ -219,6 +234,8 @@ func ParseTimeStr(str string) (time.Time, error) {
 		return ParseIsoNoSecondTime(str)
 	} else if regutils.MatchFullISOTime2(str) {
 		return ParseFullIsoTime2(str)
+	} else if regutils.MatchFullISOTime3(str) {
+		return ParseFullIsoTime3(str)
 	} else if regutils.MatchISOTime2(str) {
 		return ParseIsoTime2(str)
 	} else if regutils.MatchISONoSecondTime2(str) {
@@ -233,6 +250,8 @@ func ParseTimeStr(str string) (time.Time, error) {
 		return ParseFullNormalTime(str)
 	} else if regutils.MatchRFC2882Time(str) {
 		return ParseRFC2882Time(str)
+	} else if regutils.MatchCephTime(str) {
+		return ParseCephTime(str)
 	} else if regutils.MatchCompactTime(str) {
 		return ParseCompactTime(str)
 	} else if regutils.MatchDate(str) {

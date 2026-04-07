@@ -24,6 +24,7 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
@@ -32,7 +33,6 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -116,8 +116,8 @@ func (manager *SSchedtagManager) InitializeData() error {
 	return nil
 }
 
-func (manager *SSchedtagManager) NamespaceScope() rbacutils.TRbacScope {
-	return rbacutils.ScopeSystem
+func (manager *SSchedtagManager) NamespaceScope() rbacscope.TRbacScope {
+	return rbacscope.ScopeSystem
 }
 
 func (manager *SSchedtagManager) BindJointManagers(ms map[db.IModelManager]ISchedtagJointManager) {
@@ -146,22 +146,19 @@ type SSchedtag struct {
 	ResourceType    string `width:"16" charset:"ascii" nullable:"true" list:"user" create:"required"`                                 // Column(VARCHAR(16, charset='ascii'), nullable=True, default='')
 }
 
-func (m *SSchedtagManager) FilterByOwner(q *sqlchemy.SQuery, userCred mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
-	if userCred == nil {
+func (m *SSchedtagManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	if ownerId == nil {
 		return q
 	}
 	switch scope {
-	case rbacutils.ScopeDomain:
+	case rbacscope.ScopeDomain:
 		q = q.Filter(sqlchemy.OR(
 			// share to system
-			sqlchemy.AND(
-				sqlchemy.IsNullOrEmpty(q.Field("domain_id")),
-				//sqlchemy.IsNullOrEmpty(q.Field("tenant_id")),
-			),
+			sqlchemy.IsNullOrEmpty(q.Field("domain_id")),
 			// share to this domain or its sub-projects
-			sqlchemy.Equals(q.Field("domain_id"), userCred.GetProjectDomainId()),
+			sqlchemy.Equals(q.Field("domain_id"), ownerId.GetProjectDomainId()),
 		))
-	case rbacutils.ScopeProject:
+	case rbacscope.ScopeProject:
 		q = q.Filter(sqlchemy.OR(
 			// share to system
 			sqlchemy.AND(
@@ -170,13 +167,13 @@ func (m *SSchedtagManager) FilterByOwner(q *sqlchemy.SQuery, userCred mcclient.I
 			),
 			// share to project's parent domain
 			sqlchemy.AND(
-				sqlchemy.Equals(q.Field("domain_id"), userCred.GetProjectDomainId()),
+				sqlchemy.Equals(q.Field("domain_id"), ownerId.GetProjectDomainId()),
 				sqlchemy.IsNullOrEmpty(q.Field("tenant_id")),
 			),
 			// share to this project
 			sqlchemy.AND(
-				sqlchemy.Equals(q.Field("domain_id"), userCred.GetProjectDomainId()),
-				sqlchemy.Equals(q.Field("tenant_id"), userCred.GetProjectId()),
+				sqlchemy.Equals(q.Field("domain_id"), ownerId.GetProjectDomainId()),
+				sqlchemy.Equals(q.Field("tenant_id"), ownerId.GetProjectId()),
 			),
 		))
 	}
@@ -232,7 +229,6 @@ func (manager *SSchedtagManager) OrderByExtraFields(
 	query api.SchedtagListInput,
 ) (*sqlchemy.SQuery, error) {
 	var err error
-
 	q, err = manager.SStandaloneResourceBaseManager.OrderByExtraFields(ctx, q, userCred, query.StandaloneResourceListInput)
 	if err != nil {
 		return nil, errors.Wrap(err, "SStandaloneResourceBaseManager.OrderByExtraFields")
@@ -260,10 +256,10 @@ func (manager *SSchedtagManager) QueryDistinctExtraField(q *sqlchemy.SQuery, fie
 	return q, httperrors.ErrNotFound
 }
 
-func (manager *SSchedtagManager) ValidateSchedtags(userCred mcclient.TokenCredential, schedtags []*api.SchedtagConfig) ([]*api.SchedtagConfig, error) {
+func (manager *SSchedtagManager) ValidateSchedtags(ctx context.Context, userCred mcclient.TokenCredential, schedtags []*api.SchedtagConfig) ([]*api.SchedtagConfig, error) {
 	ret := make([]*api.SchedtagConfig, len(schedtags))
 	for idx, tag := range schedtags {
-		schedtagObj, err := manager.FetchByIdOrName(userCred, tag.Id)
+		schedtagObj, err := manager.FetchByIdOrName(ctx, userCred, tag.Id)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError("Invalid schedtag %s", tag.Id)
@@ -568,7 +564,7 @@ func PerformSetResourceSchedtag(obj IModelWithSchedtag, ctx context.Context, use
 	setTagsId := []string{}
 	for idx := 0; idx < len(schedtags); idx++ {
 		schedtagIdent, _ := schedtags[idx].GetString()
-		tag, err := SchedtagManager.FetchByIdOrName(userCred, schedtagIdent)
+		tag, err := SchedtagManager.FetchByIdOrName(ctx, userCred, schedtagIdent)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewNotFoundError("Schedtag %s not found", schedtagIdent)
@@ -672,7 +668,7 @@ func (s *SSchedtag) PerformSetResource(ctx context.Context, userCred mcclient.To
 	// get need set resource ids
 	for i := 0; i < len(input.ResourceIds); i++ {
 		resId := input.ResourceIds[i]
-		res, err := resMan.FetchByIdOrName(userCred, resId)
+		res, err := resMan.FetchByIdOrName(ctx, userCred, resId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewNotFoundError("Resource %s %s not found", s.ResourceType, resId)

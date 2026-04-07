@@ -18,9 +18,11 @@ import (
 	"context"
 	"database/sql"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
@@ -30,7 +32,6 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
@@ -78,7 +79,7 @@ type SInstanceSnapshot struct {
 	// 套餐名称
 	InstanceType string `width:"64" charset:"utf8" nullable:"true" list:"user" create:"optional"`
 	// 主机快照磁盘容量和
-	SizeMb int `nullable:"false"`
+	SizeMb int `nullable:"false" list:"user"`
 	// 镜像ID
 	ImageId string `width:"36" charset:"ascii" nullable:"true" list:"user"`
 	// 是否保存内存
@@ -133,7 +134,7 @@ func (manager *SInstanceSnapshotManager) ListItemFilter(
 
 	guestStr := query.ServerId
 	if len(guestStr) > 0 {
-		guestObj, err := GuestManager.FetchByIdOrName(userCred, guestStr)
+		guestObj, err := GuestManager.FetchByIdOrName(ctx, userCred, guestStr)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2("guests", guestStr)
@@ -177,6 +178,30 @@ func (manager *SInstanceSnapshotManager) OrderByExtraFields(
 		return nil, errors.Wrap(err, "SManagedResourceBaseManager.OrderByExtraFields")
 	}
 
+	if db.NeedOrderQuery([]string{query.OrderByDiskSnapshotCount}) {
+		nQ := SnapshotManager.Query()
+		nQ = nQ.AppendField(nQ.Field("disk_id"), sqlchemy.COUNT("snapshot_count"))
+		nQ = nQ.GroupBy("disk_id")
+		nSQ := nQ.SubQuery()
+
+		guestdiskQ := GuestdiskManager.Query()
+		guestdiskQ = guestdiskQ.LeftJoin(nSQ, sqlchemy.Equals(nSQ.Field("disk_id"), guestdiskQ.Field("disk_id")))
+		guestdiskSQ := guestdiskQ.AppendField(guestdiskQ.Field("guest_id"), nSQ.Field("snapshot_count")).SubQuery()
+
+		q = q.LeftJoin(guestdiskSQ, sqlchemy.Equals(guestdiskSQ.Field("guest_id"), q.Field("guest_id")))
+		q = q.AppendField(q.QueryFields()...)
+		q = q.AppendField(guestdiskSQ.Field("snapshot_count"))
+		q = db.OrderByFields(q, []string{query.OrderByDiskSnapshotCount}, []sqlchemy.IQueryField{q.Field("snapshot_count")})
+	}
+
+	if db.NeedOrderQuery([]string{query.OrderByGuest}) {
+		guestQ := GuestManager.Query()
+		guestSQ := guestQ.AppendField(guestQ.Field("id"), guestQ.Field("name").Label("guest_name")).SubQuery()
+		q = q.LeftJoin(guestSQ, sqlchemy.Equals(guestSQ.Field("id"), q.Field("guest_id")))
+		q = q.AppendField(q.QueryFields()...)
+		q = q.AppendField(guestSQ.Field("guest_name"))
+		q = db.OrderByFields(q, []string{query.OrderByGuest}, []sqlchemy.IQueryField{q.Field("guest_name")})
+	}
 	return q, nil
 }
 
@@ -255,7 +280,7 @@ func (self *SInstanceSnapshot) getMoreDetails(userCred mcclient.TokenCredential,
 			}
 		}
 	} else if guest != nil {
-		out.Size = self.SizeMb
+		out.Size = self.SizeMb * 1024 * 1024
 		disk, err := guest.GetSystemDisk()
 		if err != nil {
 			log.Errorf("unable to GetSystemDisk of guest %q", guest.GetId())
@@ -408,7 +433,7 @@ func (manager *SInstanceSnapshotManager) CreateInstanceSnapshot(ctx context.Cont
 	if err != nil {
 		return nil, errors.Wrap(err, "Insert")
 	}
-	err = db.InheritFromTo(ctx, guest, instanceSnapshot)
+	err = db.InheritFromTo(ctx, userCred, guest, instanceSnapshot)
 	if err != nil {
 		return nil, errors.Wrap(err, "Inherit ClassMetadata")
 	}
@@ -474,6 +499,7 @@ func (self *SInstanceSnapshot) ToInstanceCreateInput(
 		sourceInput.Secgroups = inputSecgs
 	}
 	sourceInput.OsType = self.OsType
+	sourceInput.OsArch = self.OsArch
 	sourceInput.InstanceType = self.InstanceType
 	if len(sourceInput.Networks) == 0 {
 		sourceInput.Networks = serverConfig.Networks
@@ -508,7 +534,7 @@ func (self *SInstanceSnapshot) GetSnapshots() ([]SSnapshot, error) {
 func (self *SInstanceSnapshot) GetQuotaKeys() quotas.IQuotaKeys {
 	region, _ := self.GetRegion()
 	return fetchRegionalQuotaKeys(
-		rbacutils.ScopeProject,
+		rbacscope.ScopeProject,
 		self.GetOwnerId(),
 		region,
 		self.GetCloudprovider(),
@@ -527,18 +553,18 @@ func (self *SInstanceSnapshot) GetUsages() []db.IUsage {
 	}
 }
 
-func TotalInstanceSnapshotCount(scope rbacutils.TRbacScope, ownerId mcclient.IIdentityProvider, rangeObjs []db.IStandaloneModel, providers []string, brands []string, cloudEnv string, policyResult rbacutils.SPolicyResult) (int, error) {
+func TotalInstanceSnapshotCount(ctx context.Context, scope rbacscope.TRbacScope, ownerId mcclient.IIdentityProvider, rangeObjs []db.IStandaloneModel, providers []string, brands []string, cloudEnv string, policyResult rbacutils.SPolicyResult) (int, error) {
 	q := InstanceSnapshotManager.Query()
 
 	switch scope {
-	case rbacutils.ScopeSystem:
-	case rbacutils.ScopeDomain:
+	case rbacscope.ScopeSystem:
+	case rbacscope.ScopeDomain:
 		q = q.Equals("domain_id", ownerId.GetProjectDomainId())
-	case rbacutils.ScopeProject:
+	case rbacscope.ScopeProject:
 		q = q.Equals("tenant_id", ownerId.GetProjectId())
 	}
 
-	q = db.ObjectIdQueryWithPolicyResult(q, InstanceSnapshotManager, policyResult)
+	q = db.ObjectIdQueryWithPolicyResult(ctx, q, InstanceSnapshotManager, policyResult)
 
 	q = RangeObjectsFilter(q, rangeObjs, q.Field("cloudregion_id"), nil, q.Field("manager_id"), nil, nil)
 	q = CloudProviderFilter(q, q.Field("manager_id"), providers, brands, cloudEnv)
@@ -575,7 +601,7 @@ func (self *SInstanceSnapshot) StartInstanceSnapshotDeleteTask(
 		log.Errorf("%s", err)
 		return err
 	}
-	self.SetStatus(userCred, api.INSTANCE_SNAPSHOT_START_DELETE, "InstanceSnapshotDeleteTask")
+	self.SetStatus(ctx, userCred, api.INSTANCE_SNAPSHOT_START_DELETE, "InstanceSnapshotDeleteTask")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -617,7 +643,7 @@ func (is *SInstanceSnapshot) syncRemoveCloudInstanceSnapshot(ctx context.Context
 
 	err := is.ValidateDeleteCondition(ctx, nil)
 	if err != nil {
-		err = is.SetStatus(userCred, api.INSTANCE_SNAPSHOT_UNKNOWN, "sync to delete")
+		err = is.SetStatus(ctx, userCred, api.INSTANCE_SNAPSHOT_UNKNOWN, "sync to delete")
 	} else {
 		err = is.RealDelete(ctx, userCred)
 	}

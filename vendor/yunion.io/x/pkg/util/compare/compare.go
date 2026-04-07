@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 
+	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 )
 
@@ -76,7 +77,7 @@ type SCompareSet struct {
 	ExtSet  interface{}
 }
 
-func CompareSetsFunc(cs SCompareSet, removed interface{}, commonDB interface{}, commonExt interface{}, added interface{}) error {
+func CompareSetsFunc(cs SCompareSet, removed interface{}, commonDB interface{}, commonExt interface{}, added interface{}, duplicated interface{}) error {
 	dbSetArray, err := valueSet2Array(cs.DBSet, cs.DBFunc)
 	if err != nil {
 		return err
@@ -85,21 +86,54 @@ func CompareSetsFunc(cs SCompareSet, removed interface{}, commonDB interface{}, 
 	if err != nil {
 		return err
 	}
-	sort.Sort(valueSet(dbSetArray))
-	sort.Sort(valueSet(extSetArray))
 
-	dupCheck := map[string][]reflect.Value{}
+	sort.Sort(valueSet(dbSetArray))
+
+	dupCheck := map[string][]int{}
 	for i := range extSetArray {
 		_, ok := dupCheck[extSetArray[i].key]
 		if !ok {
-			dupCheck[extSetArray[i].key] = []reflect.Value{}
+			dupCheck[extSetArray[i].key] = []int{}
 		}
-		dupCheck[extSetArray[i].key] = append(dupCheck[extSetArray[i].key], extSetArray[i].value)
+		dupCheck[extSetArray[i].key] = append(dupCheck[extSetArray[i].key], i)
+	}
 
-		if len(dupCheck[extSetArray[i].key]) > 1 {
-			return errors.Wrapf(errors.ErrDuplicateId, "duplicated id: %s", extSetArray[i].key)
+	var dupValue reflect.Value
+	storeDup := false
+	if duplicated != nil {
+		storeDup = true
+		dupValue = reflect.Indirect(reflect.ValueOf(duplicated))
+	}
+
+	errs := make([]error, 0)
+	newExtSetArray := make([]valueElement, 0)
+	duplicateMap := map[string]bool{}
+	for k, idx := range dupCheck {
+		if len(idx) > 1 {
+			if !storeDup {
+				log.Warningf("CompareSets Duplicate ID: %s (%d)", k, len(idx))
+				errs = append(errs, errors.Wrapf(errors.ErrDuplicateId, "duplicated id: %s (%d)", k, len(idx)))
+			} else {
+				// store in dupValue
+				dupArrays := reflect.MakeSlice(reflect.SliceOf(extSetArray[idx[0]].value.Type()), len(idx), len(idx))
+				for i := 0; i < len(idx); i++ {
+					dupArrays.Index(i).Set(extSetArray[idx[i]].value)
+				}
+				dupValue.SetMapIndex(reflect.ValueOf(k), dupArrays)
+				duplicateMap[k] = true
+			}
+		} else {
+			newExtSetArray = append(newExtSetArray, extSetArray[idx[0]])
 		}
 	}
+
+	if len(errs) > 0 {
+		return errors.NewAggregate(errs)
+	}
+
+	extSetArray = newExtSetArray
+
+	sort.Sort(valueSet(extSetArray))
 
 	removedValue := reflect.Indirect(reflect.ValueOf(removed))
 	commonDBValue := reflect.Indirect(reflect.ValueOf(commonDB))
@@ -119,7 +153,7 @@ func CompareSetsFunc(cs SCompareSet, removed interface{}, commonDB interface{}, 
 				i += 1
 				j += 1
 			} else if cmp < 0 {
-				if len(dbSetArray[i].key) > 0 {
+				if _, ok := duplicateMap[dbSetArray[i].key]; !ok && len(dbSetArray[i].key) > 0 {
 					newVal := reflect.Append(removedValue, dbSetArray[i].value)
 					removedValue.Set(newVal)
 				}
@@ -134,7 +168,7 @@ func CompareSetsFunc(cs SCompareSet, removed interface{}, commonDB interface{}, 
 			addedValue.Set(newVal)
 			j += 1
 		} else if j >= len(extSetArray) {
-			if len(dbSetArray[i].key) > 0 {
+			if _, ok := duplicateMap[dbSetArray[i].key]; !ok && len(dbSetArray[i].key) > 0 {
 				newVal := reflect.Append(removedValue, dbSetArray[i].value)
 				removedValue.Set(newVal)
 			}
@@ -142,14 +176,17 @@ func CompareSetsFunc(cs SCompareSet, removed interface{}, commonDB interface{}, 
 		}
 	}
 	return nil
-
 }
 
 func CompareSets(dbSet interface{}, extSet interface{}, removed interface{}, commonDB interface{}, commonExt interface{}, added interface{}) error {
+	return CompareSets2(dbSet, extSet, removed, commonDB, commonExt, added, nil)
+}
+
+func CompareSets2(dbSet interface{}, extSet interface{}, removed interface{}, commonDB interface{}, commonExt interface{}, added interface{}, duplicated interface{}) error {
 	return CompareSetsFunc(SCompareSet{
 		DBFunc:  "GetExternalId",
 		DBSet:   dbSet,
 		ExtFunc: "GetGlobalId",
 		ExtSet:  extSet,
-	}, removed, commonDB, commonExt, added)
+	}, removed, commonDB, commonExt, added, duplicated)
 }

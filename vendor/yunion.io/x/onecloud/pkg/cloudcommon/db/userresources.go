@@ -20,13 +20,13 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/util/reflectutils"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -58,7 +58,7 @@ func (manager *SUserResourceBaseManager) ListItemFilter(
 	if err != nil {
 		return nil, err
 	}
-	if ((query.Admin != nil && *query.Admin) || query.Scope == string(rbacutils.ScopeSystem)) && IsAdminAllowList(userCred, manager).Result.IsAllow() {
+	if ((query.Admin != nil && *query.Admin) || query.Scope == string(rbacscope.ScopeSystem)) && IsAdminAllowList(userCred, manager).Result.IsAllow() {
 		user := query.UserId
 		if len(user) > 0 {
 			uc, _ := UserCacheManager.FetchUserByIdOrName(ctx, user)
@@ -125,9 +125,9 @@ func (manager *SUserResourceBaseManager) FetchCustomizeColumns(
 	return rows
 }
 
-func (manager *SUserResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery, owner mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
+func (manager *SUserResourceBaseManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if owner != nil {
-		if scope == rbacutils.ScopeUser {
+		if scope == rbacscope.ScopeUser {
 			if len(owner.GetUserId()) > 0 {
 				q = q.Equals("owner_id", owner.GetUserId())
 			}
@@ -149,12 +149,12 @@ func (manager *SUserResourceBaseManager) GetIUserModelManager() IUserModelManage
 	return manager.GetVirtualObject().(IUserModelManager)
 }
 
-func (manager *SUserResourceBaseManager) FetchByName(userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
-	return FetchByName(manager, userCred, idStr)
+func (manager *SUserResourceBaseManager) FetchByName(ctx context.Context, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
+	return FetchByName(ctx, manager, userCred, idStr)
 }
 
-func (manager *SUserResourceBaseManager) FetchByIdOrName(userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
-	return FetchByIdOrName(manager, userCred, idStr)
+func (manager *SUserResourceBaseManager) FetchByIdOrName(ctx context.Context, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
+	return FetchByIdOrName(ctx, manager, userCred, idStr)
 }
 
 func (manager *SUserResourceBaseManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input apis.UserResourceCreateInput) (apis.UserResourceCreateInput, error) {
@@ -173,10 +173,10 @@ func (manager *SUserResourceBaseManager) FetchOwnerId(ctx context.Context, data 
 	return FetchUserInfo(ctx, data)
 }
 
-func (manager *SUserResourceBaseManager) NamespaceScope() rbacutils.TRbacScope {
-	return rbacutils.ScopeUser
+func (manager *SUserResourceBaseManager) NamespaceScope() rbacscope.TRbacScope {
+	return rbacscope.ScopeUser
 }
 
-func (manager *SUserResourceBaseManager) ResourceScope() rbacutils.TRbacScope {
-	return rbacutils.ScopeUser
+func (manager *SUserResourceBaseManager) ResourceScope() rbacscope.TRbacScope {
+	return rbacscope.ScopeUser
 }

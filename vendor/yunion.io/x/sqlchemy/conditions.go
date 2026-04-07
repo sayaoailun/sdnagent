@@ -21,6 +21,26 @@ import (
 	"yunion.io/x/pkg/util/reflectutils"
 )
 
+type sNoop struct{}
+
+var noop = &sNoop{}
+
+func (s sNoop) WhereClause() string {
+	return ""
+}
+
+func (s sNoop) Variables() []interface{} {
+	return nil
+}
+
+func (s sNoop) database() *SDatabase {
+	return nil
+}
+
+func Noop() ICondition {
+	return noop
+}
+
 // ICondition is the interface representing a condition for SQL query
 // e.g. WHERE a1 = b1 is a condition of equal
 // the condition support nested condition, with AND, OR and NOT boolean operators
@@ -104,6 +124,9 @@ func (c *SOrConditions) WhereClause() string {
 func AND(cond ...ICondition) ICondition {
 	conds := make([]ICondition, 0)
 	for _, c := range cond {
+		if c == nil || c == noop {
+			continue
+		}
 		andCond, ok := c.(*SAndConditions)
 		if ok {
 			conds = append(conds, andCond.conditions...)
@@ -119,6 +142,10 @@ func AND(cond ...ICondition) ICondition {
 func OR(cond ...ICondition) ICondition {
 	conds := make([]ICondition, 0)
 	for _, c := range cond {
+		if c == nil || c == noop {
+			conds = conds[0:0]
+			break
+		}
 		orCond, ok := c.(*SOrConditions)
 		if ok {
 			conds = append(conds, orCond.conditions...)
@@ -137,16 +164,25 @@ type SNotCondition struct {
 
 // WhereClause implementationq of SNotCondition for ICondition
 func (c *SNotCondition) WhereClause() string {
+	if c.condition == nil || c.condition == noop {
+		return "1!=1"
+	}
 	return fmt.Sprintf("%s (%s)", SQL_OP_NOT, c.condition.WhereClause())
 }
 
 // Variables implementation of SNotCondition for ICondition
 func (c *SNotCondition) Variables() []interface{} {
+	if c.condition == nil {
+		return nil
+	}
 	return c.condition.Variables()
 }
 
 // database implementation of SNotCondition for ICondition
 func (c *SNotCondition) database() *SDatabase {
+	if c.condition == nil {
+		return nil
+	}
 	return c.condition.database()
 }
 
@@ -215,7 +251,8 @@ type SIsEmptyCondition struct {
 
 // WhereClause implementation of SIsEmptyCondition for ICondition
 func (c *SIsEmptyCondition) WhereClause() string {
-	return fmt.Sprintf("%s = 0", c.field.Reference())
+	// DAMENG LENGTH('') = NULL
+	return fmt.Sprintf("%s = 0 OR %s IS NULL", c.field.Reference(), c.field.Reference())
 }
 
 // IsEmpty method that justifies where a text field is empty, e.g. length is zero
@@ -232,7 +269,8 @@ type SIsNullOrEmptyCondition struct {
 // WhereClause implementation of SIsNullOrEmptyCondition for ICondition
 func (c *SIsNullOrEmptyCondition) WhereClause() string {
 	originField := c.field.(*SFunctionFieldBase).queryFields()[0]
-	return fmt.Sprintf("%s IS NULL OR %s = 0", originField.Reference(), c.field.Reference())
+	// DAMENG: LENGTH('') = NULL
+	return fmt.Sprintf("%s IS NULL OR %s = 0 OR %s IS NULL", originField.Reference(), c.field.Reference(), c.field.Reference())
 }
 
 // IsNullOrEmpty is the ethod justifies a field is null or empty, e.g. a is null or length(a) == 0
@@ -331,12 +369,30 @@ type STupleCondition struct {
 }
 
 func tupleConditionWhereClause(t *STupleCondition, op string) string {
+	return tupleConditionWhereClauseInternal(t, op, "")
+}
+
+func TupleConditionWhereClauseWithFuncname(t *STupleCondition, funcName string) string {
+	return tupleConditionWhereClauseInternal(t, ",", funcName)
+}
+
+func tupleConditionWhereClauseInternal(t *STupleCondition, op string, funcName string) string {
+	if isFieldRequireAscii(t.left) && !isVariableAscii(t.right) {
+		return "0"
+	}
 	var buf bytes.Buffer
+	if len(funcName) > 0 {
+		buf.WriteString(funcName)
+		buf.WriteByte('(')
+	}
 	buf.WriteString(t.left.Reference())
 	buf.WriteByte(' ')
 	buf.WriteString(op)
 	buf.WriteByte(' ')
-	buf.WriteString(varConditionWhereClause(t.right))
+	buf.WriteString(VarConditionWhereClause(t.right))
+	if len(funcName) > 0 {
+		buf.WriteByte(')')
+	}
 	return buf.String()
 }
 
@@ -359,7 +415,7 @@ func questionMark(count int) string {
 	}
 }
 
-func varConditionWhereClause(v interface{}) string {
+func VarConditionWhereClause(v interface{}) string {
 	switch q := v.(type) {
 	case IQueryField:
 		return q.Reference()
@@ -393,8 +449,19 @@ func NewTupleCondition(l IQueryField, r interface{}) STupleCondition {
 	return STupleCondition{left: l, right: r}
 }
 
+func (t *STupleCondition) GetLeft() IQueryField {
+	return t.left
+}
+
+func (t *STupleCondition) GetRight() interface{} {
+	return t.right
+}
+
 // Variables implementation of STupleCondition for ICondition
 func (t *STupleCondition) Variables() []interface{} {
+	if isFieldRequireAscii(t.left) && !isVariableAscii(t.right) {
+		return []interface{}{}
+	}
 	return varConditionVariables(t.right)
 }
 
@@ -410,7 +477,7 @@ type SInCondition struct {
 }
 
 func inConditionWhereClause(t *STupleCondition, op string) string {
-	v := varConditionWhereClause(t.right)
+	v := VarConditionWhereClause(t.right)
 	if len(v) != 0 {
 		return tupleConditionWhereClause(t, op)
 	}
@@ -492,6 +559,22 @@ func Like(f IQueryField, v string) ICondition {
 	return &c
 }
 
+// SRegexpConition represents REGEXP operation in a SQL query
+type SRegexpConition struct {
+	STupleCondition
+}
+
+// WhereClause implementation for SRegexpConition for ICondition
+func (t *SRegexpConition) WhereClause() string {
+	return t.left.database().backend.RegexpWhereClause(t)
+}
+
+// Regexp SQL operator
+func Regexp(f IQueryField, v string) ICondition {
+	c := SRegexpConition{NewTupleCondition(f, v)}
+	return &c
+}
+
 // ContainsAny is a OR combination of serveral Contains conditions
 func ContainsAny(f IQueryField, v []string) ICondition {
 	conds := make([]ICondition, len(v))
@@ -534,8 +617,7 @@ func (t *SEqualsCondition) WhereClause() string {
 
 // Equals method represents equal of two fields
 func Equals(f IQueryField, v interface{}) ICondition {
-	c := SEqualsCondition{NewTupleCondition(f, v)}
-	return &c
+	return f.database().backend.Equals(f, v)
 }
 
 // SNotEqualsCondition is the opposite of equal condition
@@ -648,7 +730,7 @@ type SBetweenCondition struct {
 // WhereClause implementation of SBetweenCondition for ICondition
 func (t *SBetweenCondition) WhereClause() string {
 	ret := tupleConditionWhereClause(&t.STupleCondition, SQL_OP_BETWEEN)
-	return fmt.Sprintf("%s AND %s", ret, varConditionWhereClause(t.right2))
+	return fmt.Sprintf("%s AND %s", ret, VarConditionWhereClause(t.right2))
 }
 
 // Between SQL operator
@@ -690,3 +772,8 @@ func (t *SFalseCondition) Variables() []interface{} {
 func (t *SFalseCondition) database() *SDatabase {
 	return nil
 }
+
+var (
+	AlwaysTrue  = &STrueCondition{}
+	AlwaysFalse = &SFalseCondition{}
+)

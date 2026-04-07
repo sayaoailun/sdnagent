@@ -22,6 +22,8 @@ type LoadbalancerClusterDetails struct {
 	WireResourceInfoBase
 
 	SLoadbalancerCluster
+
+	RefCounts map[string]int
 }
 
 type LoadbalancerClusterResourceInfo struct {
@@ -56,4 +58,11 @@ type LoadbalancerClusterFilterListInput struct {
 
 	// 以负载均衡集群排序
 	OrderByCluster string `json:"order_by_cluster"`
+}
+
+type LoadbalancerClusterListInput struct {
+	apis.StandaloneResourceListInput
+
+	ZonalFilterListInput
+	WireFilterListBase
 }

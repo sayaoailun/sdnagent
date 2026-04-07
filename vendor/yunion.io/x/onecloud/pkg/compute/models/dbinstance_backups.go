@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
@@ -31,7 +32,6 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
@@ -208,7 +208,7 @@ func (manager *SDBInstanceBackupManager) ValidateCreateData(ctx context.Context,
 	if len(input.DBInstance) == 0 {
 		return nil, httperrors.NewMissingParameterError("dbinstance")
 	}
-	_instance, err := DBInstanceManager.FetchByIdOrName(userCred, input.DBInstance)
+	_instance, err := DBInstanceManager.FetchByIdOrName(ctx, userCred, input.DBInstance)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, httperrors.NewResourceNotFoundError("failed to found dbinstance %s", input.DBInstance)
@@ -266,8 +266,8 @@ func (self *SDBInstanceBackup) StartDBInstanceBackupCreateTask(ctx context.Conte
 	if err != nil {
 		return errors.Wrap(err, "GetDBInstance")
 	}
-	instance.SetStatus(userCred, api.DBINSTANCE_BACKING_UP, "")
-	self.SetStatus(userCred, api.DBINSTANCE_BACKUP_CREATING, "")
+	instance.SetStatus(ctx, userCred, api.DBINSTANCE_BACKING_UP, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_BACKUP_CREATING, "")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -386,9 +386,17 @@ func (backup *SDBInstanceBackup) GetIDBInstanceBackup(ctx context.Context) (clou
 	return iRegion.GetIDBInstanceBackupById(backup.ExternalId)
 }
 
-func (manager *SDBInstanceBackupManager) SyncDBInstanceBackups(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, instance *SDBInstance, region *SCloudregion, cloudBackups []cloudprovider.ICloudDBInstanceBackup) compare.SyncResult {
-	lockman.LockRawObject(ctx, "dbinstance-backups", fmt.Sprintf("%s-%s", provider.Id, region.Id))
-	defer lockman.ReleaseRawObject(ctx, "dbinstance-backups", fmt.Sprintf("%s-%s", provider.Id, region.Id))
+func (manager *SDBInstanceBackupManager) SyncDBInstanceBackups(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	provider *SCloudprovider,
+	instance *SDBInstance,
+	region *SCloudregion,
+	cloudBackups []cloudprovider.ICloudDBInstanceBackup,
+	xor bool,
+) compare.SyncResult {
+	lockman.LockRawObject(ctx, manager.Keyword(), fmt.Sprintf("%s-%s", provider.Id, region.Id))
+	defer lockman.ReleaseRawObject(ctx, manager.Keyword(), fmt.Sprintf("%s-%s", provider.Id, region.Id))
 
 	result := compare.SyncResult{}
 	dbBackups, err := region.GetDBInstanceBackups(provider, instance)
@@ -415,12 +423,14 @@ func (manager *SDBInstanceBackupManager) SyncDBInstanceBackups(ctx context.Conte
 		}
 	}
 
-	for i := 0; i < len(commondb); i++ {
-		err := commondb[i].SyncWithCloudDBInstanceBackup(ctx, userCred, commonext[i], provider)
-		if err != nil {
-			result.UpdateError(err)
-		} else {
-			result.Update()
+	if !xor {
+		for i := 0; i < len(commondb); i++ {
+			err := commondb[i].SyncWithCloudDBInstanceBackup(ctx, userCred, commonext[i], provider)
+			if err != nil {
+				result.UpdateError(err)
+			} else {
+				result.Update()
+			}
 		}
 	}
 
@@ -474,7 +484,7 @@ func (self *SDBInstanceBackup) SyncWithCloudDBInstanceBackup(
 	}
 
 	if len(self.ProjectId) == 0 {
-		SyncCloudProject(userCred, self, provider.GetOwnerId(), extBackup, provider.Id)
+		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), extBackup, provider)
 	}
 
 	return nil
@@ -533,7 +543,7 @@ func (manager *SDBInstanceBackupManager) newFromCloudDBInstanceBackup(
 	}
 
 	if len(backup.ProjectId) == 0 {
-		SyncCloudProject(userCred, &backup, provider.GetOwnerId(), extBackup, provider.Id)
+		SyncCloudProject(ctx, userCred, &backup, provider.GetOwnerId(), extBackup, provider)
 	}
 
 	return nil
@@ -553,7 +563,7 @@ func (self *SDBInstanceBackup) CustomizeDelete(ctx context.Context, userCred mcc
 }
 
 func (self *SDBInstanceBackup) StartDBInstanceBackupDeleteTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_BACKUP_DELETING, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_BACKUP_DELETING, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceBackupDeleteTask", self, userCred, nil, parentTaskId, "", nil)
 	if err != nil {
 		return err

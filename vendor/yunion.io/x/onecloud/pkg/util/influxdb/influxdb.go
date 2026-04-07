@@ -23,15 +23,16 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/gotypes"
+	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/httperrors"
-	"yunion.io/x/onecloud/pkg/util/httputils"
 )
 
 type SInfluxdb struct {
@@ -298,4 +299,8 @@ func (db *SInfluxdb) SetRetentionPolicy(rp SRetentionPolicy) error {
 	} else {
 		return db.CreateRetentionPolicy(rp)
 	}
+}
+
+func (db *SInfluxdb) SetTimeout(timeout time.Duration) {
+	db.client.Timeout = timeout
 }

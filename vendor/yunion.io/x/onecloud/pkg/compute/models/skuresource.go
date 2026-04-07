@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"strings"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/utils"
@@ -27,7 +28,6 @@ import (
 	apis "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 )
@@ -80,20 +80,15 @@ func PerformActionSyncSkus(ctx context.Context, userCred mcclient.TokenCredentia
 		return nil, httperrors.NewInputParameterError("no cloudregion found to sync skus")
 	}
 
-	// start cloudregion skus sync tasks
 	params := jsonutils.NewDict()
 	params.Set("resource", jsonutils.NewString(resourceKey))
-	// replaced with NewParallelTask??
 	ret := jsonutils.NewDict()
 	taskIds := jsonutils.NewArray()
 	for i := range regions {
-		task, err := taskman.TaskManager.NewTask(ctx, "CloudRegionSyncSkusTask", &regions[i], userCred, params, "", "", nil)
+		err = regions[i].StartSyncSkusTask(ctx, userCred, resourceKey)
 		if err != nil {
-			return nil, errors.Wrapf(err, "CloudRegionSyncSkusTask")
+			return nil, err
 		}
-
-		task.ScheduleRun(nil)
-		taskIds.Add(jsonutils.NewString(task.GetId()))
 	}
 	ret.Set("tasks", taskIds)
 	return ret, nil

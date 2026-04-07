@@ -21,18 +21,18 @@ import (
 
 	"golang.org/x/net/http/httpproxy"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/gotypes"
+	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/pkg/utils"
 
 	proxyapi "yunion.io/x/onecloud/pkg/apis/cloudcommon/proxy"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/modulebase"
 	"yunion.io/x/onecloud/pkg/mcclient/modules"
-	"yunion.io/x/onecloud/pkg/util/httputils"
 )
 
 type SCloudprovider struct {
@@ -77,6 +77,9 @@ type SCloudDelegate struct {
 
 	Options struct {
 		cloudprovider.SHCSOEndpoints
+		Account       string
+		Password      string
+		DefaultRegion string
 	}
 	ProxySetting proxyapi.SProxySetting
 }
@@ -89,20 +92,24 @@ func (account *SCloudDelegate) getAccessUrl() string {
 	return account.AccessUrl
 }
 
-func (account *SCloudDelegate) getOptions(ctx context.Context, s *mcclient.ClientSession) jsonutils.JSONObject {
-	ret := jsonutils.NewDict()
+func (account *SCloudDelegate) getOptions(ctx context.Context, s *mcclient.ClientSession) (string, jsonutils.JSONObject) {
+	regionId, ret := "", jsonutils.NewDict()
 	resp, _ := Cloudaccounts.GetById(s, account.CloudaccountId, jsonutils.Marshal(map[string]string{"scope": "system"}))
 	if !gotypes.IsNil(resp) {
 		options, _ := resp.Get("options")
 		ret.Update(options)
+		regionId, _ = resp.GetString("region_id")
+		if len(regionId) == 0 {
+			regionId, _ = ret.GetString("default_region")
+		}
 	}
-	return ret
+	return regionId, ret
 }
 
 func (self *SCloudprovider) GetProvider(ctx context.Context, s *mcclient.ClientSession, id string) (cloudprovider.ICloudProvider, error) {
 	result, err := self.Get(s, id, jsonutils.Marshal(map[string]string{"scope": "system"}))
 	if err != nil {
-		return nil, errors.Wrap(err, "Cloudaccounts.Get")
+		return nil, errors.Wrap(err, "Cloudprovider.Get")
 	}
 	account := &SCloudDelegate{}
 	err = result.Unmarshal(account)
@@ -110,7 +117,7 @@ func (self *SCloudprovider) GetProvider(ctx context.Context, s *mcclient.ClientS
 		return nil, errors.Wrap(err, "result.Unmarshal")
 	}
 	if !account.Enabled {
-		log.Warningf("Cloud account %s is disabled", account.Name)
+		log.Warningf("Cloud provider %s is disabled", account.Name)
 	}
 
 	accessUrl := account.getAccessUrl()
@@ -130,8 +137,7 @@ func (self *SCloudprovider) GetProvider(ctx context.Context, s *mcclient.ClientS
 			return cfgProxyFunc(req.URL)
 		}
 	}
-	options := account.getOptions(ctx, s)
-	defaultRegion, _ := options.GetString("default_region")
+	regionId, options := account.getOptions(ctx, s)
 	return cloudprovider.GetProvider(cloudprovider.ProviderConfig{
 		Id:        account.Id,
 		Name:      account.Name,
@@ -143,8 +149,8 @@ func (self *SCloudprovider) GetProvider(ctx context.Context, s *mcclient.ClientS
 
 		ReadOnly: account.ReadOnly,
 
-		DefaultRegion: defaultRegion,
-		Options:       options.(*jsonutils.JSONDict),
+		RegionId: regionId,
+		Options:  options.(*jsonutils.JSONDict),
 
 		AccountId: account.Id,
 	})

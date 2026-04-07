@@ -19,37 +19,34 @@ import (
 	"database/sql"
 	"fmt"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/util/reflectutils"
 	"yunion.io/x/pkg/util/stringutils"
 	"yunion.io/x/pkg/util/timeutils"
 	"yunion.io/x/sqlchemy"
-	"yunion.io/x/sqlchemy/backends/clickhouse"
 
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
 type SOpsLogManager struct {
-	SModelBaseManager
+	SLogBaseManager
 }
 
 type SOpsLog struct {
-	SModelBase
+	SLogBase
 
-	Id      int64  `primary:"true" auto_increment:"true" list:"user" clickhouse_partition_by:"toInt64(divide(id,100000000000))"`
-	ObjType string `width:"40" charset:"ascii" nullable:"false" list:"user" create:"required"`
+	ObjType string `width:"40" charset:"ascii" nullable:"false" list:"user" create:"required" index:"true"`
 	ObjId   string `width:"128" charset:"ascii" nullable:"false" list:"user" create:"required" index:"true"`
 	ObjName string `width:"128" charset:"utf8" nullable:"false" list:"user" create:"required"`
 	Action  string `width:"32" charset:"utf8" nullable:"false" list:"user" create:"required"`
@@ -81,39 +78,19 @@ var _ IModel = (*SOpsLog)(nil)
 var opslogQueryWorkerMan *appsrv.SWorkerManager
 var opslogWriteWorkerMan *appsrv.SWorkerManager
 
-func InitOpsLog() {
-	if consts.OpsLogWithClickhouse {
-		OpsLog = &SOpsLogManager{NewModelBaseManagerWithDBName(
-			SOpsLog{},
-			"opslog_tbl",
-			"event",
-			"events",
-			ClickhouseDB,
-		)}
-		col := OpsLog.TableSpec().ColumnSpec("ops_time")
-		if clickCol, ok := col.(clickhouse.IClickhouseColumnSpec); ok {
-			clickCol.SetTTL(consts.SplitableMaxKeepMonths(), "MONTH")
-		}
-	} else {
-		OpsLog = &SOpsLogManager{NewModelBaseManagerWithSplitable(
-			SOpsLog{},
-			"opslog_tbl",
-			"event",
-			"events",
-			"id",
-			"ops_time",
-			consts.SplitableMaxDuration(),
-			consts.SplitableMaxKeepMonths(),
-		)}
+func NewOpsLogManager(opslog interface{}, tblName string, keyword, keywordPlural string, timeField string, clickhouse bool) SOpsLogManager {
+	return SOpsLogManager{
+		SLogBaseManager: NewLogBaseManager(opslog, tblName, keyword, keywordPlural, timeField, clickhouse),
 	}
+}
+
+func InitOpsLog() {
+	tmp := NewOpsLogManager(SOpsLog{}, "opslog_tbl", "event", "events", "ops_time", consts.OpsLogWithClickhouse)
+	OpsLog = &tmp
 	OpsLog.SetVirtualObject(OpsLog)
 
 	opslogQueryWorkerMan = appsrv.NewWorkerManager("opslog_query_worker", 2, 512, true)
 	opslogWriteWorkerMan = appsrv.NewWorkerManager("opslog_write_worker", 1, 2048, true)
-}
-
-func (manager *SOpsLogManager) CreateByInsertOrUpdate() bool {
-	return false
 }
 
 func (manager *SOpsLogManager) CustomizeHandlerInfo(info *appsrv.SHandlerInfo) {
@@ -123,35 +100,6 @@ func (manager *SOpsLogManager) CustomizeHandlerInfo(info *appsrv.SHandlerInfo) {
 	case "list":
 		info.SetProcessTimeout(time.Minute * 15).SetWorkerManager(opslogQueryWorkerMan)
 	}
-}
-
-func CurrentTimestamp(t time.Time) int64 {
-	ret := int64(0)
-	const (
-		yOffset = 10000000000000
-		mOffset = 100000000000
-		dOffset = 1000000000
-		hOffset = 10000000
-		iOffset = 100000
-		sOffset = 1000
-	)
-	ret += int64(t.Year()) * yOffset
-	ret += int64(t.Month()) * mOffset
-	ret += int64(t.Day()) * dOffset
-	ret += int64(t.Hour()) * hOffset
-	ret += int64(t.Minute()) * iOffset
-	ret += int64(t.Second()) * sOffset
-	ret += int64(t.Nanosecond()) / 1000000
-	return ret
-}
-
-func (opslog *SOpsLog) BeforeInsert() {
-	t := time.Now().UTC()
-	opslog.Id = CurrentTimestamp(t)
-}
-
-func (opslog *SOpsLog) GetId() string {
-	return fmt.Sprintf("%d", opslog.Id)
 }
 
 func (opslog *SOpsLog) GetName() string {
@@ -317,20 +265,6 @@ func (manager *SOpsLogManager) ListItemFilter(
 	userCred mcclient.TokenCredential,
 	input apis.OpsLogListInput,
 ) (*sqlchemy.SQuery, error) {
-	for idx, projectId := range input.OwnerProjectIds {
-		projObj, err := DefaultProjectFetcher(ctx, projectId)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				return nil, httperrors.NewResourceNotFoundError2("project", projectId)
-			} else {
-				return nil, httperrors.NewGeneralError(err)
-			}
-		}
-		input.OwnerProjectIds[idx] = projObj.GetId()
-	}
-	if len(input.OwnerProjectIds) > 0 {
-		q = q.Filter(sqlchemy.In(q.Field("owner_tenant_id"), input.OwnerProjectIds))
-	}
 	for idx, domainId := range input.OwnerDomainIds {
 		domainObj, err := DefaultDomainFetcher(ctx, domainId)
 		if err != nil {
@@ -344,6 +278,24 @@ func (manager *SOpsLogManager) ListItemFilter(
 	}
 	if len(input.OwnerDomainIds) > 0 {
 		q = q.Filter(sqlchemy.In(q.Field("owner_domain_id"), input.OwnerDomainIds))
+	}
+	for idx, projectId := range input.OwnerProjectIds {
+		domainId := ""
+		if len(input.OwnerDomainIds) == 1 {
+			domainId = input.OwnerDomainIds[0]
+		}
+		projObj, err := DefaultProjectFetcher(ctx, projectId, domainId)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return nil, httperrors.NewResourceNotFoundError2("project", projectId)
+			} else {
+				return nil, httperrors.NewGeneralError(err)
+			}
+		}
+		input.OwnerProjectIds[idx] = projObj.GetId()
+	}
+	if len(input.OwnerProjectIds) > 0 {
+		q = q.Filter(sqlchemy.In(q.Field("owner_tenant_id"), input.OwnerProjectIds))
 	}
 	if len(input.ObjTypes) > 0 {
 		if len(input.ObjTypes) == 1 {
@@ -410,35 +362,17 @@ func (manager *SOpsLogManager) LogSyncUpdate(m IModel, uds sqlchemy.UpdateDiffs,
 	}
 }
 
-func (self *SOpsLog) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
-	return httperrors.NewForbiddenError("not allow to delete log")
-}
-
-func (self *SOpsLogManager) FilterById(q *sqlchemy.SQuery, idStr string) *sqlchemy.SQuery {
-	id, _ := strconv.Atoi(idStr)
-	return q.Equals("id", id)
-}
-
-func (self *SOpsLogManager) FilterByNotId(q *sqlchemy.SQuery, idStr string) *sqlchemy.SQuery {
-	id, _ := strconv.Atoi(idStr)
-	return q.NotEquals("id", id)
-}
-
-func (self *SOpsLogManager) FilterByName(q *sqlchemy.SQuery, name string) *sqlchemy.SQuery {
-	return q
-}
-
-func (self *SOpsLogManager) FilterByOwner(q *sqlchemy.SQuery, ownerId mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
+func (self *SOpsLogManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if ownerId != nil {
 		switch scope {
-		case rbacutils.ScopeUser:
+		case rbacscope.ScopeUser:
 			if len(ownerId.GetUserId()) > 0 {
 				/*
 				 * 默认只能查看本人发起的操作
 				 */
 				q = q.Filter(sqlchemy.Equals(q.Field("user_id"), ownerId.GetUserId()))
 			}
-		case rbacutils.ScopeProject:
+		case rbacscope.ScopeProject:
 			if len(ownerId.GetProjectId()) > 0 {
 				/*
 				 * 项目视图可以查看本项目人员发起的操作，或者对本项目资源实施的操作, QIU Jian
@@ -448,7 +382,7 @@ func (self *SOpsLogManager) FilterByOwner(q *sqlchemy.SQuery, ownerId mcclient.I
 					sqlchemy.Equals(q.Field("owner_tenant_id"), ownerId.GetProjectId()),
 				))
 			}
-		case rbacutils.ScopeDomain:
+		case rbacscope.ScopeDomain:
 			if len(ownerId.GetProjectDomainId()) > 0 {
 				/*
 				 * 域视图可以查看本域人员发起的操作，或者对本域资源实施的操作, QIU Jian
@@ -483,16 +417,8 @@ func (self *SOpsLog) IsSharable(reqCred mcclient.IIdentityProvider) bool {
 	return false
 }
 
-func (manager *SOpsLogManager) ResourceScope() rbacutils.TRbacScope {
-	return rbacutils.ScopeUser
-}
-
-func (manager *SOpsLogManager) GetPagingConfig() *SPagingConfig {
-	return &SPagingConfig{
-		Order:        sqlchemy.SQL_ORDER_DESC,
-		MarkerFields: []string{"id"},
-		DefaultLimit: 20,
-	}
+func (manager *SOpsLogManager) ResourceScope() rbacscope.TRbacScope {
+	return rbacscope.ScopeUser
 }
 
 func (manager *SOpsLogManager) FetchOwnerId(ctx context.Context, data jsonutils.JSONObject) (mcclient.IIdentityProvider, error) {
@@ -533,6 +459,7 @@ func (log *SOpsLog) CustomizeCreate(ctx context.Context,
 	return log.SModelBase.CustomizeCreate(ctx, userCred, ownerId, query, data)
 }
 
+// override
 func (log *SOpsLog) GetRecordTime() time.Time {
 	return log.OpsTime
 }

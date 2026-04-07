@@ -17,11 +17,13 @@ package models
 import (
 	"fmt"
 
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 
 	"yunion.io/x/onecloud/pkg/apihelper"
 	computeapis "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/compute/models"
 	mcclient_modulebase "yunion.io/x/onecloud/pkg/mcclient/modulebase"
 	mcclient_modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 )
@@ -40,6 +42,7 @@ type (
 	Guestnetworks  map[string]*Guestnetwork  // key: rowId
 	Guestsecgroups map[string]*Guestsecgroup // key: guestId/secgroupId
 
+	DnsZones   map[string]*DnsZone
 	DnsRecords map[string]*DnsRecord
 
 	RouteTables map[string]*RouteTable
@@ -47,10 +50,18 @@ type (
 	Groupguests   map[string]*Groupguest
 	Groupnetworks map[string]*Groupnetwork
 	Groups        map[string]*Group
+
+	LoadbalancerNetworks  map[string]*LoadbalancerNetwork // key: networkId/loadbalancerId
+	LoadbalancerListeners map[string]*LoadbalancerListener
+	LoadbalancerAcls      map[string]*LoadbalancerAcl
 )
 
 func (set Vpcs) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.Vpcs
+}
+
+func (set Vpcs) DBModelManager() db.IModelManager {
+	return models.VpcManager
 }
 
 func (set Vpcs) NewModel() db.IModel {
@@ -68,6 +79,12 @@ func (set Vpcs) Copy() apihelper.IModelSet {
 		setCopy[id] = el.Copy()
 	}
 	return setCopy
+}
+
+func (set Vpcs) ModelParamFilter() jsonutils.JSONObject {
+	params := jsonutils.NewDict()
+	params.Add(jsonutils.NewString("OneCloud"), "provider")
+	return params
 }
 
 func (ms Vpcs) joinWires(subEntries Wires) bool {
@@ -149,6 +166,10 @@ func (set Wires) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.Wires
 }
 
+func (set Wires) DBModelManager() db.IModelManager {
+	return models.WireManager
+}
+
 func (set Wires) NewModel() db.IModel {
 	return &Wire{}
 }
@@ -170,6 +191,12 @@ func (set Wires) IncludeEmulated() bool {
 	return true
 }
 
+func (set Wires) ModelParamFilter() jsonutils.JSONObject {
+	params := jsonutils.NewDict()
+	params.Add(jsonutils.NewString("OneCloud"), "provider")
+	return params
+}
+
 func (ms Wires) joinNetworks(subEntries Networks) bool {
 	correct := true
 	for _, subEntry := range subEntries {
@@ -188,6 +215,10 @@ func (set Guests) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.Servers
 }
 
+func (set Guests) DBModelManager() db.IModelManager {
+	return models.GuestManager
+}
+
 func (set Guests) NewModel() db.IModel {
 	return &Guest{}
 }
@@ -203,6 +234,12 @@ func (set Guests) Copy() apihelper.IModelSet {
 		setCopy[id] = el.Copy()
 	}
 	return setCopy
+}
+
+func (set Guests) ModelParamFilter() jsonutils.JSONObject {
+	params := jsonutils.NewDict()
+	params.Add(jsonutils.NewString("OneCloud"), "provider")
+	return params
 }
 
 func (set Guests) initJoin() {
@@ -293,6 +330,10 @@ func (set Hosts) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.Hosts
 }
 
+func (set Hosts) DBModelManager() db.IModelManager {
+	return models.HostManager
+}
+
 func (set Hosts) NewModel() db.IModel {
 	return &Host{}
 }
@@ -310,8 +351,24 @@ func (set Hosts) Copy() apihelper.IModelSet {
 	return setCopy
 }
 
+func (set Hosts) ModelParamFilter() jsonutils.JSONObject {
+	params := jsonutils.NewDict()
+	params.Add(jsonutils.NewString("OneCloud"), "provider")
+	return params
+}
+
 func (set Networks) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.Networks
+}
+
+func (set Networks) DBModelManager() db.IModelManager {
+	return models.NetworkManager
+}
+
+func (set Networks) ModelParamFilter() jsonutils.JSONObject {
+	params := jsonutils.NewDict()
+	params.Add(jsonutils.NewString("OneCloud"), "provider")
+	return params
 }
 
 func (set Networks) NewModel() db.IModel {
@@ -353,6 +410,32 @@ func (ms Networks) joinGuestnetworks(subEntries Guestnetworks) bool {
 		}
 		subEntry.Network = m
 		m.Guestnetworks[subId] = subEntry
+	}
+	return true
+}
+
+func (ms Networks) joinLoadbalancerNetworks(subEntries LoadbalancerNetworks) bool {
+	for _, m := range ms {
+		m.LoadbalancerNetworks = LoadbalancerNetworks{}
+	}
+	for subEntryId, subEntry := range subEntries {
+		netId := subEntry.NetworkId
+		m, ok := ms[netId]
+		if !ok {
+			// this can happen for external loadbalancers
+			log.Warningf("cannot find network %s for loadblancer %s",
+				subEntry.NetworkId, subEntry.LoadbalancerId)
+			// so that we can ignore these for later stages
+			delete(subEntries, subEntryId)
+			continue
+		}
+		subId := subEntry.NetworkId + "/" + subEntry.LoadbalancerId
+		if _, ok := m.LoadbalancerNetworks[subId]; ok {
+			log.Warningf("loadbalancernetwork net/lb %s already joined", subId)
+			continue
+		}
+		subEntry.Network = m
+		m.LoadbalancerNetworks[subId] = subEntry
 	}
 	return true
 }
@@ -400,6 +483,10 @@ func (set Guestnetworks) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.Servernetworks
 }
 
+func (set Guestnetworks) DBModelManager() db.IModelManager {
+	return models.GuestnetworkManager
+}
+
 func (set Guestnetworks) NewModel() db.IModel {
 	return &Guestnetwork{}
 }
@@ -425,9 +512,8 @@ func (set Guestnetworks) joinGuests(subEntries Guests) bool {
 		if !ok {
 			if gn.Network != nil && gn.Network.Vpc != nil {
 				// Only log info instead of error because the
-				// guest could be in pending_deleted state
-				log.Infof("guestnetwork (net:%s,ip:%s) guest id %s not found",
-					gn.NetworkId, gn.IpAddr, gId)
+				// guest could be in pending_deleted state or guest is not a KVM
+				// log.Infof("guestnetwork (net:%s,ip:%s) guest id %s not found", gn.NetworkId, gn.IpAddr, gId)
 			}
 			continue
 		}
@@ -501,6 +587,10 @@ func (set NetworkAddresses) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.NetworkAddresses
 }
 
+func (set NetworkAddresses) DBModelManager() db.IModelManager {
+	return models.NetworkAddressManager
+}
+
 func (set NetworkAddresses) NewModel() db.IModel {
 	return &NetworkAddress{}
 }
@@ -520,6 +610,10 @@ func (set NetworkAddresses) Copy() apihelper.IModelSet {
 
 func (set SecurityGroups) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.SecGroups
+}
+
+func (set SecurityGroups) DBModelManager() db.IModelManager {
+	return models.SecurityGroupManager
 }
 
 func (set SecurityGroups) NewModel() db.IModel {
@@ -548,8 +642,8 @@ func (ms SecurityGroups) joinSecurityGroupRules(subEntries SecurityGroupRules) b
 		id := subEntry.SecgroupId
 		m, ok := ms[id]
 		if !ok {
-			log.Warningf("secgrouprule %s: secgroup %s not found",
-				subEntry.Id, id)
+			// log.Warningf("secgrouprule %s: secgroup %s not found",
+			// 	subEntry.Id, id)
 			// secgroup onpremise filter may filter out secgroup without any guest or host
 			// https://github.com/yunionio/cloudpods/pull/11781
 			// so ignore this error case
@@ -568,6 +662,10 @@ func (ms SecurityGroups) joinSecurityGroupRules(subEntries SecurityGroupRules) b
 
 func (set SecurityGroupRules) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.SecGroupRules
+}
+
+func (set SecurityGroupRules) DBModelManager() db.IModelManager {
+	return models.SecurityGroupRuleManager
 }
 
 func (set SecurityGroupRules) NewModel() db.IModel {
@@ -589,6 +687,10 @@ func (set SecurityGroupRules) Copy() apihelper.IModelSet {
 
 func (set Guestsecgroups) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.Serversecgroups
+}
+
+func (set Guestsecgroups) DBModelManager() db.IModelManager {
+	return models.GuestsecgroupManager
 }
 
 func (set Guestsecgroups) NewModel() db.IModel {
@@ -653,6 +755,10 @@ func (set Elasticips) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.Elasticips
 }
 
+func (set Elasticips) DBModelManager() db.IModelManager {
+	return models.ElasticipManager
+}
+
 func (set Elasticips) NewModel() db.IModel {
 	return &Elasticip{}
 }
@@ -674,8 +780,52 @@ func (set Elasticips) Copy() apihelper.IModelSet {
 	return setCopy
 }
 
+func (set DnsZones) ModelManager() mcclient_modulebase.IBaseManager {
+	return &mcclient_modules.DnsZones
+}
+
+func (set DnsZones) DBModelManager() db.IModelManager {
+	return models.DnsZoneManager
+}
+
+func (set DnsZones) NewModel() db.IModel {
+	return &DnsZone{}
+}
+
+func (set DnsZones) AddModel(i db.IModel) {
+	m := i.(*DnsZone)
+	set[m.Id] = m
+}
+
+func (set DnsZones) Copy() apihelper.IModelSet {
+	setCopy := DnsZones{}
+	for id, el := range set {
+		setCopy[id] = el.Copy()
+	}
+	return setCopy
+}
+
+func (ms DnsZones) joinRecords(subEntries DnsRecords) bool {
+	correct := true
+	for _, subEntry := range subEntries {
+		zoneId := subEntry.DnsZoneId
+		m, ok := ms[zoneId]
+		if !ok {
+			log.Warningf("dns_zone_id %s of record %s(%s) is not present", zoneId, subEntry.Name, subEntry.Id)
+			correct = false
+			continue
+		}
+		subEntry.DnsZone = m
+	}
+	return correct
+}
+
 func (set DnsRecords) ModelManager() mcclient_modulebase.IBaseManager {
-	return &mcclient_modules.DNSRecords
+	return &mcclient_modules.DnsRecords
+}
+
+func (set DnsRecords) DBModelManager() db.IModelManager {
+	return models.DnsRecordManager
 }
 
 func (set DnsRecords) NewModel() db.IModel {
@@ -699,6 +849,10 @@ func (set RouteTables) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.RouteTables
 }
 
+func (set RouteTables) DBModelManager() db.IModelManager {
+	return models.RouteTableManager
+}
+
 func (set RouteTables) NewModel() db.IModel {
 	return &RouteTable{}
 }
@@ -720,6 +874,10 @@ func (set Groupguests) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.InstanceGroupGuests
 }
 
+func (set Groupguests) DBModelManager() db.IModelManager {
+	return models.GroupguestManager
+}
+
 func (set Groupguests) NewModel() db.IModel {
 	return &Groupguest{}
 }
@@ -738,8 +896,38 @@ func (set Groupguests) Copy() apihelper.IModelSet {
 	return setCopy
 }
 
+func (set LoadbalancerNetworks) ModelManager() mcclient_modulebase.IBaseManager {
+	return &mcclient_modules.Loadbalancernetworks
+}
+
+func (set LoadbalancerNetworks) DBModelManager() db.IModelManager {
+	return models.LoadbalancernetworkManager
+}
+
+func (set LoadbalancerNetworks) NewModel() db.IModel {
+	return &LoadbalancerNetwork{}
+}
+
+func (set LoadbalancerNetworks) AddModel(i db.IModel) {
+	m := i.(*LoadbalancerNetwork)
+	k := fmt.Sprintf("%s/%s", m.NetworkId, m.LoadbalancerId)
+	set[k] = m
+}
+
+func (set LoadbalancerNetworks) Copy() apihelper.IModelSet {
+	setCopy := LoadbalancerNetworks{}
+	for id, el := range set {
+		setCopy[id] = el.Copy()
+	}
+	return setCopy
+}
+
 func (set Groupnetworks) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.InstancegroupNetworks
+}
+
+func (set Groupnetworks) DBModelManager() db.IModelManager {
+	return models.GroupnetworkManager
 }
 
 func (set Groupnetworks) NewModel() db.IModel {
@@ -791,6 +979,10 @@ func (set Groups) ModelManager() mcclient_modulebase.IBaseManager {
 	return &mcclient_modules.InstanceGroups
 }
 
+func (set Groups) DBModelManager() db.IModelManager {
+	return models.GroupManager
+}
+
 func (set Groups) NewModel() db.IModel {
 	return &Group{}
 }
@@ -809,19 +1001,141 @@ func (set Groups) Copy() apihelper.IModelSet {
 }
 
 func (set Groups) joinGroupnetworks(subEntries Groupnetworks, networks Networks) bool {
+	ret := true
 	for _, gn := range subEntries {
 		if network, ok := networks[gn.NetworkId]; ok {
 			gn.Network = network
 			gn.Network.Groupnetworks.AddModel(gn)
 		} else {
 			log.Errorf("Network %s not found for vip %s", gn.NetworkId, gn.IpAddr)
+			ret = false
 		}
-		if group, ok := set[gn.GroupId]; ok {
-			gn.Group = group
-			group.Groupnetworks.AddModel(gn)
-		} else {
-			log.Errorf("Network %s not found for vip %s", gn.GroupId, gn.IpAddr)
+		if _, ok := set[gn.GroupId]; !ok {
+			// no group was found, create one
+			grp := &Group{}
+			grp.Id = gn.GroupId
+			grp.Groupguests = Groupguests{}
+			grp.Groupnetworks = Groupnetworks{}
+			set.AddModel(grp)
+		}
+		group := set[gn.GroupId]
+		gn.Group = group
+		group.Groupnetworks.AddModel(gn)
+	}
+	return ret
+}
+
+func (set LoadbalancerNetworks) joinElasticips(subEntries Elasticips) bool {
+	correct := true
+
+	lnMap := map[string]*LoadbalancerNetwork{}
+	for _, m := range set {
+		lbId := m.LoadbalancerId
+		if old, ok := lnMap[lbId]; ok {
+			log.Errorf("loadbalancer %s is associated with more than 1 networks: %s, %s",
+				lbId, old.NetworkId, m.NetworkId)
+			correct = false
+			continue
+		}
+		lnMap[lbId] = m
+	}
+	for _, subEntry := range subEntries {
+		if subEntry.AssociateType != computeapis.EIP_ASSOCIATE_TYPE_LOADBALANCER {
+			continue
+		}
+		m, ok := lnMap[subEntry.AssociateId]
+		if !ok {
+			log.Errorf("elasticip %s(%s) associated with non-existent loadbalancer %s",
+				subEntry.Name, subEntry.Id, subEntry.AssociateId)
+			correct = false
+			continue
+		}
+		subEntry.LoadbalancerNetwork = m
+		m.Elasticip = subEntry
+	}
+	return correct
+}
+
+func (set LoadbalancerNetworks) joinLoadbalancerListeners(subEntries LoadbalancerListeners) bool {
+	lbListeners := map[string]LoadbalancerListeners{}
+	for subId, subEntry := range subEntries {
+		lbId := subEntry.LoadbalancerId
+		v, ok := lbListeners[lbId]
+		if !ok {
+			v = LoadbalancerListeners{}
+			lbListeners[lbId] = v
+		}
+		v[subId] = subEntry
+	}
+
+	for _, m := range set {
+		lbId := m.LoadbalancerId
+		m.LoadbalancerListeners = lbListeners[lbId]
+	}
+	return true
+}
+
+func (set LoadbalancerListeners) ModelManager() mcclient_modulebase.IBaseManager {
+	return &mcclient_modules.LoadbalancerListeners
+}
+
+func (set LoadbalancerListeners) DBModelManager() db.IModelManager {
+	return models.LoadbalancerListenerManager
+}
+
+func (set LoadbalancerListeners) NewModel() db.IModel {
+	return &LoadbalancerListener{}
+}
+
+func (set LoadbalancerListeners) AddModel(i db.IModel) {
+	m := i.(*LoadbalancerListener)
+	set[m.Id] = m
+}
+
+func (set LoadbalancerListeners) Copy() apihelper.IModelSet {
+	setCopy := LoadbalancerListeners{}
+	for id, el := range set {
+		setCopy[id] = el.Copy()
+	}
+	return setCopy
+}
+
+func (set LoadbalancerListeners) joinLoadbalancerAcls(subEntries LoadbalancerAcls) bool {
+	for _, m := range set {
+		if m.AclStatus != computeapis.LB_BOOL_ON {
+			continue
+		}
+		switch m.AclType {
+		case computeapis.LB_ACL_TYPE_WHITE,
+			computeapis.LB_ACL_TYPE_BLACK:
+			lbacl := subEntries[m.AclId]
+			m.LoadbalancerAcl = lbacl
 		}
 	}
 	return true
+}
+
+func (set LoadbalancerAcls) ModelManager() mcclient_modulebase.IBaseManager {
+	return &mcclient_modules.LoadbalancerAcls
+}
+
+func (set LoadbalancerAcls) DBModelManager() db.IModelManager {
+	return models.LoadbalancerAclManager
+}
+
+func (set LoadbalancerAcls) NewModel() db.IModel {
+	return &LoadbalancerAcl{}
+}
+
+func (set LoadbalancerAcls) AddModel(i db.IModel) {
+	m := i.(*LoadbalancerAcl)
+	set[m.Id] = m
+}
+
+func (set LoadbalancerAcls) Copy() apihelper.IModelSet {
+	setCopy := LoadbalancerAcls{}
+	for id, el := range set {
+		setCopy[id] = el.Copy()
+	}
+	return setCopy
 }

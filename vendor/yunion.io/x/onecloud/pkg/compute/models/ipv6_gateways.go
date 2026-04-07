@@ -17,9 +17,11 @@ package models
 import (
 	"context"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
@@ -28,10 +30,9 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
 	"yunion.io/x/onecloud/pkg/cloudcommon/policy"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
+	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -81,7 +82,13 @@ func (self *SVpc) GetIPv6Gateways() ([]SIPv6Gateway, error) {
 	return ret, err
 }
 
-func (self *SVpc) SyncIPv6Gateways(ctx context.Context, userCred mcclient.TokenCredential, exts []cloudprovider.ICloudIPv6Gateway, provider *SCloudprovider) compare.SyncResult {
+func (self *SVpc) SyncIPv6Gateways(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	exts []cloudprovider.ICloudIPv6Gateway,
+	provider *SCloudprovider,
+	xor bool,
+) compare.SyncResult {
 	lockman.LockRawObject(ctx, IPv6GatewayManager.Keyword(), self.Id)
 	defer lockman.ReleaseRawObject(ctx, IPv6GatewayManager.Keyword(), self.Id)
 
@@ -112,13 +119,15 @@ func (self *SVpc) SyncIPv6Gateways(ctx context.Context, userCred mcclient.TokenC
 			result.Delete()
 		}
 	}
-	for i := 0; i < len(commondb); i += 1 {
-		err = commondb[i].SyncWithCloudIPv6Gateway(ctx, userCred, commonext[i], provider)
-		if err != nil {
-			result.UpdateError(err)
-			continue
+	if !xor {
+		for i := 0; i < len(commondb); i += 1 {
+			err = commondb[i].SyncWithCloudIPv6Gateway(ctx, userCred, commonext[i], provider)
+			if err != nil {
+				result.UpdateError(err)
+				continue
+			}
+			result.Update()
 		}
-		result.Update()
 	}
 	for i := 0; i < len(added); i += 1 {
 		_, err := self.newFromCloudIPv6Gateway(ctx, userCred, added[i], provider)
@@ -138,7 +147,7 @@ func (self *SIPv6Gateway) syncRemoveCloudIPv6Gateway(ctx context.Context, userCr
 
 	err := self.ValidateDeleteCondition(ctx, nil)
 	if err != nil { // cannot delete
-		self.SetStatus(userCred, api.NETWORK_STATUS_UNKNOWN, "Sync to remove")
+		self.SetStatus(ctx, userCred, api.NETWORK_STATUS_UNKNOWN, "Sync to remove")
 		return err
 	}
 	return self.RealDelete(ctx, userCred)
@@ -146,6 +155,13 @@ func (self *SIPv6Gateway) syncRemoveCloudIPv6Gateway(ctx context.Context, userCr
 
 func (self *SIPv6Gateway) SyncWithCloudIPv6Gateway(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudIPv6Gateway, provider *SCloudprovider) error {
 	diff, err := db.Update(self, func() error {
+		if options.Options.EnableSyncName {
+			newName, _ := db.GenerateAlterName(self, ext.GetName())
+			if len(newName) > 0 {
+				self.Name = newName
+			}
+		}
+
 		self.Status = ext.GetStatus()
 		self.InstanceType = ext.GetInstanceType()
 		return nil
@@ -161,8 +177,11 @@ func (self *SIPv6Gateway) SyncWithCloudIPv6Gateway(ctx context.Context, userCred
 		})
 	}
 
-	syncVirtualResourceMetadata(ctx, userCred, self, ext)
-	SyncCloudProject(userCred, self, provider.GetOwnerId(), ext, provider.Id)
+	if account, _ := provider.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, self, ext, account.ReadOnly)
+	}
+
+	SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider)
 	return nil
 }
 
@@ -194,8 +213,8 @@ func (self *SVpc) newFromCloudIPv6Gateway(ctx context.Context, userCred mcclient
 		return nil, errors.Wrapf(err, "Insert")
 	}
 
-	syncVirtualResourceMetadata(ctx, userCred, ret, ext)
-	SyncCloudProject(userCred, ret, provider.GetOwnerId(), ext, self.ManagerId)
+	syncVirtualResourceMetadata(ctx, userCred, ret, ext, false)
+	SyncCloudProject(ctx, userCred, ret, provider.GetOwnerId(), ext, provider)
 
 	db.OpsLog.LogEvent(ret, db.ACT_CREATE, ret.GetShortDesc(ctx), userCred)
 	notifyclient.EventNotify(ctx, userCred, notifyclient.SEventNotifyParam{
@@ -237,7 +256,7 @@ func (self *SIPv6Gateway) ValidateUpdateData(ctx context.Context, userCred mccli
 }
 
 func (self *SIPv6Gateway) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
-	self.SetStatus(userCred, apis.STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, apis.STATUS_DELETING, "")
 	return nil
 }
 
@@ -329,7 +348,7 @@ func (manager *SIPv6GatewayManager) ListItemExportKeys(ctx context.Context,
 	return q, nil
 }
 
-func (manager *SIPv6GatewayManager) AllowScope(userCred mcclient.TokenCredential) rbacutils.TRbacScope {
+func (manager *SIPv6GatewayManager) AllowScope(userCred mcclient.TokenCredential) rbacscope.TRbacScope {
 	scope, _ := policy.PolicyManager.AllowScope(userCred, api.SERVICE_TYPE, IPv6GatewayManager.KeywordPlural(), policy.PolicyActionGet)
 	return scope
 }

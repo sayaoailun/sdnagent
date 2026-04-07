@@ -17,6 +17,7 @@ package models
 import (
 	"context"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
@@ -25,7 +26,6 @@ import (
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
@@ -39,9 +39,7 @@ type SAppEnvironment struct {
 	db.SVirtualResourceBase
 	db.SExternalizedResourceBase
 
-	AppId          string `width:"36" charset:"ascii" index:"true"`
-	InstanceType   string `width:"16" charset:"ascii" index:"true" get:"user" list:"user"`
-	InstanceNumber int    `get:"user" list:"user"`
+	AppId string `width:"36" charset:"ascii" index:"true"`
 }
 
 var AppEnvironmentManager *SAppEnvironmentManager
@@ -163,15 +161,6 @@ func (a *SApp) newFromCloudAppEnvironment(ctx context.Context, userCred mcclient
 	appEnvironment.ExternalId = ext.GetGlobalId()
 	appEnvironment.IsEmulated = ext.IsEmulated()
 	appEnvironment.Status = ext.GetStatus()
-	appEnvironment.InstanceType, err = ext.GetInstanceType()
-	if err != nil {
-		return nil, errors.Wrap(err, "unable to GetInsntaceType")
-	}
-
-	appEnvironment.InstanceNumber, err = ext.GetInstanceNumber()
-	if err != nil {
-		return nil, errors.Wrap(err, "unable to GetInstanceNumber")
-	}
 
 	appEnvironment.Name = ext.GetName()
 	appEnvironment.AppId = a.Id
@@ -180,7 +169,7 @@ func (a *SApp) newFromCloudAppEnvironment(ctx context.Context, userCred mcclient
 		return nil, errors.Wrapf(err, "newFromCloudAppEnvironment.Insert")
 	}
 
-	SyncCloudProject(userCred, &appEnvironment, provider.GetOwnerId(), ext, provider.Id)
+	SyncCloudProject(ctx, userCred, &appEnvironment, provider.GetOwnerId(), ext, provider)
 	db.OpsLog.LogEvent(&appEnvironment, db.ACT_CREATE, appEnvironment.GetShortDesc(ctx), userCred)
 	return nil, nil
 }
@@ -191,17 +180,8 @@ func (ae *SAppEnvironment) syncRemoveCloudAppEnvironment(ctx context.Context, us
 
 func (ae *SAppEnvironment) SyncWithCloudAppEnvironment(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudAppEnvironment) error {
 	_, err := db.UpdateWithLock(ctx, ae, func() error {
-		var err error
 		ae.ExternalId = ext.GetGlobalId()
 		ae.Status = ext.GetStatus()
-		ae.InstanceType, err = ext.GetInstanceType()
-		if err != nil {
-			return err
-		}
-		ae.InstanceNumber, err = ext.GetInstanceNumber()
-		if err != nil {
-			return err
-		}
 		return nil
 	})
 	if err != nil {

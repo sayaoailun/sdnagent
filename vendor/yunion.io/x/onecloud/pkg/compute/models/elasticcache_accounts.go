@@ -18,10 +18,12 @@ import (
 	"context"
 	"fmt"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
@@ -31,11 +33,9 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/choices"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/seclib2"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
@@ -197,16 +197,16 @@ func (manager *SElasticcacheAccountManager) FetchUniqValues(ctx context.Context,
 	return jsonutils.Marshal(map[string]string{"elasticcache_id": cacheId})
 }
 
-func (manager *SElasticcacheAccountManager) ResourceScope() rbacutils.TRbacScope {
-	return rbacutils.ScopeProject
+func (manager *SElasticcacheAccountManager) ResourceScope() rbacscope.TRbacScope {
+	return rbacscope.ScopeProject
 }
 
 func (manager *SElasticcacheAccountManager) FetchOwnerId(ctx context.Context, data jsonutils.JSONObject) (mcclient.IIdentityProvider, error) {
 	return elasticcacheSubResourceFetchOwnerId(ctx, data)
 }
 
-func (manager *SElasticcacheAccountManager) FilterByOwner(q *sqlchemy.SQuery, userCred mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
-	return elasticcacheSubResourceFetchOwner(q, userCred, scope)
+func (manager *SElasticcacheAccountManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	return elasticcacheSubResourceFetchOwner(ctx, q, ownerId, scope)
 }
 
 func (manager *SElasticcacheAccountManager) FilterByUniqValues(q *sqlchemy.SQuery, values jsonutils.JSONObject) *sqlchemy.SQuery {
@@ -220,7 +220,7 @@ func (manager *SElasticcacheAccountManager) FilterByUniqValues(q *sqlchemy.SQuer
 func (manager *SElasticcacheAccountManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
 	var region *SCloudregion
 	if id, _ := data.GetString("elasticcache"); len(id) > 0 {
-		ec, err := db.FetchByIdOrName(ElasticcacheManager, userCred, id)
+		ec, err := db.FetchByIdOrName(ctx, ElasticcacheManager, userCred, id)
 		if err != nil {
 			return nil, fmt.Errorf("getting elastic cache instance failed")
 		}
@@ -256,7 +256,7 @@ func (self *SElasticcacheAccount) PostCreate(ctx context.Context, userCred mccli
 		self.SavePassword(self.Password)
 	}
 
-	self.SetStatus(userCred, api.ELASTIC_CACHE_ACCOUNT_STATUS_CREATING, "")
+	self.SetStatus(ctx, userCred, api.ELASTIC_CACHE_ACCOUNT_STATUS_CREATING, "")
 	if err := self.StartElasticcacheAccountCreateTask(ctx, userCred, data.(*jsonutils.JSONDict), ""); err != nil {
 		log.Errorf("Failed to create elastic account cache error: %v", err)
 	}
@@ -441,7 +441,7 @@ func (self *SElasticcacheAccount) GetDecodedPassword() (string, error) {
 }
 
 func (self *SElasticcacheAccount) CustomizeDelete(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) error {
-	self.SetStatus(userCred, api.ELASTIC_CACHE_ACCOUNT_STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, api.ELASTIC_CACHE_ACCOUNT_STATUS_DELETING, "")
 	return self.StartDeleteElasticcacheAccountTask(ctx, userCred, jsonutils.NewDict(), "")
 }
 
@@ -475,14 +475,14 @@ func (self *SElasticcacheAccount) ValidatorResetPasswordData(ctx context.Context
 	}
 
 	privilegeV := validators.NewStringChoicesValidator("account_privilege", choices.NewChoices(api.ELASTIC_CACHE_ACCOUNT_PRIVILEGE_READ, api.ELASTIC_CACHE_ACCOUNT_PRIVILEGE_WRITE, api.ELASTIC_CACHE_ACCOUNT_PRIVILEGE_REPL)).Optional(true)
-	if err := privilegeV.Validate(data.(*jsonutils.JSONDict)); err != nil {
+	if err := privilegeV.Validate(ctx, data.(*jsonutils.JSONDict)); err != nil {
 		return nil, err
 	}
 	return data, nil
 }
 
 func (self *SElasticcacheAccount) PerformResetPassword(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {
-	self.SetStatus(userCred, api.ELASTIC_CACHE_STATUS_CHANGING, "")
+	self.SetStatus(ctx, userCred, api.ELASTIC_CACHE_STATUS_CHANGING, "")
 	data, err := self.ValidatorResetPasswordData(ctx, userCred, query, data)
 	if err != nil {
 		return nil, err
@@ -506,10 +506,6 @@ func (self *SElasticcacheAccount) GetDetailsLoginInfo(ctx context.Context, userC
 	ret.Add(jsonutils.NewString(self.Name), "username")
 	ret.Add(jsonutils.NewString(self.Password), "password")
 	return ret, nil
-}
-
-func (self *SElasticcacheAccount) ValidatePurgeCondition(ctx context.Context) error {
-	return nil
 }
 
 // 弹性缓存账号列表

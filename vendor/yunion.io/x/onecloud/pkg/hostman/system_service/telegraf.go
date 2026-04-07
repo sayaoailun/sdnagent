@@ -21,8 +21,11 @@ import (
 	"strings"
 
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
 
-	"yunion.io/x/onecloud/pkg/util/httputils"
+	"yunion.io/x/onecloud/pkg/apis"
+	"yunion.io/x/onecloud/pkg/util/procutils"
 )
 
 type STelegraf struct {
@@ -49,7 +52,14 @@ func (s *STelegraf) GetConfig(kwargs map[string]interface{}) string {
 	}
 	conf += "\n"
 	conf += "[agent]\n"
-	conf += "  interval = \"60s\"\n"
+	intVal := 60
+	if v, ok := kwargs["interval"]; ok {
+		intvalInt, _ := v.(int)
+		if intvalInt > 0 {
+			intVal = intvalInt
+		}
+	}
+	conf += fmt.Sprintf("  interval = \"%ds\"\n", intVal)
 	conf += "  round_interval = true\n"
 	conf += "  metric_batch_size = 1000\n"
 	conf += "  metric_buffer_limit = 10000\n"
@@ -67,11 +77,17 @@ func (s *STelegraf) GetConfig(kwargs map[string]interface{}) string {
 	conf += fmt.Sprintf("  hostname = \"%s\"\n", hostname)
 	conf += "  omit_hostname = false\n"
 	conf += "\n"
-	if ifluxb, ok := kwargs["influxdb"]; ok {
-		influxdb, _ := ifluxb.(map[string]interface{})
+	if influx, ok := kwargs[apis.SERVICE_TYPE_INFLUXDB]; ok {
+		influxdb, _ := influx.(map[string]interface{})
 		inUrls, _ := influxdb["url"]
 		tUrls, _ := inUrls.([]string)
 		inDatabase, _ := influxdb["database"]
+		isVM := false
+		if tsdbType, ok := influxdb["tsdb_type"]; ok {
+			if tsdbType.(string) == apis.SERVICE_TYPE_VICTORIA_METRICS {
+				isVM = true
+			}
+		}
 		tdb, _ := inDatabase.(string)
 		urls := []string{}
 		for _, u := range tUrls {
@@ -81,29 +97,10 @@ func (s *STelegraf) GetConfig(kwargs map[string]interface{}) string {
 		conf += fmt.Sprintf("  urls = [%s]\n", strings.Join(urls, ", "))
 		conf += fmt.Sprintf("  database = \"%s\"\n", tdb)
 		conf += "  insecure_skip_verify = true\n"
-		conf += "  timeout = \"30s\"\n"
-		conf += "\n"
-	}
-	if kafka, ok := kwargs["kafka"]; ok {
-		ka, _ := kafka.(map[string]interface{})
-		bks, _ := ka["brokers"]
-		tbk, _ := bks.([]string)
-		brokers := []string{}
-		for _, b := range tbk {
-			brokers = append(brokers, fmt.Sprintf("\"%s\"", b[len("kafka://\n"):]))
+		if isVM {
+			conf += "  skip_database_creation = true\n"
 		}
-		conf += "[[outputs.kafka]]\n"
-		conf += fmt.Sprintf("  brokers = [%s]\n", strings.Join(brokers, ", "))
-
-		topic, _ := ka["topic"]
-		itopic, _ := topic.(string)
-		conf += fmt.Sprintf("  topic = \"%s\"\n", itopic)
-		conf += "  compression_codec = 0\n"
-		conf += "  required_acks = -1\n"
-		conf += "  max_retry = 3\n"
-		conf += "  data_format = \"json\"\n"
-		conf += "  json_timestamp_units = \"1ms\"\n"
-		conf += "  routing_tag = \"host\"\n"
+		conf += "  timeout = \"30s\"\n"
 		conf += "\n"
 	}
 	conf += "[[inputs.cpu]]\n"
@@ -113,8 +110,8 @@ func (s *STelegraf) GetConfig(kwargs map[string]interface{}) string {
 	conf += "  report_active = true\n"
 	conf += "\n"
 	conf += "[[inputs.disk]]\n"
-	conf += "  ignore_mount_points = [\"/etc/telegraf\", \"/etc/hosts\", \"/etc/hostname\", \"/etc/resolv.conf\", \"/dev/termination-log\"]"
-	conf += "  ignore_fs = [\"tmpfs\", \"devtmpfs\", \"overlay\", \"squashfs\", \"iso9660\", \"rootfs\"]\n"
+	conf += "  ignore_mount_points = [\"/etc/telegraf\", \"/etc/hosts\", \"/etc/hostname\", \"/etc/resolv.conf\", \"/dev/termination-log\"]\n"
+	conf += "  ignore_fs = [\"tmpfs\", \"devtmpfs\", \"overlay\", \"squashfs\", \"iso9660\", \"rootfs\", \"hugetlbfs\", \"autofs\"]\n"
 	conf += "\n"
 	conf += "[[inputs.diskio]]\n"
 	conf += "  skip_serial_number = false\n"
@@ -147,12 +144,9 @@ func (s *STelegraf) GetConfig(kwargs map[string]interface{}) string {
 		conf += fmt.Sprintf("  interfaces = [%s]\n", strings.Join(infs, ", "))
 		conf += "\n"
 		for _, n := range ns {
-			iname, _ := n["name"]
-			name, _ := iname.(string)
-			ialias, _ := n["alias"]
-			alias, _ := ialias.(string)
-			ispeed, _ := n["speed"]
-			speed, _ := ispeed.(int)
+			name, _ := n["name"].(string)
+			alias, _ := n["alias"].(string)
+			speed, _ := n["speed"].(int)
 
 			conf += "  [[inputs.net.interface_conf]]\n"
 			conf += fmt.Sprintf("    name = \"%s\"\n", name)
@@ -183,6 +177,16 @@ func (s *STelegraf) GetConfig(kwargs map[string]interface{}) string {
 	conf += "  data_source = \"body\"\n"
 	conf += "  data_format = \"influx\"\n"
 	conf += "\n"
+	if haproxyConf, ok := kwargs["haproxy"]; ok {
+		haproxyConfMap, _ := haproxyConf.(map[string]interface{})
+		haIntVal, _ := haproxyConfMap["interval"].(int)
+		statsSocket, _ := haproxyConfMap["stats_socket_path"].(string)
+		conf += "[[inputs.haproxy]]\n"
+		conf += fmt.Sprintf("  interval = \"%ds\"\n", haIntVal)
+		conf += fmt.Sprintf("  servers = [\"%s\"]\n", statsSocket)
+		conf += "  keep_field_names = true\n"
+		conf += "\n"
+	}
 	return conf
 }
 
@@ -214,11 +218,43 @@ func (s *STelegraf) BgReloadConf(kwargs map[string]interface{}) {
 }
 
 func (s *STelegraf) ReloadTelegraf() error {
-	log.Infof("Start reolad telegraf...")
+	log.Infof("Start reloading telegraf...")
+	errs := []error{}
+	if err := s.reloadTelegrafByDocker(); err != nil {
+		errs = append(errs, errors.Wrap(err, "reloadTelegrafByDocker"))
+		if err := s.reloadTelegrafByHTTP(); err != nil {
+			errs = append(errs, errors.Wrap(err, "reloadTelegrafByHTTP"))
+			return errors.NewAggregate(errs)
+		}
+	}
+	log.Infof("Finish reloading telegraf")
+	return nil
+}
+
+func (s *STelegraf) reloadTelegrafByDocker() error {
+	log.Infof("Reloading telegraf by docker...")
+	output, err := procutils.NewRemoteCommandAsFarAsPossible("sh", "-c", "/usr/bin/docker ps --filter 'label=io.kubernetes.container.name=telegraf' --format '{{.ID}}'").Output()
+	if err != nil {
+		return errors.Wrap(err, "using docker ps find telegraf container")
+	}
+	id := strings.TrimSpace(string(output))
+	if len(id) == 0 {
+		return errors.Errorf("not found telegraf running container")
+	}
+	if err := procutils.NewRemoteCommandAsFarAsPossible("sh", "-c", "/usr/bin/docker restart "+id).Run(); err != nil {
+		return errors.Wrapf(err, "restart telegraf container %q", id)
+	}
+	return nil
+}
+
+func (s *STelegraf) reloadTelegrafByHTTP() error {
 	telegrafReoladUrl := "http://127.0.0.1:8087/reload"
-	_, _, err := httputils.JSONRequest(
+	log.Infof("Reloading telegraf by %q ...", telegrafReoladUrl)
+	if _, _, err := httputils.JSONRequest(
 		httputils.GetDefaultClient(), context.Background(),
 		"POST", telegrafReoladUrl, nil, nil, false,
-	)
-	return err
+	); err != nil {
+		return errors.Wrap(err, "reload telegraf by http reload api")
+	}
+	return nil
 }

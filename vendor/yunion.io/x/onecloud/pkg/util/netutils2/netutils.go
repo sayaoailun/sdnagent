@@ -21,9 +21,9 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
-	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/netutils"
@@ -34,7 +34,8 @@ import (
 )
 
 var PSEUDO_VIP = "169.254.169.231"
-var MASKS = []string{"0", "128", "192", "224", "240", "248", "252", "254", "255"}
+
+// var MASKS = []string{"0", "128", "192", "224", "240", "248", "252", "254", "255"}
 
 var PRIVATE_PREFIXES = []string{
 	"10.0.0.0/8",
@@ -43,16 +44,7 @@ var PRIVATE_PREFIXES = []string{
 }
 
 func GetFreePort() (int, error) {
-	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
-	if err != nil {
-		return 0, err
-	}
-	l, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
+	return netutils.GetFreePort()
 }
 
 func IsTcpPortUsed(addr string, port int) bool {
@@ -135,117 +127,65 @@ func GetMainNicFromDeployApi(nics []*types.SServerNic) (*types.SServerNic, error
 	return nil, errors.Wrap(errors.ErrInvalidStatus, "no valid nic")
 }
 
-func GetMainNic(nics []jsonutils.JSONObject) (jsonutils.JSONObject, error) {
-	var mainIp netutils.IPV4Addr
-	var mainNic jsonutils.JSONObject
-	for _, n := range nics {
-		if n.Contains("gateway") {
-			ip, _ := n.GetString("ip")
-			ipInt, err := netutils.NewIPV4Addr(ip)
-			if err != nil {
-				return nil, err
-			}
-			if mainIp == 0 {
-				mainIp = ipInt
-				mainNic = n
-			} else if !netutils.IsPrivate(ipInt) && netutils.IsPrivate(mainIp) {
-				mainIp = ipInt
-				mainNic = n
-			}
-		}
-	}
-	if mainNic != nil {
-		return mainNic, nil
-	}
-	for _, n := range nics {
-		ip, _ := n.GetString("ip")
-		ipInt, err := netutils.NewIPV4Addr(ip)
-		if err != nil {
-			return nil, errors.Wrapf(err, "netutils.NewIPV4Addr %s", ip)
-		}
-		if mainIp == 0 {
-			mainIp = ipInt
-			mainNic = n
-		} else if !netutils.IsPrivate(ipInt) && netutils.IsPrivate(mainIp) {
-			mainIp = ipInt
-			mainNic = n
-		}
-	}
-	if mainNic != nil {
-		return mainNic, nil
-	}
-	return nil, errors.Wrap(errors.ErrInvalidStatus, "no valid nic")
-}
-
 func Netlen2Mask(netmasklen int) string {
-	var mask = ""
-	var segCnt = 0
-	for netmasklen > 0 {
-		var m string
-		if netmasklen > 8 {
-			m = MASKS[8]
-			netmasklen -= 8
-		} else {
-			m = MASKS[netmasklen]
-			netmasklen = 0
-		}
-		if mask != "" {
-			mask += "."
-		}
-		mask += m
-		segCnt += 1
-	}
-	for i := 0; i < (4 - segCnt); i++ {
-		if mask != "" {
-			mask += "."
-		}
-		mask += "0"
-	}
-	return mask
+	return netutils.Netlen2Mask(netmasklen)
 }
 
-func addRoute(routes *[][]string, net, gw string) {
-	for _, rt := range *routes {
+func addRoute(routes [][]string, net, gw string) [][]string {
+	for _, rt := range routes {
 		if rt[0] == net {
-			return
+			return routes
 		}
 	}
-	*routes = append(*routes, []string{net, gw})
+	return append(routes, []string{net, gw})
 }
 
-func extendRoutes(routes *[][]string, nicRoutes []types.SRoute) error {
+func extendRoutes(routes [][]string, nicRoutes []types.SRoute) [][]string {
 	for i := 0; i < len(nicRoutes); i++ {
-		addRoute(routes, nicRoutes[i][0], nicRoutes[i][1])
+		routes = addRoute(routes, nicRoutes[i][0], nicRoutes[i][1])
 	}
-	return nil
+	return routes
 }
 
 func isExitAddress(ip string) bool {
 	ipv4, err := netutils.NewIPV4Addr(ip)
 	if err != nil {
+		log.Errorf("NewIPV4Addr %s fail %s", ip, err)
 		return false
 	}
-	return !netutils.IsPrivate(ipv4) || netutils.IsHostLocal(ipv4) || netutils.IsLinkLocal(ipv4)
+	return netutils.IsExitAddress(ipv4)
 }
 
-func AddNicRoutes(routes *[][]string, nicDesc *types.SServerNic, mainIp string, nicCnt int, privatePrefixes []string) {
-	if mainIp == nicDesc.Ip {
-		return
-	}
+func AddNicRoutes(routes [][]string, nicDesc *types.SServerNic, mainIp string, nicCnt int) [][]string {
+	// always add static routes, even if this is the default NIC
+	// if mainIp == nicDesc.Ip {
+	// 	return routes
+	// }
 	if len(nicDesc.Routes) > 0 {
-		extendRoutes(routes, nicDesc.Routes)
+		routes = extendRoutes(routes, nicDesc.Routes)
 	} else if len(nicDesc.Gateway) > 0 && !isExitAddress(nicDesc.Ip) &&
 		nicCnt == 2 && nicDesc.Ip != mainIp && isExitAddress(mainIp) {
-		for _, pref := range GetPrivatePrefixes(privatePrefixes) {
-			addRoute(routes, pref, nicDesc.Gateway)
+		for _, pref := range netutils.GetPrivateIPRanges() {
+			prefs := pref.ToPrefixes()
+			for _, p := range prefs {
+				routes = addRoute(routes, p.String(), nicDesc.Gateway)
+			}
 		}
 	}
+
+	if nicDesc.Ip == mainIp {
+		// always add 169.254.169.254 for default NIC
+		routes = addRoute(routes, "169.254.169.254/32", "0.0.0.0")
+	}
+	return routes
 }
 
 func GetNicDns(nicdesc *types.SServerNic) []string {
 	dnslist := []string{}
 	if len(nicdesc.Dns) > 0 {
-		dnslist = append(dnslist, nicdesc.Dns)
+		for _, dns := range strings.Split(nicdesc.Dns, ",") {
+			dnslist = append(dnslist, dns)
+		}
 	}
 	return dnslist
 }
@@ -266,9 +206,15 @@ type SNetInterface struct {
 	name string
 	Addr string
 	Mask net.IPMask
-	Mac  string
+	mac  string
 
 	Mtu int
+
+	VlanId     int
+	VlanParent *SNetInterface
+
+	BondingMode   int
+	BondingSlaves []*SNetInterface
 }
 
 var (
@@ -317,7 +263,7 @@ func (n *SNetInterface) FetchConfig() {
 func (n *SNetInterface) fetchConfig(expectIp string) {
 	n.Addr = ""
 	n.Mask = nil
-	n.Mac = ""
+	n.mac = ""
 	// n.Mtu = 0
 	inter := n.FetchInter()
 	if inter == nil {
@@ -326,7 +272,7 @@ func (n *SNetInterface) fetchConfig(expectIp string) {
 
 	n.Mtu = inter.MTU
 
-	n.Mac = inter.HardwareAddr.String()
+	n.mac = inter.HardwareAddr.String()
 	addrs, err := inter.Addrs()
 	if err == nil {
 		for _, addr := range addrs {
@@ -344,6 +290,43 @@ func (n *SNetInterface) fetchConfig(expectIp string) {
 		}
 	}
 
+	// check vlanId
+	vlanConf := getVlanConfig(n.name)
+	if vlanConf != nil {
+		n.VlanId = vlanConf.VlanId
+		n.VlanParent = NewNetInterface(vlanConf.Parent)
+	} else {
+		n.VlanId = 1
+		n.VlanParent = nil
+	}
+
+	// check bonding
+	bondingConf := getBondingConfig(n.name)
+	if bondingConf != nil {
+		n.BondingMode = bondingConf.Mode
+		for _, slave := range bondingConf.Slaves {
+			n.BondingSlaves = append(n.BondingSlaves, NewNetInterface(slave))
+		}
+	}
+}
+
+func (n *SNetInterface) GetMac() string {
+	return n.mac
+}
+
+func (n *SNetInterface) GetAllMacs() []string {
+	macs := make([]string, 0, len(n.BondingSlaves)+1)
+	find := false
+	for _, inf := range n.BondingSlaves {
+		macs = append(macs, inf.GetMac())
+		if n.mac == inf.GetMac() {
+			find = true
+		}
+	}
+	if !find {
+		macs = append(macs, n.mac)
+	}
+	return macs
 }
 
 // https://kris.io/2015/10/01/kvm-network-performance-tso-and-gso-turn-it-off/
@@ -465,4 +448,32 @@ func PrefixSplit(pref string) (string, int, error) {
 	} else {
 		return pref, 32, nil
 	}
+}
+
+func TestTcpPort(ip string, port int, timeoutSecs int, tries int) error {
+	if timeoutSecs <= 0 {
+		timeoutSecs = 3
+	}
+	if tries <= 0 {
+		tries = 3
+	}
+
+	address := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+	// 3 second timeout
+	errs := make([]error, 0)
+	for i := 0; i < tries; i++ {
+		conn, err := net.DialTimeout("tcp", address, time.Duration(timeoutSecs)*time.Second)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			if conn != nil {
+				_ = conn.Close()
+				return nil
+			} else {
+				errs = append(errs, errors.Wrap(errors.ErrEmpty, "nil conn"))
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return errors.NewAggregate(errs)
 }

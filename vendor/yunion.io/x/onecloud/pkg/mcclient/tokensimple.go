@@ -24,7 +24,6 @@ import (
 	"yunion.io/x/pkg/gotypes"
 
 	api "yunion.io/x/onecloud/pkg/apis/identity"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 )
 
 type SSimpleToken struct {
@@ -42,6 +41,8 @@ type SSimpleToken struct {
 	Roles   string
 	RoleIds string
 	Expires time.Time
+
+	SystemAccount bool
 
 	Context SAuthContext
 }
@@ -130,7 +131,7 @@ func (self *SSimpleToken) HasSystemAdminPrivilege() bool {
 	return self.IsAdmin() && self.Project == "system"
 }
 
-func (this *SSimpleToken) IsAllow(scope rbacutils.TRbacScope, service string, resource string, action string, extra ...string) rbacutils.SPolicyResult {
+/*func (this *SSimpleToken) IsAllow(scope rbacscope.TRbacScope, service string, resource string, action string, extra ...string) rbacutils.SPolicyResult {
 	if this.isAllow(scope, service, resource, action, extra...) {
 		return rbacutils.PolicyAllow
 	} else {
@@ -138,13 +139,13 @@ func (this *SSimpleToken) IsAllow(scope rbacutils.TRbacScope, service string, re
 	}
 }
 
-func (this *SSimpleToken) isAllow(scope rbacutils.TRbacScope, service string, resource string, action string, extra ...string) bool {
-	if scope == rbacutils.ScopeSystem || scope == rbacutils.ScopeDomain {
+func (this *SSimpleToken) isAllow(scope rbacscope.TRbacScope, service string, resource string, action string, extra ...string) bool {
+	if scope == rbacscope.ScopeSystem || scope == rbacscope.ScopeDomain {
 		return this.HasSystemAdminPrivilege()
 	} else {
 		return true
 	}
-}
+}*/
 
 func (self *SSimpleToken) GetRegions() []string {
 	return nil
@@ -154,11 +155,11 @@ func (self *SSimpleToken) Len() int {
 	return 0
 }
 
-func (self *SSimpleToken) GetServiceURL(service, region, zone, endpointType string) (string, error) {
+func (self *SSimpleToken) getServiceURL(service, region, zone, endpointType string) (string, error) {
 	return "", fmt.Errorf("Not available")
 }
 
-func (self *SSimpleToken) GetServiceURLs(service, region, zone, endpointType string) ([]string, error) {
+func (self *SSimpleToken) getServiceURLs(service, region, zone, endpointType string) ([]string, error) {
 	return nil, fmt.Errorf("Not available")
 }
 
@@ -180,6 +181,10 @@ func (this *SSimpleToken) GetEndpoints(region string, endpointType string) []End
 
 func (this *SSimpleToken) GetServiceCatalog() IServiceCatalog {
 	return nil
+}
+
+func (this *SSimpleToken) IsSystemAccount() bool {
+	return this.SystemAccount
 }
 
 func (this *SSimpleToken) GetLoginSource() string {
@@ -213,6 +218,7 @@ func SimplifyToken(token TokenCredential) TokenCredential {
 			Source: token.GetLoginSource(),
 			Ip:     token.GetLoginIp(),
 		},
+		SystemAccount: token.IsSystemAccount(),
 	}
 }
 

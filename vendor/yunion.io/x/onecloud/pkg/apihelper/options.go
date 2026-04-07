@@ -21,8 +21,10 @@ import (
 type Options struct {
 	common_options.CommonOptions
 
-	SyncInterval         int
-	ListBatchSize        int
-	IncludeDetails       bool
-	IncludeOtherCloudEnv bool
+	SyncIntervalSeconds     int
+	RunDelayMilliseconds    int
+	ListBatchSize           int
+	IncludeDetails          bool
+	IncludeOtherCloudEnv    bool
+	FetchFromComputeService bool
 }

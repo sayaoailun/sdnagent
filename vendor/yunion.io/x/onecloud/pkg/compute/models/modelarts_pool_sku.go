@@ -17,8 +17,8 @@ package models
 import (
 	"context"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
-	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
 	"yunion.io/x/sqlchemy"
@@ -26,7 +26,6 @@ import (
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
@@ -56,7 +55,6 @@ func init() {
 }
 
 type SModelartsPoolSku struct {
-	SManagedResourceBase
 	db.SEnabledStatusStandaloneResourceBase
 	db.SExternalizedResourceBase
 	SCloudregionResourceBase
@@ -76,6 +74,8 @@ type SModelartsPoolSku struct {
 	NpuSize int `nullable:"true" list:"user" create:"admin_optional" update:"admin"`
 	// 内存
 	Memory int `nullable:"true" list:"user" create:"admin_optional" update:"admin"`
+	// 处理器类型
+	ProcessorType string `width:"128" charset:"ascii" nullable:"true" list:"user" create:"admin_optional" update:"admin"`
 }
 
 func (manager *SModelartsPoolSkuManager) GetContextManagers() [][]db.IModelManager {
@@ -97,15 +97,16 @@ func (man *SModelartsPoolSkuManager) ListItemFilter(
 	if err != nil {
 		return nil, errors.Wrap(err, "SExternalizedResourceBaseManager.ListItemFilter")
 	}
-	q, err = man.SManagedResourceBaseManager.ListItemFilter(ctx, q, userCred, query.ManagedResourceListInput)
-	if err != nil {
-		return nil, errors.Wrap(err, "SManagedResourceBaseManager.ListItemFilter")
-	}
 	q, err = man.SCloudregionResourceBaseManager.ListItemFilter(ctx, q, userCred, query.RegionalFilterListInput)
 	if err != nil {
 		return nil, errors.Wrap(err, "SCloudregionResourceBaseManager.ListItemFilter")
 	}
-
+	if len(query.CpuArch) > 0 {
+		q = q.Equals("cpu_arch", query.CpuArch)
+	}
+	if len(query.ProcessorType) > 0 {
+		q = q.Equals("processor_type", query.ProcessorType)
+	}
 	return q, nil
 }
 
@@ -122,10 +123,6 @@ func (man *SModelartsPoolSkuManager) OrderByExtraFields(
 	q, err = man.SExternalizedResourceBaseManager.ListItemFilter(ctx, q, userCred, query.ExternalizedResourceBaseListInput)
 	if err != nil {
 		return nil, errors.Wrap(err, "SExternalizedResourceBaseManager.ListItemFilter")
-	}
-	q, err = man.SManagedResourceBaseManager.OrderByExtraFields(ctx, q, userCred, query.ManagedResourceListInput)
-	if err != nil {
-		return nil, errors.Wrap(err, "SManagedResourceBaseManager.OrderByExtraFields")
 	}
 	q, err = man.SCloudregionResourceBaseManager.OrderByExtraFields(ctx, q, userCred, query.RegionalFilterListInput)
 	if err != nil {
@@ -190,11 +187,8 @@ func (manager *SModelartsPoolSkuManager) ListItemExportKeys(ctx context.Context,
 
 	return q, nil
 }
-func (self *SCloudregion) GetModelartsPoolSkus(managerId string) ([]SModelartsPoolSku, error) {
+func (self *SCloudregion) GetModelartsPoolSkus() ([]SModelartsPoolSku, error) {
 	q := ModelartsPoolSkuManager.Query().Equals("cloudregion_id", self.Id)
-	if len(managerId) > 0 {
-		q = q.Equals("manager_id", managerId)
-	}
 	ret := []SModelartsPoolSku{}
 	err := db.FetchModelObjects(ModelartsPoolSkuManager, q, &ret)
 	if err != nil {
@@ -203,12 +197,18 @@ func (self *SCloudregion) GetModelartsPoolSkus(managerId string) ([]SModelartsPo
 	return ret, nil
 }
 
-func (self *SCloudregion) SyncModelartsPoolSkus(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, exts []cloudprovider.ICloudModelartsPoolSku) compare.SyncResult {
+func (self *SCloudregion) SyncModelartsPoolSkus(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	provider *SCloudprovider,
+	exts []cloudprovider.ICloudModelartsPoolSku,
+	xor bool,
+) compare.SyncResult {
 	// 加锁防止重入
-	lockman.LockRawObject(ctx, self.Provider, "modelarts-pool-sku")
-	defer lockman.ReleaseRawObject(ctx, self.Provider, "modelarts-pool-sku")
+	lockman.LockRawObject(ctx, self.Provider, ModelartsPoolSkuManager.Keyword())
+	defer lockman.ReleaseRawObject(ctx, self.Provider, ModelartsPoolSkuManager.Keyword())
 	result := compare.SyncResult{}
-	dbPoolSku, err := self.GetModelartsPoolSkus(provider.Id)
+	dbPoolSku, err := self.GetModelartsPoolSkus()
 	if err != nil {
 		result.Error(err)
 		return result
@@ -234,15 +234,16 @@ func (self *SCloudregion) SyncModelartsPoolSkus(ctx context.Context, userCred mc
 		result.Delete()
 	}
 
-	// 和云上资源属性进行同步
-	for i := 0; i < len(commondb); i++ {
-		log.Errorln("this is commonext", commonext[i])
-		err := commondb[i].syncWithCloudSku(ctx, userCred, commonext[i])
-		if err != nil {
-			result.UpdateError(err)
-			continue
+	if !xor {
+		// 和云上资源属性进行同步
+		for i := 0; i < len(commondb); i++ {
+			err := commondb[i].syncWithCloudSku(ctx, userCred, commonext[i])
+			if err != nil {
+				result.UpdateError(err)
+				continue
+			}
+			result.Update()
 		}
-		result.Update()
 	}
 
 	// 创建本地没有的云上资源
@@ -271,6 +272,7 @@ func (self *SModelartsPoolSku) syncWithCloudSku(ctx context.Context, userCred mc
 		self.NpuType = isku.GetNpuType()
 		self.NpuSize = isku.GetNpuSize()
 		self.ExternalId = isku.GetGlobalId()
+		self.ProcessorType = isku.GetProcessorType()
 		return nil
 	})
 	return err
@@ -283,6 +285,7 @@ func (self *SCloudregion) newFromCloudModelartsPoolSku(ctx context.Context, user
 	sku.Name = isku.GetName()
 	sku.CpuCount = isku.GetCpuCoreCount()
 	sku.CpuArch = isku.GetCpuArch()
+	sku.ProcessorType = isku.GetProcessorType()
 	sku.Status = isku.GetStatus()
 	sku.Type = isku.GetPoolType()
 	sku.CreatedAt = isku.GetCreatedAt()
@@ -292,6 +295,5 @@ func (self *SCloudregion) newFromCloudModelartsPoolSku(ctx context.Context, user
 	sku.NpuType = isku.GetNpuType()
 	sku.NpuSize = isku.GetNpuSize()
 	sku.ExternalId = isku.GetGlobalId()
-	sku.ManagerId = provider.Id
 	return ModelartsPoolSkuManager.TableSpec().Insert(ctx, &sku)
 }

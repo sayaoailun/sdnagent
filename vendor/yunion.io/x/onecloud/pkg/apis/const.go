@@ -34,11 +34,16 @@ const (
 	SERVICE_TYPE_LOG               = "log"
 	SERVICE_TYPE_REGION            = "compute"
 	SERVICE_TYPE_CLOUDMON          = "cloudmon"
+	SERVICE_TYPE_VPCAGENT          = "vpcagent"
 
-	SERVICE_TYPE_ETCD     = "etcd"
-	SERVICE_TYPE_INFLUXDB = "influxdb"
+	SERVICE_TYPE_ETCD             = "etcd"
+	SERVICE_TYPE_INFLUXDB         = "influxdb"
+	SERVICE_TYPE_NTP              = "ntp"
+	SERVICE_TYPE_VICTORIA_METRICS = "victoria-metrics"
 
 	SERVICE_TYPE_SCHEDULEDTASK = "scheduledtask"
+
+	SERVICE_TYPE_APIMAP = "apimap"
 
 	STATUS_UPDATE_TAGS        = "update_tags"
 	STATUS_UPDATE_TAGS_FAILED = "update_tags_fail"
@@ -48,13 +53,19 @@ const (
 	STATUS_DELETE_FAILED = "delete_failed"
 	STATUS_UNKNOWN       = "unknown"
 	STATUS_CREATING      = "creating"
+	STATUS_AVAILABLE     = "available"
 	STATUS_CREATE_FAILED = "create_failed"
 
 	CLOUD_TAG_PREFIX     = "ext:"
 	USER_TAG_PREFIX      = "user:"
 	SYS_CLOUD_TAG_PREFIX = "sys:"
 	// Such tags have inherited and isolated properties
-	CLASS_TAT_PREFIX = "cls:"
+	CLASS_TAG_PREFIX = "cls:"
+
+	ORGANIZATION_TAG_PREFIX = "org:"
+
+	SKU_STATUS_AVAILABLE = "available"
+	SKU_STATUS_SOLDOUT   = "soldout"
 
 	MetaServiceMonitorAgentUrl = "http://169.254.169.254/monitor"
 )
@@ -68,7 +79,39 @@ var (
 		SERVICE_TYPE_KEYSTONE,
 		SERVICE_TYPE_ETCD,
 		SERVICE_TYPE_INFLUXDB,
+		SERVICE_TYPE_CLOUDMON,
+		SERVICE_TYPE_METER,
+		SERVICE_TYPE_CLOUDEVENT,
+		SERVICE_TYPE_ANSIBLE,
+		SERVICE_TYPE_INFLUXDB,
+		SERVICE_TYPE_APIMAP,
+		SERVICE_TYPE_LOG,
+		"autoupdate",
+		"yunionagent",
+		"webconsole",
+		"esxiagent",
+		"s3gateway",
+		"common",
+		"websocket",
+		"echarts-ssr",
+		"lbagent",
+		"vpcagent",
+		"cloudwatcher",
+		"cloudnet",
+		"repo",
+		"cloudproxy",
+		"apigateway",
+		"yunionapi",
+		"billing",
+		SERVICE_TYPE_ETCD,
+		"itsm",
+		SERVICE_TYPE_NTP,
 	}
+)
+
+const (
+	COMPRESS_FORMAT_GZIP   = "gzip"
+	COMPRESS_FORMAT_TAR_GZ = "tar.gz"
 )
 
 const (

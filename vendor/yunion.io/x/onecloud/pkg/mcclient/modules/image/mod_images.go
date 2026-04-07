@@ -24,6 +24,8 @@ import (
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/util/httputils"
+	"yunion.io/x/pkg/util/printutils"
 	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/httperrors"
@@ -31,7 +33,6 @@ import (
 	"yunion.io/x/onecloud/pkg/mcclient/modulebase"
 	"yunion.io/x/onecloud/pkg/mcclient/modules"
 	"yunion.io/x/onecloud/pkg/mcclient/modules/identity"
-	"yunion.io/x/onecloud/pkg/util/httputils"
 )
 
 type ImageManager struct {
@@ -42,9 +43,11 @@ const (
 	IMAGE_META          = "X-Image-Meta-"
 	IMAGE_META_PROPERTY = "X-Image-Meta-Property-"
 
-	IMAGE_METADATA = "X-Image-Meta-Metadata"
+	IMAGE_METADATA         = "X-Image-Meta-Metadata"
+	IMAGE_PROJECT_METADATA = "X-Image-Meta-Project_metadata"
 
-	IMAGE_META_COPY_FROM = "x-glance-api-copy-from"
+	IMAGE_META_COPY_FROM       = "x-glance-api-copy-from"
+	IMAGE_META_COMPRESS_FORMAT = "x-glance-compress-format"
 )
 
 func decodeMeta(str string) string {
@@ -64,6 +67,11 @@ func FetchImageMeta(h http.Header) jsonutils.JSONObject {
 			metadata, _ := jsonutils.Parse([]byte(v[0]))
 			if metadata != nil {
 				meta.Add(metadata, "metadata")
+			}
+		} else if k == IMAGE_PROJECT_METADATA && len(v) == 1 {
+			metadata, _ := jsonutils.Parse([]byte(v[0]))
+			if metadata != nil {
+				meta.Add(metadata, "project_metadata")
 			}
 		} else if strings.HasPrefix(k, IMAGE_META_PROPERTY) {
 			k := strings.ToLower(k[len(IMAGE_META_PROPERTY):])
@@ -128,13 +136,13 @@ func (this *ImageManager) GetId(session *mcclient.ClientSession, id string, para
 	return img.GetString("id")
 }
 
-func (this *ImageManager) BatchGet(session *mcclient.ClientSession, idlist []string, params jsonutils.JSONObject) []modulebase.SubmitResult {
+func (this *ImageManager) BatchGet(session *mcclient.ClientSession, idlist []string, params jsonutils.JSONObject) []printutils.SubmitResult {
 	return modulebase.BatchDo(idlist, func(id string) (jsonutils.JSONObject, error) {
 		return this.Get(session, id, params)
 	})
 }
 
-func (this *ImageManager) List(session *mcclient.ClientSession, params jsonutils.JSONObject) (*modulebase.ListResult, error) {
+func (this *ImageManager) List(session *mcclient.ClientSession, params jsonutils.JSONObject) (*printutils.ListResult, error) {
 	path := fmt.Sprintf("/%s", this.URLPath())
 	if params != nil {
 		details, _ := params.Bool("details")
@@ -175,7 +183,7 @@ func (this *ImageManager) countUsage(session *mcclient.ClientSession, deleted bo
 	var limit int64 = 1000
 	var offset int64 = 0
 	ret := make(map[string]*ImageUsageCount)
-	count := func(ret map[string]*ImageUsageCount, results *modulebase.ListResult) {
+	count := func(ret map[string]*ImageUsageCount, results *printutils.ListResult) {
 		for _, r := range results.Data {
 			format, _ := r.GetString("disk_format")
 			status, _ := r.GetString("status")
@@ -250,27 +258,21 @@ func setImageMeta(params jsonutils.JSONObject) (http.Header, error) {
 		return header, e
 	}
 	for k, v := range p {
-		if ok, _ := utils.InStringArray(k, []string{"copy_from"}); ok {
+		if k == "copy_from" || k == "properties" || k == "compress_format" {
 			continue
 		}
-		if k == "properties" {
-			pp, e := v.(*jsonutils.JSONDict).GetMap()
-			if e != nil {
-				return header, e
-			}
-			for kk, vv := range pp {
-				vvs, _ := vv.GetString()
-				header.Add(fmt.Sprintf("%s%s", IMAGE_META_PROPERTY, utils.Capitalize(kk)), vvs)
-			}
-		} else {
-			vs, _ := v.GetString()
-			header.Add(fmt.Sprintf("%s%s", IMAGE_META, utils.Capitalize(k)), vs)
-		}
+		vs, _ := v.GetString()
+		header.Add(fmt.Sprintf("%s%s", IMAGE_META, utils.Capitalize(k)), vs)
+	}
+	properties := map[string]string{}
+	params.Unmarshal(properties, "properties")
+	for k, v := range properties {
+		header.Add(fmt.Sprintf("%s%s", IMAGE_META_PROPERTY, utils.Capitalize(k)), v)
 	}
 	return header, nil
 }
 
-func (this *ImageManager) ListMemberProjects(s *mcclient.ClientSession, imageId string) (*modulebase.ListResult, error) {
+func (this *ImageManager) ListMemberProjects(s *mcclient.ClientSession, imageId string) (*printutils.ListResult, error) {
 	result, e := this.ListMemberProjectIds(s, imageId)
 	if e != nil {
 		return nil, e
@@ -289,7 +291,7 @@ func (this *ImageManager) ListMemberProjects(s *mcclient.ClientSession, imageId 
 	return result, nil
 }
 
-func (this *ImageManager) ListMemberProjectIds(s *mcclient.ClientSession, imageId string) (*modulebase.ListResult, error) {
+func (this *ImageManager) ListMemberProjectIds(s *mcclient.ClientSession, imageId string) (*printutils.ListResult, error) {
 	path := fmt.Sprintf("/%s/%s/members", this.URLPath(), url.PathEscape(imageId))
 	return modulebase.List(this.ResourceManager, s, path, "members")
 }
@@ -405,13 +407,13 @@ func (this *ImageManager) _removeMembership(s *mcclient.ClientSession, image_id 
 	return e
 }
 
-func (this *ImageManager) ListSharedImageIds(s *mcclient.ClientSession, projectId string) (*modulebase.ListResult, error) {
+func (this *ImageManager) ListSharedImageIds(s *mcclient.ClientSession, projectId string) (*printutils.ListResult, error) {
 	path := fmt.Sprintf("/shared-images/%s", projectId)
 	// {"shared_images": [{"image_id": "4d82c731-937e-4420-959b-de9c213efd2b", "can_share": false}]}
 	return modulebase.List(this.ResourceManager, s, path, "shared_images")
 }
 
-func (this *ImageManager) ListSharedImages(s *mcclient.ClientSession, projectId string) (*modulebase.ListResult, error) {
+func (this *ImageManager) ListSharedImages(s *mcclient.ClientSession, projectId string) (*printutils.ListResult, error) {
 	result, e := this.ListSharedImageIds(s, projectId)
 	if e != nil {
 		return nil, e
@@ -439,17 +441,6 @@ func (this *ImageManager) Upload(s *mcclient.ClientSession, params jsonutils.JSO
 }
 
 func (this *ImageManager) _create(s *mcclient.ClientSession, params jsonutils.JSONObject, body io.Reader, size int64) (jsonutils.JSONObject, error) {
-	/*format, _ := params.GetString("disk-format")
-	if len(format) == 0 {
-		format, _ = params.GetString("disk_format")
-		if len(format) == 0 {
-			return nil, httperrors.NewMissingParameterError("disk_format")
-		}
-	}
-	exists, _ := utils.InStringArray(format, []string{"qcow2", "raw", "vhd", "vmdk", "iso", "docker"})
-	if !exists {
-		return nil, fmt.Errorf("Unsupported image format %s", format)
-	}*/
 	imageId, _ := params.GetString("image_id")
 	path := fmt.Sprintf("/%s", this.URLPath())
 	method := httputils.POST
@@ -466,6 +457,7 @@ func (this *ImageManager) _create(s *mcclient.ClientSession, params jsonutils.JS
 		return nil, e
 	}
 	copyFromUrl, _ := params.GetString("copy_from")
+	compressFormat, _ := params.GetString("compress_format")
 	if len(copyFromUrl) != 0 {
 		if size != 0 {
 			return nil, fmt.Errorf("Can't use copy_from and upload file at the same time")
@@ -473,6 +465,7 @@ func (this *ImageManager) _create(s *mcclient.ClientSession, params jsonutils.JS
 		body = nil
 		size = 0
 		headers.Set(IMAGE_META_COPY_FROM, copyFromUrl)
+		headers.Set(IMAGE_META_COMPRESS_FORMAT, compressFormat)
 	}
 	if body != nil {
 		headers.Add("Content-Type", "application/octet-stream")
@@ -530,7 +523,7 @@ func (this *ImageManager) _update(s *mcclient.ClientSession, id string, params j
 
 func (this *ImageManager) BatchUpdate(
 	session *mcclient.ClientSession, idlist []string, params jsonutils.JSONObject,
-) []modulebase.SubmitResult {
+) []printutils.SubmitResult {
 	return modulebase.BatchDo(idlist, func(id string) (jsonutils.JSONObject, error) {
 		var curParams = params.(*jsonutils.JSONDict).Copy()
 		img, err := this.Get(session, id, nil)

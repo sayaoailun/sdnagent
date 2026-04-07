@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
@@ -29,7 +30,6 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
@@ -131,13 +131,13 @@ func (man *SRouteTableManager) QueryDistinctExtraField(q *sqlchemy.SQuery, field
 	return q, httperrors.ErrNotFound
 }
 
-func (man *SRouteTableManager) validateRoutes(data *jsonutils.JSONDict, update bool) (*jsonutils.JSONDict, error) {
+func (man *SRouteTableManager) validateRoutes(ctx context.Context, data *jsonutils.JSONDict, update bool) (*jsonutils.JSONDict, error) {
 	routes := api.SRoutes{}
 	routesV := validators.NewStructValidator("routes", &routes)
 	if update {
 		routesV.Optional(true)
 	}
-	err := routesV.Validate(data)
+	err := routesV.Validate(ctx, data)
 	if err != nil {
 		return nil, err
 	}
@@ -151,11 +151,11 @@ func (man *SRouteTableManager) ValidateCreateData(
 	query jsonutils.JSONObject,
 	input api.RouteTableCreateInput,
 ) (api.RouteTableCreateInput, error) {
-	_, err := man.validateRoutes(jsonutils.Marshal(input).(*jsonutils.JSONDict), false)
+	_, err := man.validateRoutes(ctx, jsonutils.Marshal(input).(*jsonutils.JSONDict), false)
 	if err != nil {
 		return input, errors.Wrap(err, "validateRoutes")
 	}
-	_, err = validators.ValidateModel(userCred, VpcManager, &input.VpcId)
+	_, err = validators.ValidateModel(ctx, userCred, VpcManager, &input.VpcId)
 	if err != nil {
 		return input, err
 	}
@@ -213,7 +213,7 @@ func (rt *SRouteTable) ValidateUpdateData(
 	query jsonutils.JSONObject,
 	input api.RouteTableUpdateInput,
 ) (api.RouteTableUpdateInput, error) {
-	_, err := RouteTableManager.validateRoutes(jsonutils.Marshal(input).(*jsonutils.JSONDict), true)
+	_, err := RouteTableManager.validateRoutes(ctx, jsonutils.Marshal(input).(*jsonutils.JSONDict), true)
 	if err != nil {
 		return input, errors.Wrap(err, "RouteTableManager.validateRoutes")
 	}
@@ -236,7 +236,7 @@ func (rt *SRouteTable) PerformAddRoutes(ctx context.Context, userCred mcclient.T
 		adds := api.SRoutes{}
 		addsV := validators.NewStructValidator("routes", &adds)
 		addsV.Optional(true)
-		err := addsV.Validate(data)
+		err := addsV.Validate(ctx, data)
 		if err != nil {
 			return nil, err
 		}
@@ -356,9 +356,16 @@ func (manager *SRouteTableManager) FetchCustomizeColumns(
 	return rows
 }
 
-func (man *SRouteTableManager) SyncRouteTables(ctx context.Context, userCred mcclient.TokenCredential, vpc *SVpc, cloudRouteTables []cloudprovider.ICloudRouteTable, provider *SCloudprovider) ([]SRouteTable, []cloudprovider.ICloudRouteTable, compare.SyncResult) {
-	lockman.LockRawObject(ctx, "route-tables", vpc.Id)
-	defer lockman.ReleaseRawObject(ctx, "route-tables", vpc.Id)
+func (man *SRouteTableManager) SyncRouteTables(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	vpc *SVpc,
+	cloudRouteTables []cloudprovider.ICloudRouteTable,
+	provider *SCloudprovider,
+	xor bool,
+) ([]SRouteTable, []cloudprovider.ICloudRouteTable, compare.SyncResult) {
+	lockman.LockRawObject(ctx, man.Keyword(), vpc.Id)
+	defer lockman.ReleaseRawObject(ctx, man.Keyword(), vpc.Id)
 
 	localRouteTables := make([]SRouteTable, 0)
 	remoteRouteTables := make([]cloudprovider.ICloudRouteTable, 0)
@@ -387,16 +394,17 @@ func (man *SRouteTableManager) SyncRouteTables(ctx context.Context, userCred mcc
 		}
 	}
 
-	for i := 0; i < len(commondb); i += 1 {
-		err := commondb[i].SyncWithCloudRouteTable(ctx, userCred, vpc, commonext[i], provider)
-		if err != nil {
-			syncResult.UpdateError(err)
-			continue
+	if !xor {
+		for i := 0; i < len(commondb); i += 1 {
+			err := commondb[i].SyncWithCloudRouteTable(ctx, userCred, vpc, commonext[i], provider)
+			if err != nil {
+				syncResult.UpdateError(err)
+				continue
+			}
+			localRouteTables = append(localRouteTables, commondb[i])
+			remoteRouteTables = append(remoteRouteTables, commonext[i])
+			syncResult.Update()
 		}
-		syncMetadata(ctx, userCred, &commondb[i], commonext[i])
-		localRouteTables = append(localRouteTables, commondb[i])
-		remoteRouteTables = append(remoteRouteTables, commonext[i])
-		syncResult.Update()
 	}
 
 	for i := 0; i < len(added); i += 1 {
@@ -405,7 +413,7 @@ func (man *SRouteTableManager) SyncRouteTables(ctx context.Context, userCred mcc
 			syncResult.AddError(err)
 			continue
 		}
-		syncMetadata(ctx, userCred, routeTableNew, added[i])
+		syncMetadata(ctx, userCred, routeTableNew, added[i], false)
 		localRouteTables = append(localRouteTables, *routeTableNew)
 		remoteRouteTables = append(remoteRouteTables, added[i])
 		syncResult.Add()
@@ -521,13 +529,22 @@ func (self *SRouteTable) SyncWithCloudRouteTable(ctx context.Context, userCred m
 	if provider != nil {
 		SyncCloudDomain(userCred, self, provider.GetOwnerId())
 		self.SyncShareState(ctx, userCred, provider.getAccountShareInfo())
+		if account, _ := provider.GetCloudaccount(); account != nil {
+			syncMetadata(ctx, userCred, self, cloudRouteTable, account.ReadOnly)
+		}
 	}
 
 	db.OpsLog.LogSyncUpdate(self, diff, userCred)
 	return nil
 }
 
-func (self *SRouteTable) SyncRouteTableRouteSets(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudRouteTable, provider *SCloudprovider) compare.SyncResult {
+func (self *SRouteTable) SyncRouteTableRouteSets(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	ext cloudprovider.ICloudRouteTable,
+	provider *SCloudprovider,
+	xor bool,
+) compare.SyncResult {
 	lockman.LockRawObject(ctx, self.Keyword(), fmt.Sprintf("%s-records", self.Id))
 	defer lockman.ReleaseRawObject(ctx, self.Keyword(), fmt.Sprintf("%s-records", self.Id))
 
@@ -569,13 +586,15 @@ func (self *SRouteTable) SyncRouteTableRouteSets(ctx context.Context, userCred m
 		}
 	}
 
-	for i := 0; i < len(commondb); i++ {
-		err := commondb[i].syncWithCloudRouteSet(ctx, userCred, provider, commonext[i])
-		if err != nil {
-			syncResult.UpdateError(err)
-			continue
+	if !xor {
+		for i := 0; i < len(commondb); i++ {
+			err := commondb[i].syncWithCloudRouteSet(ctx, userCred, provider, commonext[i])
+			if err != nil {
+				syncResult.UpdateError(err)
+				continue
+			}
+			syncResult.Update()
 		}
-		syncResult.Update()
 	}
 
 	for i := 0; i < len(added); i++ {
@@ -600,7 +619,13 @@ func (self *SRouteTable) GetRouteTableRouteSets() ([]SRouteTableRouteSet, error)
 	return routes, nil
 }
 
-func (self *SRouteTable) SyncRouteTableAssociations(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudRouteTable, provider *SCloudprovider) compare.SyncResult {
+func (self *SRouteTable) SyncRouteTableAssociations(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	ext cloudprovider.ICloudRouteTable,
+	provider *SCloudprovider,
+	xor bool,
+) compare.SyncResult {
 	lockman.LockRawObject(ctx, self.Keyword(), fmt.Sprintf("%s-records", self.Id))
 	defer lockman.ReleaseRawObject(ctx, self.Keyword(), fmt.Sprintf("%s-records", self.Id))
 
@@ -638,13 +663,15 @@ func (self *SRouteTable) SyncRouteTableAssociations(ctx context.Context, userCre
 		}
 	}
 
-	for i := 0; i < len(commondb); i++ {
-		err := commondb[i].syncWithCloudAssociation(ctx, userCred, provider, commonext[i])
-		if err != nil {
-			syncResult.UpdateError(err)
-			continue
+	if !xor {
+		for i := 0; i < len(commondb); i++ {
+			err := commondb[i].syncWithCloudAssociation(ctx, userCred, provider, commonext[i])
+			if err != nil {
+				syncResult.UpdateError(err)
+				continue
+			}
+			syncResult.Update()
 		}
-		syncResult.Update()
 	}
 
 	for i := 0; i < len(added); i++ {

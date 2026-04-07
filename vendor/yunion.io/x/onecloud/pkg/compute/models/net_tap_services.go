@@ -81,7 +81,7 @@ func (man *SNetTapServiceManager) ListItemFilter(
 	}
 
 	if len(query.HostId) > 0 {
-		hostObj, err := HostManager.FetchByIdOrName(userCred, query.HostId)
+		hostObj, err := HostManager.FetchByIdOrName(ctx, userCred, query.HostId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(HostManager.Keyword(), query.HostId)
@@ -129,6 +129,23 @@ func (man *SNetTapServiceManager) OrderByExtraFields(
 	q, err := man.SEnabledStatusStandaloneResourceBaseManager.OrderByExtraFields(ctx, q, userCred, query.EnabledStatusStandaloneResourceListInput)
 	if err != nil {
 		return nil, errors.Wrap(err, "SEnabledStatusInfrasResourceBaseManager.OrderByExtraFields")
+	}
+	if db.NeedOrderQuery([]string{query.OrderByIp}) {
+		hSQ := HostManager.Query("id", "access_ip").SubQuery()
+		q = q.LeftJoin(hSQ, sqlchemy.Equals(q.Field("target_id"), hSQ.Field("id")))
+		q = q.AppendField(q.QueryFields()...)
+		q = q.AppendField(hSQ.Field("access_ip"))
+		db.OrderByFields(q, []string{query.OrderByIp}, []sqlchemy.IQueryField{q.Field("access_ip")})
+	}
+	if db.NeedOrderQuery([]string{query.OrderByFlowCount}) {
+		ntfQ := NetTapFlowManager.Query()
+		ntfQ = ntfQ.AppendField(ntfQ.Field("tap_id"), sqlchemy.COUNT("flow_count", ntfQ.Field("tap_id")))
+		ntfQ = ntfQ.GroupBy("tap_id")
+		ntfSQ := ntfQ.SubQuery()
+		q = q.LeftJoin(ntfSQ, sqlchemy.Equals(q.Field("id"), ntfSQ.Field("tap_id")))
+		q = q.AppendField(q.QueryFields()...)
+		q = q.AppendField(ntfSQ.Field("flow_count"))
+		db.OrderByFields(q, []string{query.OrderByFlowCount}, []sqlchemy.IQueryField{q.Field("flow_count")})
 	}
 	return q, nil
 }
@@ -225,7 +242,7 @@ func (manager *SNetTapServiceManager) ValidateCreateData(
 	}
 	switch input.Type {
 	case api.TapServiceHost:
-		hostObj, err := HostManager.FetchByIdOrName(userCred, input.TargetId)
+		hostObj, err := HostManager.FetchByIdOrName(ctx, userCred, input.TargetId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return input, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", HostManager.Keyword(), input.TargetId)
@@ -239,7 +256,7 @@ func (manager *SNetTapServiceManager) ValidateCreateData(
 		}
 		if len(input.MacAddr) > 0 {
 			input.MacAddr = netutils.FormatMacAddr(input.MacAddr)
-			nic := host.GetNetInterface(input.MacAddr)
+			nic := host.GetNetInterface(input.MacAddr, 1)
 			if nic == nil {
 				return input, errors.Wrap(errors.ErrNotFound, "host.GetNetInterface")
 			}
@@ -255,7 +272,7 @@ func (manager *SNetTapServiceManager) ValidateCreateData(
 		}
 		input.TargetId = hostObj.GetId()
 	case api.TapServiceGuest:
-		guestObj, err := GuestManager.FetchByIdOrName(userCred, input.TargetId)
+		guestObj, err := GuestManager.FetchByIdOrName(ctx, userCred, input.TargetId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return input, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", GuestManager.Keyword(), input.TargetId)

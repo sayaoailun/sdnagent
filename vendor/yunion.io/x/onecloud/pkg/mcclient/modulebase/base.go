@@ -19,35 +19,51 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
+	"time"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
+	"yunion.io/x/pkg/util/printutils"
+	"yunion.io/x/pkg/util/sets"
 
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/httputils"
 )
 
 type BaseManager struct {
 	serviceType  string
 	endpointType string
 	version      string
-	apiVersion   string
+	// apiVersion   string
 
 	columns      []string
 	adminColumns []string
+
+	specificMethods sets.String
 }
 
-func NewBaseManager(serviceType, endpointType, version string, columns, adminColumns []string, apiVersion string) *BaseManager {
+func NewBaseManager(serviceType, endpointType, version string, columns, adminColumns []string) *BaseManager {
 	return &BaseManager{
 		serviceType:  serviceType,
 		endpointType: endpointType,
 		version:      version,
-		apiVersion:   apiVersion,
-		columns:      columns,
-		adminColumns: adminColumns,
+		// apiVersion:   apiVersion,
+		columns:         columns,
+		adminColumns:    adminColumns,
+		specificMethods: sets.NewString(),
 	}
+}
+
+func (m *BaseManager) GetSpecificMethods() sets.String {
+	return m.specificMethods
+}
+
+func (m *BaseManager) SetSpecificMethods(ms ...string) {
+	m.specificMethods = sets.NewString(ms...)
 }
 
 func (this *BaseManager) GetColumns(session *mcclient.ClientSession) []string {
@@ -62,9 +78,9 @@ func (this *BaseManager) SetVersion(v string) {
 	this.version = v
 }
 
-func (this *BaseManager) GetApiVersion() string {
+/*func (this *BaseManager) GetApiVersion() string {
 	return this.apiVersion
-}
+}*/
 
 func (this *BaseManager) versionedURL(path string) string {
 	offset := 0
@@ -85,7 +101,7 @@ func (this *BaseManager) jsonRequest(session *mcclient.ClientSession,
 	header http.Header, body jsonutils.JSONObject) (http.Header, jsonutils.JSONObject, error) {
 	hdr, resp, err := session.JSONVersionRequest(this.serviceType, this.endpointType,
 		method, this.versionedURL(path),
-		header, body, this.GetApiVersion())
+		header, body)
 	if err != nil {
 		if e, ok := err.(*httputils.JSONClientError); ok {
 			switch e.Class {
@@ -109,7 +125,11 @@ func (this *BaseManager) rawRequest(session *mcclient.ClientSession,
 	header http.Header, body io.Reader) (*http.Response, error) {
 	return session.RawVersionRequest(this.serviceType, this.endpointType,
 		method, this.versionedURL(path),
-		header, body, this.GetApiVersion())
+		header, body)
+}
+
+func (this *BaseManager) GetBaseUrl(s *mcclient.ClientSession) (string, error) {
+	return s.GetBaseUrl(this.serviceType, this.endpointType)
 }
 
 func (this *BaseManager) rawBaseUrlRequest(s *mcclient.ClientSession,
@@ -117,16 +137,25 @@ func (this *BaseManager) rawBaseUrlRequest(s *mcclient.ClientSession,
 	header http.Header, body io.Reader) (*http.Response, error) {
 	baseUrlF := func(baseurl string) string {
 		obj, _ := url.Parse(baseurl)
-		obj.Path = ""
-		return obj.String()
+		lastSlashPos := strings.LastIndex(obj.Path, "/")
+		if lastSlashPos >= 0 {
+			lastSeg := obj.Path[lastSlashPos+1:]
+			verReg := regexp.MustCompile(`^v\d+`)
+			if verReg.MatchString(lastSeg) {
+				obj.Path = obj.Path[:lastSlashPos]
+			}
+		}
+		ret := obj.String()
+		log.Debugf("baseurl %s ret %s", baseurl, ret)
+		return ret
 	}
 	return s.RawBaseUrlRequest(
 		this.serviceType, this.endpointType,
 		method, this.versionedURL(path),
-		header, body, this.GetApiVersion(), baseUrlF)
+		header, body, baseUrlF)
 }
 
-type ListResult struct {
+/*type ListResult struct {
 	Data   []jsonutils.JSONObject `json:"data,allowempty"`
 	Total  int
 	Limit  int
@@ -135,12 +164,15 @@ type ListResult struct {
 	NextMarker  string
 	MarkerField string
 	MarkerOrder string
-}
+}*/
 
-func ListResult2JSONWithKey(result *ListResult, key string) jsonutils.JSONObject {
+func ListResult2JSONWithKey(result *printutils.ListResult, key string) jsonutils.JSONObject {
 	obj := jsonutils.NewDict()
 	if result.Total > 0 {
 		obj.Add(jsonutils.NewInt(int64(result.Total)), "total")
+	}
+	if result.Totals != nil {
+		obj.Add(result.Totals, "totals")
 	}
 	if result.Limit > 0 {
 		obj.Add(jsonutils.NewInt(int64(result.Limit)), "limit")
@@ -162,11 +194,11 @@ func ListResult2JSONWithKey(result *ListResult, key string) jsonutils.JSONObject
 	return obj
 }
 
-func ListResult2JSON(result *ListResult) jsonutils.JSONObject {
+func ListResult2JSON(result *printutils.ListResult) jsonutils.JSONObject {
 	return ListResult2JSONWithKey(result, "data")
 }
 
-func JSON2ListResult(result jsonutils.JSONObject) *ListResult {
+func JSON2ListResult(result jsonutils.JSONObject) *printutils.ListResult {
 	total, _ := result.Int("total")
 	limit, _ := result.Int("limit")
 	offset, _ := result.Int("offset")
@@ -177,16 +209,18 @@ func JSON2ListResult(result jsonutils.JSONObject) *ListResult {
 	if len(markerField) == 0 && total == 0 {
 		total = int64(len(data))
 	}
-	return &ListResult{
+	totalJson, _ := result.Get("totals")
+	return &printutils.ListResult{
 		Data:  data,
 		Total: int(total), Limit: int(limit), Offset: int(offset),
+		Totals:      totalJson,
 		NextMarker:  nextMarker,
 		MarkerField: markerField,
 		MarkerOrder: markerOrder,
 	}
 }
 
-func (this *BaseManager) _list(session *mcclient.ClientSession, path, responseKey string) (*ListResult, error) {
+func (this *BaseManager) _list(session *mcclient.ClientSession, path, responseKey string) (*printutils.ListResult, error) {
 	_, body, err := this.jsonRequest(session, "GET", path, nil, nil)
 	if err != nil {
 		return nil, err
@@ -196,7 +230,7 @@ func (this *BaseManager) _list(session *mcclient.ClientSession, path, responseKe
 	}
 	rets, err := body.GetArray(responseKey)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "key:%s", responseKey)
 	}
 	nextMarker, _ := body.GetString("next_marker")
 	markerField, _ := body.GetString("marker_field")
@@ -207,9 +241,11 @@ func (this *BaseManager) _list(session *mcclient.ClientSession, path, responseKe
 	if len(nextMarker) == 0 && total == 0 {
 		total = int64(len(rets))
 	}
-	return &ListResult{
+	totalJson, _ := body.Get("totals")
+	return &printutils.ListResult{
 		Data:  rets,
 		Total: int(total), Limit: int(limit), Offset: int(offset),
+		Totals:      totalJson,
 		NextMarker:  nextMarker,
 		MarkerField: markerField,
 		MarkerOrder: markerOrder,
@@ -244,24 +280,30 @@ func (this *BaseManager) _submit(session *mcclient.ClientSession, method httputi
 	}
 	ret, e := resp.Get(respKey)
 	if e != nil {
-		return nil, e
+		return nil, errors.Wrapf(e, "key:%s", respKey)
 	}
 	return ret, nil
 }
 
-type SubmitResult struct {
+/*type SubmitResult struct {
 	Status int
 	Id     interface{}
 	Data   jsonutils.JSONObject
-}
+}*/
 
-func SubmitResults2JSON(results []SubmitResult) jsonutils.JSONObject {
+//type SubmitResult printutils.SubmitResult
+
+func SubmitResults2JSON(results []printutils.SubmitResult) jsonutils.JSONObject {
 	arr := jsonutils.NewArray()
+	now := time.Now().In(httperrors.GetTimeZone())
 	for _, r := range results {
 		obj := jsonutils.NewDict()
 		obj.Add(jsonutils.NewInt(int64(r.Status)), "status")
 		obj.Add(jsonutils.Marshal(r.Id), "id")
 		obj.Add(r.Data, "data")
+		if r.Status >= 400 {
+			obj.Add(jsonutils.NewString(now.Format(time.RFC3339)), "data", "time")
+		}
 		arr.Add(obj)
 	}
 	body := jsonutils.NewDict()
@@ -269,46 +311,46 @@ func SubmitResults2JSON(results []SubmitResult) jsonutils.JSONObject {
 	return body
 }
 
-func SubmitResults2ListResult(results []SubmitResult) *ListResult {
+func SubmitResults2ListResult(results []printutils.SubmitResult) *printutils.ListResult {
 	arr := make([]jsonutils.JSONObject, 0)
 	for _, r := range results {
 		if r.Status == 200 {
 			arr = append(arr, r.Data)
 		}
 	}
-	return &ListResult{Data: arr, Total: len(arr), Limit: 0, Offset: 0}
+	return &printutils.ListResult{Data: arr, Total: len(arr), Limit: 0, Offset: 0}
 }
 
-func (this *BaseManager) _batch(session *mcclient.ClientSession, method httputils.THttpMethod, path string, ids []string, body jsonutils.JSONObject, respKey string) []SubmitResult {
+func (this *BaseManager) _batch(session *mcclient.ClientSession, method httputils.THttpMethod, path string, ids []string, body jsonutils.JSONObject, respKey string) []printutils.SubmitResult {
 	return BatchDo(ids, func(id string) (jsonutils.JSONObject, error) {
 		u := fmt.Sprintf(path, url.PathEscape(id))
 		return this._submit(session, method, u, body, respKey)
 	})
 }
 
-func addResult(results chan SubmitResult, id interface{}, r jsonutils.JSONObject, e error) {
+func addResult(results chan printutils.SubmitResult, id interface{}, r jsonutils.JSONObject, e error) {
 	if e != nil {
 		ecls, ok := e.(*httputils.JSONClientError)
 		if ok {
-			results <- SubmitResult{Status: ecls.Code, Id: id, Data: jsonutils.Marshal(ecls)}
+			results <- printutils.SubmitResult{Status: ecls.Code, Id: id, Data: jsonutils.Marshal(ecls)}
 		} else {
-			results <- SubmitResult{Status: 400, Id: id, Data: jsonutils.NewString(e.Error())}
+			results <- printutils.SubmitResult{Status: 400, Id: id, Data: jsonutils.NewString(e.Error())}
 		}
 	} else {
-		results <- SubmitResult{Status: 200, Id: id, Data: r}
+		results <- printutils.SubmitResult{Status: 200, Id: id, Data: r}
 	}
 }
 
-func waitResults(results chan SubmitResult, length int) []SubmitResult {
-	ret := make([]SubmitResult, length)
+func waitResults(results chan printutils.SubmitResult, length int) []printutils.SubmitResult {
+	ret := make([]printutils.SubmitResult, length)
 	for i := 0; i < length; i++ {
 		ret[i] = <-results
 	}
 	return ret
 }
 
-func BatchDo(ids []string, do func(id string) (jsonutils.JSONObject, error)) []SubmitResult {
-	results := make(chan SubmitResult, len(ids))
+func BatchDo(ids []string, do func(id string) (jsonutils.JSONObject, error)) []printutils.SubmitResult {
+	results := make(chan printutils.SubmitResult, len(ids))
 	for i := 0; i < len(ids); i++ {
 		go func(id string) {
 			r, e := do(id)
@@ -321,8 +363,8 @@ func BatchDo(ids []string, do func(id string) (jsonutils.JSONObject, error)) []S
 func BatchParamsDo(
 	ids []string, params []jsonutils.JSONObject,
 	do func(id string, param jsonutils.JSONObject) (jsonutils.JSONObject, error),
-) []SubmitResult {
-	results := make(chan SubmitResult, len(ids))
+) []printutils.SubmitResult {
+	results := make(chan printutils.SubmitResult, len(ids))
 	for i := 0; i < len(ids); i++ {
 		go func(id string, param jsonutils.JSONObject) {
 			r, e := do(id, param)
@@ -334,8 +376,8 @@ func BatchParamsDo(
 
 func BatchDoClassAction(
 	batchParams []jsonutils.JSONObject, do func(jsonutils.JSONObject) (jsonutils.JSONObject, error),
-) []SubmitResult {
-	results := make(chan SubmitResult, len(batchParams))
+) []printutils.SubmitResult {
+	results := make(chan printutils.SubmitResult, len(batchParams))
 	for i := 0; i < len(batchParams); i++ {
 		go func(params jsonutils.JSONObject) {
 			r, e := do(params)

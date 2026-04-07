@@ -19,22 +19,21 @@ import (
 	"fmt"
 	"sort"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
+	"yunion.io/x/cloudmux/pkg/multicloud/esxi"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/pkg/util/netutils"
+	"yunion.io/x/pkg/util/rbacscope"
 
 	proxyapi "yunion.io/x/onecloud/pkg/apis/cloudcommon/proxy"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/proxy"
-	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/multicloud/esxi"
-	"yunion.io/x/onecloud/pkg/util/httputils"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 )
 
 type sNetworkInfo struct {
@@ -134,7 +133,7 @@ func (scm *SCloudaccountManager) PerformPrepareNets(ctx context.Context, userCre
 		return output, errors.Wrap(err, "unable to FetchEsxiZoneIds")
 	}
 	if len(zoneids) == 0 {
-		id, err := scm.defaultZoneId(userCred)
+		id, err := scm.defaultZoneId(ctx, userCred)
 		if err != nil {
 			return output, errors.Wrap(err, "unable to fetch defaultZoneId")
 		}
@@ -147,7 +146,7 @@ func (scm *SCloudaccountManager) PerformPrepareNets(ctx context.Context, userCre
 	if err != nil {
 		return output, errors.Wrap(err, "cloudprovider.GetProviderFactory")
 	}
-	input.SCloudaccount, err = factory.ValidateCreateCloudaccountData(ctx, userCred, input.SCloudaccountCredential)
+	input.SCloudaccount, err = factory.ValidateCreateCloudaccountData(ctx, input.SCloudaccountCredential)
 	if err != nil {
 		return output, errors.Wrap(err, "providerDriver.ValidateCreateCloudaccountData")
 	}
@@ -157,20 +156,22 @@ func (scm *SCloudaccountManager) PerformPrepareNets(ctx context.Context, userCre
 			input.ProxySettingId = proxyapi.ProxySettingId_DIRECT
 		}
 		var proxySetting *proxy.SProxySetting
-		proxySetting, input.ProxySettingResourceInput, err = proxy.ValidateProxySettingResourceInput(userCred, input.ProxySettingResourceInput)
+		proxySetting, input.ProxySettingResourceInput, err = proxy.ValidateProxySettingResourceInput(ctx, userCred, input.ProxySettingResourceInput)
 		if err != nil {
 			return output, errors.Wrap(err, "ValidateProxySettingResourceInput")
 		}
 		proxyFunc = proxySetting.HttpTransportProxyFunc()
 	}
 	provider, err := factory.GetProvider(cloudprovider.ProviderConfig{
-		Vendor:        input.Provider,
-		URL:           input.AccessUrl,
-		Account:       input.Account,
-		Secret:        input.Secret,
-		ProxyFunc:     proxyFunc,
-		Name:          input.Name,
-		DefaultRegion: input.DefaultRegion,
+		Vendor:    input.Provider,
+		URL:       input.AccessUrl,
+		Account:   input.Account,
+		Secret:    input.Secret,
+		ProxyFunc: proxyFunc,
+		Name:      input.Name,
+		RegionId:  input.RegionId,
+
+		AliyunResourceGroupIds: options.Options.AliyunResourceGroups,
 
 		Options: input.Options,
 	})
@@ -210,14 +211,14 @@ func (cam *SCloudaccountManager) prepareNets(ctx context.Context, userCred mccli
 
 	if !input.Dvs {
 		// fetch all wire candidate
-		wires, err := cam.fetchWires(userCred, input.ProjectDomainId, zoneids)
+		wires, err := cam.fetchWires(ctx, userCred, input.ProjectDomainId, zoneids)
 		if err != nil {
 			return output, errors.Wrap(err, "unable to fetch wires")
 		}
 		// fetch networks
 		networks := make([][]SNetwork, len(wires))
 		for i := range networks {
-			nets, err := wires[i].getNetworks(userCred, rbacutils.ScopeSystem)
+			nets, err := wires[i].getNetworks(ctx, userCred, userCred, rbacscope.ScopeSystem)
 			if err != nil {
 				return output, errors.Wrap(err, "wire.getNetwork")
 			}
@@ -260,7 +261,7 @@ func (cam *SCloudaccountManager) prepareNets(ctx context.Context, userCred mccli
 			IPNets: ipNets,
 		})
 	}
-	output.Guests = cam.parseSimpleVms(nInfo.VMs, existedIpPool)
+	// output.Guests = cam.parseSimpleVms(nInfo.VMs, existedIpPool)
 
 	vsList := nInfo.VsMap.List()
 	for i := range vsList {
@@ -296,7 +297,7 @@ func (cam *SCloudaccountManager) prepareNets(ctx context.Context, userCred mccli
 					ipWithSameNet = append(ipWithSameNet, ips[k])
 				}
 				ipLimitLow, ipLimitUp := ips[0], ips[len(ips)-1]
-				simNetConfs := cam.expandIPRnage(ips, ipLimitLow, ipLimitUp, func(proc esxi.SIPProc) bool {
+				simNetConfs := cam.expandIPRange(ips, ipLimitLow, ipLimitUp, func(proc esxi.SIPProc) bool {
 					return proc.IsHost
 				}, nInfo.IPPool, existedIpPool)
 				for k := range simNetConfs {
@@ -307,8 +308,8 @@ func (cam *SCloudaccountManager) prepareNets(ctx context.Context, userCred mccli
 				}
 			}
 		}
-		for vlan, ips := range vs.Vlans {
-			simNetConfs := cam.expandIPRnage(ips, 0, 0, func(proc esxi.SIPProc) bool {
+		/*for vlan, ips := range vs.Vlans {
+			simNetConfs := cam.expandIPRange(ips, 0, 0, func(proc esxi.SIPProc) bool {
 				return proc.VlanId == vlan
 			}, nInfo.IPPool, existedIpPool)
 			for j := range simNetConfs {
@@ -318,7 +319,7 @@ func (cam *SCloudaccountManager) prepareNets(ctx context.Context, userCred mccli
 					CASimpleNetConf: simNetConfs[j],
 				})
 			}
-		}
+		}*/
 		output.Wires = append(output.Wires, wire)
 	}
 
@@ -345,7 +346,7 @@ func (cam *SCloudaccountManager) parseSimpleVms(vms []esxi.SSimpleVM, existedIpP
 	return guests
 }
 
-func (cam *SCloudaccountManager) expandIPRnage(ips []netutils.IPV4Addr, limitLow, limitUp netutils.IPV4Addr,
+func (cam *SCloudaccountManager) expandIPRange(ips []netutils.IPV4Addr, limitLow, limitUp netutils.IPV4Addr,
 	expand func(esxi.SIPProc) bool, ipPool esxi.SIPPool, existedIpPool *sIPPool) []api.CASimpleNetConf {
 	ret := make([]api.CASimpleNetConf, 0)
 	for i := 0; i < len(ips); i++ {
@@ -494,7 +495,7 @@ func (scm *SCloudaccountManager) parseAndSuggestSingleWire(params sParseAndSugge
 		for i, nets := range networks {
 			score := 0
 			tmpSNs := make(map[netutils.IPV4Addr]*SNetwork)
-			ipRanges := make([]netutils.IPV4AddrRange, len(nets))
+			ipRanges := make([]*netutils.IPV4AddrRange, len(nets))
 			for i2 := range ipRanges {
 				ipRanges[i2] = nets[i2].GetIPRange()
 			}
@@ -560,10 +561,10 @@ func (scm *SCloudaccountManager) parseAndSuggestSingleWire(params sParseAndSugge
 			})
 		}
 
-		wireNet.Guests = scm.parseSimpleVms(ni.VMs, params.ExistedIpPool)
+		/* wireNet.Guests = scm.parseSimpleVms(ni.VMs, params.ExistedIpPool)
 
 		for vlan, ips := range ni.VlanIps {
-			simNetConfs := scm.expandIPRnage(ips, 0, 0, func(proc esxi.SIPProc) bool {
+			simNetConfs := scm.expandIPRange(ips, 0, 0, func(proc esxi.SIPProc) bool {
 				return proc.VlanId == vlan
 			}, ni.IPPool, params.ExistedIpPool)
 			for i := range simNetConfs {
@@ -573,28 +574,28 @@ func (scm *SCloudaccountManager) parseAndSuggestSingleWire(params sParseAndSugge
 					CASimpleNetConf: simNetConfs[i],
 				})
 			}
-		}
+		}*/
 		output.CAWireNets = append(output.CAWireNets, wireNet)
 	}
 	return output
 }
 
-func (manager *SCloudaccountManager) fetchWires(userCred mcclient.TokenCredential, domainId string, zoneIds []string) ([]SWire, error) {
+func (manager *SCloudaccountManager) fetchWires(ctx context.Context, userCred mcclient.TokenCredential, domainId string, zoneIds []string) ([]SWire, error) {
 	q := WireManager.Query().In("zone_id", zoneIds)
 	if len(domainId) > 0 {
 		ownerId := &db.SOwnerId{}
 		ownerId.DomainId = domainId
-		q = WireManager.FilterByOwner(q, ownerId, rbacutils.ScopeDomain)
+		q = WireManager.FilterByOwner(ctx, q, WireManager, userCred, ownerId, rbacscope.ScopeDomain)
 	} else {
-		q = WireManager.FilterByOwner(q, userCred, rbacutils.ScopeDomain)
+		q = WireManager.FilterByOwner(ctx, q, WireManager, userCred, userCred, rbacscope.ScopeDomain)
 	}
 	wires := make([]SWire, 0, 1)
 	err := db.FetchModelObjects(WireManager, q, &wires)
 	return wires, err
 }
 
-func (manager *SCloudaccountManager) defaultZoneId(userCred mcclient.TokenCredential) (string, error) {
-	zone, err := ZoneManager.FetchByName(userCred, "zone0")
+func (manager *SCloudaccountManager) defaultZoneId(ctx context.Context, userCred mcclient.TokenCredential) (string, error) {
+	zone, err := ZoneManager.FetchByName(ctx, userCred, "zone0")
 	if err != nil {
 		return "", err
 	}
@@ -669,19 +670,4 @@ func (manager *SCloudaccountManager) suggestHostNetworks(ips []netutils.IPV4Addr
 		GuestGateway: gatewayIp.String(),
 	})
 	return ret
-}
-
-func (self *SCloudaccount) StartSyncVMwareNetworkTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string, networkZone string) error {
-	if self.Provider != api.CLOUD_PROVIDER_VMWARE {
-		return errors.ErrNotSupported
-	}
-	params := jsonutils.NewDict()
-	params.Set("zone", jsonutils.NewString(networkZone))
-	task, err := taskman.TaskManager.NewTask(ctx, "CloudAccountSyncVMwareNetworkTask", self, userCred, params, parentTaskId, "", nil)
-	if err != nil {
-		return err
-	}
-	self.SetStatus(userCred, api.CLOUD_PROVIDER_SYNC_NETWORK, "StartSyncVMwareNetworkTask")
-	task.ScheduleRun(nil)
-	return nil
 }

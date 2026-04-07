@@ -18,12 +18,12 @@ import (
 	"fmt"
 	"strings"
 
-	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/apis/compute"
+	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
 	"yunion.io/x/onecloud/pkg/hostman/options"
 	"yunion.io/x/onecloud/pkg/hostman/system_service"
 	"yunion.io/x/onecloud/pkg/util/bwutils"
@@ -101,7 +101,7 @@ func (o *SOVSBridgeDriver) SetupBridgeDev() error {
 func (d *SOVSBridgeDriver) PersistentConfig() error {
 	args := []string{
 		"ovs-vsctl", "set", "Bridge", d.bridge.String(),
-		"other-config:hwaddr=" + d.inter.Mac,
+		"other-config:hwaddr=" + d.inter.GetMac(),
 	}
 	output, err := procutils.NewCommand(args[0], args[1:]...).Output()
 	if err != nil {
@@ -118,23 +118,35 @@ func (d *SOVSBridgeDriver) PersistentConfig() error {
 	return nil
 }
 
-func (o *SOVSBridgeDriver) GenerateIfdownScripts(scriptPath string, nic jsonutils.JSONObject, isSlave bool) error {
-	return o.generateIfdownScripts(o, scriptPath, nic, isSlave)
+func (o *SOVSBridgeDriver) GenerateIfdownScripts(scriptPath string, nic *desc.SGuestNetwork, isVolatileHost bool) error {
+	return o.generateIfdownScripts(o, scriptPath, nic, isVolatileHost)
 }
 
-func (o *SOVSBridgeDriver) GenerateIfupScripts(scriptPath string, nic jsonutils.JSONObject, isSlave bool) error {
-	return o.generateIfupScripts(o, scriptPath, nic, isSlave)
+func (o *SOVSBridgeDriver) GenerateIfupScripts(scriptPath string, nic *desc.SGuestNetwork, isVolatileHost bool) error {
+	return o.generateIfupScripts(o, scriptPath, nic, isVolatileHost)
 }
 
-func (o *SOVSBridgeDriver) getUpScripts(nic jsonutils.JSONObject, isSlave bool) (string, error) {
+func (o *SOVSBridgeDriver) OnVolatileGuestResume(nic *desc.SGuestNetwork) error {
+	cmd := []string{"ovs-vsctl", "set", "Interface", nic.Ifname,
+		fmt.Sprintf("external_ids:iface-id=iface-%s-%s", nic.NetId, nic.Ifname),
+	}
+	output, err := procutils.NewRemoteCommandAsFarAsPossible(cmd[0], cmd[1:]...).Output()
+	if err != nil {
+		log.Errorf("failed exec %v: %s %s", cmd, err, output)
+		return errors.Wrapf(err, "set interface external_ids failed: %s", output)
+	}
+	return nil
+}
+
+func (o *SOVSBridgeDriver) getUpScripts(nic *desc.SGuestNetwork, isVolatileHost bool) (string, error) {
 	var (
-		bridge         = o.bridge.String()
-		ifname, _      = nic.GetString("ifname")
-		ip, _          = nic.GetString("ip")
-		mac, _         = nic.GetString("mac")
-		netId, _       = nic.GetString("net_id")
-		vlan, _        = nic.Int("vlan")
-		vpcProvider, _ = nic.GetString("vpc", "provider")
+		bridge      = o.bridge.String()
+		ifname      = nic.Ifname
+		ip          = nic.Ip
+		mac         = nic.Mac
+		netId       = nic.NetId
+		vlan        = nic.Vlan
+		vpcProvider = nic.Vpc.Provider
 	)
 
 	if vpcProvider == compute.VPC_PROVIDER_OVN {
@@ -148,13 +160,13 @@ func (o *SOVSBridgeDriver) getUpScripts(nic jsonutils.JSONObject, isSlave bool) 
 	s += fmt.Sprintf("MAC='%s'\n", mac)
 	s += fmt.Sprintf("VLAN_ID=%d\n", vlan)
 	s += fmt.Sprintf("NET_ID=%s\n", netId)
-	limit, burst, err := bwutils.GetOvsBwValues(nic)
+	limit, burst, err := bwutils.GetOvsBwValues(nic.Bw, nic.Ip)
 	if err != nil {
 		return "", err
 	}
 	s += fmt.Sprintf("LIMIT=%d\n", limit)
 	s += fmt.Sprintf("BURST=%d\n", burst)
-	bwDownload, err := bwutils.GetDownloadBwValue(nic, options.HostOptions.BwDownloadBandwidth)
+	bwDownload, err := bwutils.GetDownloadBwValue(nic.Bw, nic.Ip, nic.Ifname, options.HostOptions.BwDownloadBandwidth)
 	if err != nil {
 		return "", err
 	}
@@ -173,18 +185,19 @@ func (o *SOVSBridgeDriver) getUpScripts(nic jsonutils.JSONObject, isSlave bool) 
 	s += "    TAG=\"tag=$VLAN_ID\"\n"
 	s += "fi\n"
 	s += "ovs-vsctl add-port $SWITCH $IF $TAG\n"
-	if vpcProvider == compute.VPC_PROVIDER_OVN {
-		if !isSlave {
-			s += "ovs-vsctl set Interface $IF external_ids:iface-id=iface-$NET_ID-$IF\n"
-		}
+	if vpcProvider == compute.VPC_PROVIDER_OVN && !isVolatileHost {
+		s += "ovs-vsctl set Interface $IF external_ids:iface-id=iface-$NET_ID-$IF\n"
 	}
 	s += "PORT=$(ovs-ofctl show $SWITCH | grep -w $IF)\n"
 	s += "PORT=$(echo $PORT | awk 'BEGIN{FS=\"(\"}{print $1}')\n"
 	s += "OFCTL=$(ovs-vsctl get-controller $SWITCH)\n"
-	s += "if [ -z \"$OFCTL\" ]; then\n"
-	s += "    ovs-vsctl set Interface $IF ingress_policing_rate=$LIMIT\n"
-	s += "    ovs-vsctl set Interface $IF ingress_policing_burst=$BURST\n"
-	s += "fi\n"
+	if nic.Driver != compute.NETWORK_DRIVER_VFIO {
+		s += "if [ -z \"$OFCTL\" ]; then\n"
+		s += "    ovs-vsctl set Interface $IF ingress_policing_rate=$LIMIT\n"
+		s += "    ovs-vsctl set Interface $IF ingress_policing_burst=$BURST\n"
+		s += "fi\n"
+	}
+
 	s += "if [ $LIMIT_DOWNLOAD != \"0mbit\" ]; then\n"
 	s += "    tc qdisc del dev $IF root 2>/dev/null\n"
 	s += "    tc qdisc add dev $IF root handle 1: htb default 10\n"
@@ -196,13 +209,13 @@ func (o *SOVSBridgeDriver) getUpScripts(nic jsonutils.JSONObject, isSlave bool) 
 	return s, nil
 }
 
-func (o *SOVSBridgeDriver) getDownScripts(nic jsonutils.JSONObject, isSlave bool) (string, error) {
+func (o *SOVSBridgeDriver) getDownScripts(nic *desc.SGuestNetwork, isVolatileHost bool) (string, error) {
 	var (
-		bridge    = o.bridge.String()
-		ifname, _ = nic.GetString("ifname")
-		ip, _     = nic.GetString("ip")
-		mac, _    = nic.GetString("mac")
-		vlan, _   = nic.Int("vlan")
+		bridge = o.bridge.String()
+		ifname = nic.Ifname
+		ip     = nic.Ip
+		mac    = nic.Mac
+		vlan   = nic.Vlan
 	)
 
 	s := "#!/bin/bash\n\n"

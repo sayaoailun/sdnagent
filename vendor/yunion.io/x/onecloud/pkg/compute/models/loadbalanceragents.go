@@ -16,8 +16,8 @@ package models
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
-	"fmt"
 	"net/url"
 	"reflect"
 	"text/template"
@@ -33,11 +33,14 @@ import (
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	identity_apis "yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
+	"yunion.io/x/onecloud/pkg/cloudcommon/tsdb"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
 	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
+	"yunion.io/x/onecloud/pkg/util/logclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -66,20 +69,23 @@ func init() {
 
 // TODO
 //
-//  - scrub stale backends: Guests with deleted=1
-//  - agent configuration params
-//
+//   - scrub stale backends: Guests with deleted=1
+//   - agent configuration params
 type SLoadbalancerAgent struct {
 	db.SStandaloneResourceBase
-	SLoadbalancerClusterResourceBase `width:"36" charset:"ascii" nullable:"false" list:"user" create:"required"`
+	SLoadbalancerClusterResourceBase `width:"36" charset:"ascii" nullable:"true" list:"user" update:"admin"`
 
-	Version    string                    `width:"64" nullable:"true" list:"admin" update:"admin"`
-	IP         string                    `width:"32" nullable:"true" list:"admin" update:"admin"`
+	Version    string                    `width:"64" nullable:"true" list:"admin" create:"required" update:"admin"`
+	IP         string                    `width:"32" charset:"ascii" nullable:"true" list:"admin" create:"required"`
+	Interface  string                    `width:"17" charset:"ascii" nullable:"true" list:"admin" create:"required" update:"admin"`
+	Priority   int                       `nullable:"true" list:"user" update:"admin"`
 	HaState    string                    `width:"32" nullable:"true" list:"admin" update:"admin" default:"UNKNOWN"` // LB_HA_STATE_UNKNOWN
 	HbLastSeen time.Time                 `nullable:"true" list:"admin" update:"admin"`
 	HbTimeout  int                       `nullable:"true" list:"admin" update:"admin" create:"optional" default:"3600"`
 	Params     *SLoadbalancerAgentParams `create:"optional" list:"admin" get:"admin"`
 
+	Networks                  time.Time `nullable:"true" list:"admin" update:"admin"`
+	LoadbalancerNetworks      time.Time `nullable:"true" list:"admin" update:"admin"`
 	Loadbalancers             time.Time `nullable:"true" list:"admin" update:"admin"`
 	LoadbalancerListeners     time.Time `nullable:"true" list:"admin" update:"admin"`
 	LoadbalancerListenerRules time.Time `nullable:"true" list:"admin" update:"admin"`
@@ -93,13 +99,10 @@ type SLoadbalancerAgent struct {
 }
 
 type SLoadbalancerAgentParamsVrrp struct {
-	Priority          int `json:",omitzero"`
-	VirtualRouterId   int `json:",omitzero"`
-	GarpMasterRefresh int `json:",omitzero"`
-	Preempt           bool
-	Interface         string
-	AdvertInt         int `json:",omitzero"`
-	Pass              string
+	SLoadbalancerClusterParams
+
+	Priority  int `json:",omitzero"`
+	Interface string
 }
 
 const (
@@ -133,7 +136,7 @@ type SLoadbalancerAgentParams struct {
 }
 
 func (p *SLoadbalancerAgentParamsVrrp) Validate(data *jsonutils.JSONDict) error {
-	if len(p.Interface) == 0 || len(p.Interface) > 16 {
+	/*if len(p.Interface) == 0 || len(p.Interface) > 16 {
 		// TODO printable exclude white space
 		return httperrors.NewInputParameterError("invalid vrrp interface %q", p.Interface)
 	}
@@ -149,10 +152,11 @@ func (p *SLoadbalancerAgentParamsVrrp) Validate(data *jsonutils.JSONDict) error 
 	}
 	if p.AdvertInt < 1 || p.AdvertInt > 255 {
 		return httperrors.NewInputParameterError("invalid vrrp advert_int %d: want [1,255]", p.AdvertInt)
-	}
+	}*/
 	return nil
 }
 
+/*
 func (p *SLoadbalancerAgentParamsVrrp) validatePeer(pp *SLoadbalancerAgentParamsVrrp) error {
 	if p.Priority == pp.Priority {
 		return fmt.Errorf("vrrp priority of peer lbagents must be different, got %d", p.Priority)
@@ -199,7 +203,7 @@ func (p *SLoadbalancerAgentParamsVrrp) initDefault(data *jsonutils.JSONDict) {
 		p.VirtualRouterId = lbagentVrrpDefaultVrid
 	}
 	if !data.Contains("params", "vrrp", "advert_int") {
-		p.AdvertInt = 1
+		p.AdvertInt = 5
 	}
 	if !data.Contains("params", "vrrp", "garp_master_refresh") {
 		p.GarpMasterRefresh = 27
@@ -207,7 +211,7 @@ func (p *SLoadbalancerAgentParamsVrrp) initDefault(data *jsonutils.JSONDict) {
 	if !data.Contains("params", "vrrp", "pass") {
 		p.Pass = "YunionLB"
 	}
-}
+}*/
 
 func (p *SLoadbalancerAgentParamsHaproxy) Validate(data *jsonutils.JSONDict) error {
 	if p.GlobalNbthread < 1 {
@@ -276,8 +280,7 @@ func (p *SLoadbalancerAgentParamsTelegraf) updateBy(pp *SLoadbalancerAgentParams
 func (p *SLoadbalancerAgentParamsTelegraf) initDefault(data *jsonutils.JSONDict) {
 	if p.InfluxDbOutputUrl == "" {
 		baseOpts := &options.Options
-		u, _ := auth.GetServiceURL("influxdb", baseOpts.Region, "",
-			identity_apis.EndpointInterfacePublic)
+		u, _ := tsdb.GetDefaultServiceSourceURL(auth.GetAdminSession(context.Background(), baseOpts.Region), identity_apis.EndpointInterfacePublic)
 		p.InfluxDbOutputUrl = u
 		p.InfluxDbOutputUnsafeSsl = true
 	}
@@ -312,7 +315,7 @@ func (p *SLoadbalancerAgentParams) initDefault(data *jsonutils.JSONDict) {
 	if p.TelegrafConfTmpl == "" {
 		p.TelegrafConfTmpl = loadbalancerTelegrafConfTmplDefaultEncoded
 	}
-	p.Vrrp.initDefault(data)
+	//p.Vrrp.initDefault(data)
 	p.Haproxy.initDefault(data)
 	p.Telegraf.initDefault(data)
 }
@@ -328,9 +331,9 @@ func (p *SLoadbalancerAgentParams) Validate(data *jsonutils.JSONDict) error {
 	if err := p.validateTmpl("telegraf_conf_tmpl", p.TelegrafConfTmpl); err != nil {
 		return err
 	}
-	if err := p.Vrrp.Validate(data); err != nil {
+	/*if err := p.Vrrp.Validate(data); err != nil {
 		return err
-	}
+	}*/
 	if err := p.Haproxy.Validate(data); err != nil {
 		return err
 	}
@@ -346,8 +349,7 @@ func (p *SLoadbalancerAgentParams) needsUpdatePeer(pp *SLoadbalancerAgentParams)
 		p.TelegrafConfTmpl != pp.TelegrafConfTmpl {
 		return true
 	}
-	return p.Vrrp.needsUpdatePeer(&pp.Vrrp) ||
-		p.Haproxy.needsUpdatePeer(&pp.Haproxy) ||
+	return p.Haproxy.needsUpdatePeer(&pp.Haproxy) ||
 		p.Telegraf.needsUpdatePeer(&pp.Telegraf)
 }
 
@@ -356,7 +358,7 @@ func (p *SLoadbalancerAgentParams) updateBy(pp *SLoadbalancerAgentParams) {
 	p.HaproxyConfTmpl = pp.HaproxyConfTmpl
 	p.TelegrafConfTmpl = pp.TelegrafConfTmpl
 
-	p.Vrrp.updateBy(&pp.Vrrp)
+	// p.Vrrp.updateBy(&pp.Vrrp)
 	p.Haproxy.updateBy(&pp.Haproxy)
 	p.Telegraf.updateBy(&pp.Telegraf)
 }
@@ -379,7 +381,7 @@ func (man *SLoadbalancerAgentManager) GetPropertyDefaultParams(ctx context.Conte
 	{
 		clusterV := validators.NewModelIdOrNameValidator("cluster", "loadbalancercluster", userCred)
 		clusterV.Optional(true)
-		if err := clusterV.Validate(query.(*jsonutils.JSONDict)); err != nil {
+		if err := clusterV.Validate(ctx, query.(*jsonutils.JSONDict)); err != nil {
 			return nil, err
 		}
 		if clusterV.Model != nil {
@@ -402,102 +404,16 @@ func (man *SLoadbalancerAgentManager) GetPropertyDefaultParams(ctx context.Conte
 }
 
 func (man *SLoadbalancerAgentManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	clusterV := validators.NewModelIdOrNameValidator("cluster", "loadbalancercluster", ownerId)
+	// clusterV := validators.NewModelIdOrNameValidator("cluster", "loadbalancercluster", ownerId)
 	{
 		keyV := map[string]validators.IValidator{
 			"hb_timeout": validators.NewNonNegativeValidator("hb_timeout").Default(3600),
-			"cluster":    clusterV,
+			// "cluster":    clusterV,
 		}
 		for _, v := range keyV {
-			if err := v.Validate(data); err != nil {
+			if err := v.Validate(ctx, data); err != nil {
 				return nil, err
 			}
-		}
-	}
-	{
-		cluster := clusterV.Model.(*SLoadbalancerCluster)
-		lbagents, err := LoadbalancerClusterManager.getLoadbalancerAgents(cluster.Id)
-		if err != nil {
-			return nil, httperrors.NewGeneralError(err)
-		}
-		params := &SLoadbalancerAgentParams{}
-		{
-			if len(lbagents) > 0 {
-				peerLbagent := &lbagents[0]
-				peerParams := peerLbagent.Params
-				params.Vrrp.setByPeer(&peerParams.Vrrp)
-			}
-			if len(lbagents) == 0 && !data.Contains("params", "vrrp", "virtual_router_id") {
-				otherLbagents := []SLoadbalancerAgent{}
-				q := man.Query().GroupBy("cluster_id")
-				err := db.FetchModelObjects(LoadbalancerAgentManager, q, &otherLbagents)
-				if err != nil {
-					return nil, httperrors.NewInternalServerError("fetch lbagents of other clusters: %v", err)
-				}
-				maxVrid := -1
-				for i := range otherLbagents {
-					lbagent := &otherLbagents[i]
-					if lbagent.ClusterId == cluster.Id {
-						continue
-					}
-					vrid := lbagent.Params.Vrrp.VirtualRouterId
-					if vrid > maxVrid {
-						maxVrid = vrid
-					}
-				}
-				if maxVrid > 0 && maxVrid < 255 {
-					params.Vrrp.VirtualRouterId = maxVrid + 1
-				} else {
-					params.Vrrp.VirtualRouterId = lbagentVrrpDefaultVrid
-				}
-			}
-			if !data.Contains("params", "vrrp", "priority") {
-				// a backup to all existing members
-				minPrio := 256
-				for i := range lbagents {
-					peerLbagent := &lbagents[i]
-					priority := peerLbagent.Params.Vrrp.Priority
-					if priority < minPrio {
-						minPrio = priority
-					}
-				}
-				if minPrio > 1 {
-					params.Vrrp.Priority = minPrio - 1
-				} else {
-					params.Vrrp.Priority = lbagentVrrpDefaultPrio
-				}
-			}
-			var (
-				oldVrrpParams jsonutils.JSONObject
-				err           error
-			)
-			if oldVrrpParams, err = data.Get("params", "vrrp"); err != nil {
-				oldVrrpParams = jsonutils.NewDict()
-			}
-			vrrpParams := jsonutils.Marshal(params.Vrrp).(*jsonutils.JSONDict)
-			vrrpParams.UpdateDefault(oldVrrpParams)
-			data.Add(vrrpParams, "params", "vrrp")
-			paramsV := validators.NewStructValidator("params", params)
-			if err := paramsV.Validate(data); err != nil {
-				return nil, err
-			}
-		}
-		for i := range lbagents {
-			peerLbagent := &lbagents[i]
-			peerParams := peerLbagent.Params
-			err := params.Vrrp.validatePeer(&peerParams.Vrrp)
-			if err != nil {
-				return nil, httperrors.NewConflictError("conflict with lbagent %s(%s): %v", peerLbagent.Name, peerLbagent.Id, err)
-			}
-		}
-		vrrpRouterId := params.Vrrp.VirtualRouterId
-		otherCluster, err := LoadbalancerClusterManager.findByVrrpRouterIdInZone(cluster.ZoneId, vrrpRouterId)
-		if err != nil {
-			return nil, err
-		}
-		if otherCluster != nil && otherCluster.Id != cluster.Id {
-			return nil, httperrors.NewConflictError("lbcluster %s(%s) already has virtual_router_id %d",
-				otherCluster.Name, otherCluster.Id, vrrpRouterId)
 		}
 	}
 
@@ -512,6 +428,25 @@ func (man *SLoadbalancerAgentManager) ValidateCreateData(ctx context.Context, us
 	}
 	data.Update(jsonutils.Marshal(input))
 	return data, nil
+}
+
+func (agent *SLoadbalancerAgent) PostCreate(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	ownerId mcclient.IIdentityProvider,
+	query jsonutils.JSONObject,
+	data jsonutils.JSONObject,
+) {
+	params := SLoadbalancerAgentParams{}
+	params.initDefault(data.(*jsonutils.JSONDict))
+
+	_, err := db.Update(agent, func() error {
+		agent.Params = &params
+		return nil
+	})
+	if err != nil {
+		log.Errorf("init params fail: %s", err)
+	}
 }
 
 // 负载均衡Agent列表
@@ -578,106 +513,6 @@ func (man *SLoadbalancerAgentManager) QueryDistinctExtraField(q *sqlchemy.SQuery
 	return q, httperrors.ErrNotFound
 }
 
-func (man *SLoadbalancerAgentManager) CleanPendingDeleteLoadbalancers(ctx context.Context, userCred mcclient.TokenCredential, isStart bool) {
-	agents := []SLoadbalancerAgent{}
-	{
-		// find active agents
-		err := man.Query().All(&agents)
-		if err != nil {
-			log.Errorf("query agents failed")
-			return
-		}
-		i := 0
-		for _, agent := range agents {
-			if !agent.IsActive() {
-				continue
-			}
-			agents[i] = agent
-			i++
-		}
-		agents = agents[:i]
-	}
-	men := map[string]db.IModelManager{
-		"loadbalancers":               LoadbalancerManager,
-		"loadbalancer_listeners":      LoadbalancerListenerManager,
-		"loadbalancer_listener_rules": LoadbalancerListenerRuleManager,
-		"loadbalancer_backend_groups": LoadbalancerBackendGroupManager,
-		"loadbalancer_backends":       LoadbalancerBackendManager,
-		"loadbalancer_acls":           LoadbalancerAclManager,
-		"loadbalancer_certificates":   LoadbalancerCertificateManager,
-	}
-	agentsData := jsonutils.Marshal(&agents).(*jsonutils.JSONArray)
-	for fieldName, man := range men {
-		var (
-			keyPlural = man.KeywordPlural()
-			now       = time.Now()
-			minT      = now
-		)
-		if len(agents) > 0 {
-			// find min updated_at seen by these active agents
-			for i := 0; i < agentsData.Length(); i++ {
-				agentData, _ := agentsData.GetAt(i)
-				t, err := agentData.GetTime(fieldName)
-				if err != nil {
-					continue
-				}
-				if minT.After(t) {
-					minT = t
-				}
-			}
-			if minT.Equal(now) {
-				log.Warningf("%s: no agents has reported yet", keyPlural)
-				continue
-			}
-		} else {
-			// when no active agents exists, we are free to go
-		}
-		{
-			// find resources pending deleted before minT
-			q := man.Query().IsTrue("pending_deleted").LT("pending_deleted_at", minT)
-			rows, err := q.Rows()
-			if err != nil {
-				log.Errorf("%s: query pending_deleted_at < %s: %s", keyPlural, minT, err)
-				continue
-			}
-			defer rows.Close()
-			for rows.Next() {
-				m, err := db.NewModelObject(man)
-				if err != nil {
-					log.Errorf("%s: new model object failed: %s", keyPlural, err)
-					continue
-				}
-				if err := q.Row2Struct(rows, m); err != nil {
-					log.Errorf("%s: Row2Struct: %s", keyPlural, err)
-					continue
-				}
-				{
-					// find real delete method
-					rv := reflect.Indirect(reflect.ValueOf(m))
-					baseRv := rv.FieldByName("SVirtualResourceBase")
-					if !baseRv.IsValid() {
-						baseRv = rv.FieldByName("SSharableVirtualResourceBase")
-					}
-					if !baseRv.IsValid() {
-						log.Errorf("%s: cannot find base resource field", keyPlural)
-						break // no need to try again
-					}
-					// now update deleted,deleted_at fields
-					realDeleteMethod := baseRv.Addr().MethodByName("Delete")
-					retRv := realDeleteMethod.Call([]reflect.Value{
-						reflect.ValueOf(ctx),
-						reflect.ValueOf(userCred),
-					})
-					err := retRv[0].Interface()
-					if !gotypes.IsNil(err) {
-						log.Errorf("%s: real delete failed: %s", keyPlural, err.(error))
-					}
-				}
-			}
-		}
-	}
-}
-
 func (lbagent *SLoadbalancerAgent) ValidateUpdateData(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
 	if data.Contains("cluster_id") {
 		data.Remove("cluster_id")
@@ -687,12 +522,14 @@ func (lbagent *SLoadbalancerAgent) ValidateUpdateData(ctx context.Context, userC
 			"hb_timeout": validators.NewNonNegativeValidator("hb_timeout").Optional(true),
 		}
 		for _, v := range keyV {
-			if err := v.Validate(data); err != nil {
+			if err := v.Validate(ctx, data); err != nil {
 				return nil, err
 			}
 		}
 	}
 	keys := map[string]time.Time{
+		"networks":                    lbagent.Networks,
+		"loadbalancer_networks":       lbagent.LoadbalancerNetworks,
 		"loadbalancers":               lbagent.Loadbalancers,
 		"loadbalancer_listeners":      lbagent.LoadbalancerListeners,
 		"loadbalancer_listener_rules": lbagent.LoadbalancerListenerRules,
@@ -721,6 +558,13 @@ func (lbagent *SLoadbalancerAgent) ValidateUpdateData(ctx context.Context, userC
 	}
 	data.Set("hb_last_seen", jsonutils.NewTimeString(time.Now()))
 	return data, nil
+}
+
+func (agent *SLoadbalancerAgent) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
+	if len(agent.ClusterId) > 0 {
+		return errors.Wrap(httperrors.ErrResourceBusy, "agent join a cluster")
+	}
+	return agent.SStandaloneResourceBase.ValidateDeleteCondition(ctx, info)
 }
 
 func (manager *SLoadbalancerAgentManager) FetchCustomizeColumns(
@@ -789,9 +633,21 @@ func (man *SLoadbalancerAgentManager) getByClusterId(clusterId string) ([]SLoadb
 	r := []SLoadbalancerAgent{}
 	q := man.Query().Equals("cluster_id", clusterId)
 	if err := db.FetchModelObjects(man, q, &r); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "FetchModelObjects")
 	}
 	return r, nil
+}
+
+func (lbagent *SLoadbalancerAgent) getCluster() *SLoadbalancerCluster {
+	if len(lbagent.ClusterId) == 0 {
+		return nil
+	}
+	clusterObj, err := LoadbalancerClusterManager.FetchById(lbagent.ClusterId)
+	if err != nil {
+		log.Errorf("SLoadbalancerAgent.getCluster error %s", err)
+		return nil
+	}
+	return clusterObj.(*SLoadbalancerCluster)
 }
 
 func (lbagent *SLoadbalancerAgent) PerformHb(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
@@ -804,7 +660,7 @@ func (lbagent *SLoadbalancerAgent) PerformHb(ctx context.Context, userCred mccli
 		}
 		for _, v := range keyV {
 			v.Optional(true)
-			if err := v.Validate(data); err != nil {
+			if err := v.Validate(ctx, data); err != nil {
 				return nil, err
 			}
 		}
@@ -846,47 +702,112 @@ func (lbagent *SLoadbalancerAgent) IsActive() bool {
 	return true
 }
 
+func (lbagent *SLoadbalancerAgent) PerformJoinCluster(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+	input api.LoadbalancerAgentJoinClusterInput,
+) (*jsonutils.JSONDict, error) {
+	if len(lbagent.ClusterId) > 0 {
+		return nil, errors.Wrap(httperrors.ErrConflict, "lbagent has been join cluster")
+	}
+	clusterObj, err := LoadbalancerClusterManager.FetchByIdOrName(ctx, userCred, input.ClusterId)
+	if err != nil {
+		if errors.Cause(err) == sql.ErrNoRows {
+			return nil, errors.Wrapf(httperrors.ErrNotFound, "%s %s", LoadbalancerClusterManager.Keyword(), input.ClusterId)
+		} else {
+			return nil, errors.Wrap(err, "LoadbalancerClusterManager.FetchById")
+		}
+	}
+	cluster := clusterObj.(*SLoadbalancerCluster)
+
+	lockman.LockObject(ctx, cluster)
+	defer lockman.ReleaseObject(ctx, cluster)
+
+	peerAgents, err := LoadbalancerAgentManager.getByClusterId(cluster.Id)
+	if err != nil {
+		return nil, errors.Wrap(err, "LoadbalancerAgentManager.getByClusterId")
+	}
+	if len(peerAgents) >= 2 {
+		return nil, errors.Wrap(httperrors.ErrTooLarge, "too many agents")
+	}
+	priority := 255
+	if input.Priority > 0 {
+		for i := range peerAgents {
+			if input.Priority == peerAgents[i].Priority {
+				return nil, errors.Wrap(httperrors.ErrDuplicateId, "duplicate priority in same cluster")
+			}
+		}
+		priority = input.Priority
+	} else {
+		for i := range peerAgents {
+			if priority >= peerAgents[i].Priority {
+				priority = peerAgents[i].Priority - 1
+			}
+		}
+	}
+	var params SLoadbalancerAgentParams
+	if lbagent.Params != nil {
+		params = *lbagent.Params
+	}
+	params.Vrrp.SLoadbalancerClusterParams = *cluster.Params
+	_, err = db.Update(lbagent, func() error {
+		lbagent.ClusterId = cluster.Id
+		lbagent.Priority = priority
+		lbagent.Params = &params
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "Update")
+	} else {
+		notes := struct {
+			ClusterId string
+			Priority  int
+		}{
+			ClusterId: cluster.Id,
+			Priority:  priority,
+		}
+		logclient.AddActionLogWithContext(ctx, lbagent, logclient.ACT_ATTACH_HOST, notes, userCred, true)
+	}
+	return nil, nil
+}
+
+func (lbagent *SLoadbalancerAgent) PerformLeaveCluster(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+	data api.LoadbalancerAgentLeaveClusterInput,
+) (*jsonutils.JSONDict, error) {
+	if len(lbagent.ClusterId) == 0 {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "lbagent not belong to any cluster")
+	}
+	oldClusterId := lbagent.ClusterId
+	_, err := db.Update(lbagent, func() error {
+		lbagent.ClusterId = ""
+		lbagent.HaState = api.LB_HA_STATE_UNKNOWN
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "Update")
+	} else {
+		notes := struct {
+			ClusterId string
+		}{
+			ClusterId: oldClusterId,
+		}
+		logclient.AddActionLogWithContext(ctx, lbagent, logclient.ACT_DETACH_HOST, notes, userCred, true)
+	}
+	return nil, nil
+}
+
 func (lbagent *SLoadbalancerAgent) PerformParamsPatch(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
 	oldParams := lbagent.Params
 	params := gotypes.DeepCopy(*lbagent.Params).(SLoadbalancerAgentParams)
 	d := jsonutils.NewDict()
 	d.Set("params", data)
 	paramsV := validators.NewStructValidator("params", &params)
-	if err := paramsV.Validate(d); err != nil {
+	if err := paramsV.Validate(ctx, d); err != nil {
 		return nil, err
-	}
-	// new vrrp virtual_router_id should be unique across clusters
-	if params.Vrrp.VirtualRouterId != oldParams.Vrrp.VirtualRouterId {
-		clusterM, err := LoadbalancerClusterManager.FetchById(lbagent.ClusterId)
-		if err != nil {
-			return nil, httperrors.NewGeneralError(err)
-		}
-		cluster := clusterM.(*SLoadbalancerCluster)
-		otherCluster, err := LoadbalancerClusterManager.findByVrrpRouterIdInZone(cluster.ZoneId, params.Vrrp.VirtualRouterId)
-		if err != nil {
-			return nil, err
-		}
-		if otherCluster != nil {
-			return nil, httperrors.NewConflictError("lbcluster %s(%s) already has virtual_router_id %d",
-				otherCluster.Name, otherCluster.Id, params.Vrrp.VirtualRouterId)
-		}
-	}
-	// new vrrp priority should be unique in the cluster
-	if params.Vrrp.Priority != oldParams.Vrrp.Priority {
-		lbagents, err := LoadbalancerClusterManager.getLoadbalancerAgents(lbagent.ClusterId)
-		if err != nil {
-			return nil, httperrors.NewGeneralError(err)
-		}
-		for i := range lbagents {
-			peerLbagent := &lbagents[i]
-			if peerLbagent.Id == lbagent.Id {
-				continue
-			}
-			if peerLbagent.Params.Vrrp.Priority == params.Vrrp.Priority {
-				return nil, httperrors.NewConflictError("peer lbagent %s(%s) already has vrrp priority %d",
-					peerLbagent.Name, peerLbagent.Id, params.Vrrp.Priority)
-			}
-		}
 	}
 	{
 		diff, err := db.Update(lbagent, func() error {

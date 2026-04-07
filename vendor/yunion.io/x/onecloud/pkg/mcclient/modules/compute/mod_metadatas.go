@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/util/printutils"
 	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/httperrors"
@@ -42,14 +43,19 @@ func init() {
 		[]string{"id", "key", "value"},
 		[]string{})}
 	// !!! Register computer metadata ONLY !!! QIUJIAN
-	modules.RegisterCompute(&ComputeMetadatas)
+	// allpw register multiple metadatas! 20240815
+	modules.Register(&ComputeMetadatas)
 
 	IdentityMetadatas = MetadataManager{modules.NewIdentityV3Manager("metadata", "metadatas",
 		[]string{"id", "key", "value"},
 		[]string{})}
+	modules.Register(&IdentityMetadatas)
+
 	ImageMetadatas = MetadataManager{modules.NewImageManager("metadata", "metadatas",
 		[]string{"id", "key", "value"},
 		[]string{})}
+
+	modules.Register(&ImageMetadatas)
 }
 
 func (this *MetadataManager) getModule(session *mcclient.ClientSession, params jsonutils.JSONObject) (modulebase.Manager, error) {
@@ -92,18 +98,18 @@ func (this *MetadataManager) getModule(session *mcclient.ClientSession, params j
 		}
 	}
 
-	_, err := session.GetServiceURL(service, "", "")
+	_, err := session.GetServiceURL(service, "")
 	if err != nil {
 		return nil, httperrors.NewNotFoundError("service %s not found error: %v", service, err)
 	}
 
 	return &modulebase.ResourceManager{
-		BaseManager: *modulebase.NewBaseManager(service, "", "", []string{}, []string{}, ""),
+		BaseManager: *modulebase.NewBaseManager(service, "", "", []string{}, []string{}),
 		Keyword:     "metadata", KeywordPlural: "metadatas",
 	}, nil
 }
 
-func (this *MetadataManager) List(session *mcclient.ClientSession, params jsonutils.JSONObject) (*modulebase.ListResult, error) {
+func (this *MetadataManager) List(session *mcclient.ClientSession, params jsonutils.JSONObject) (*printutils.ListResult, error) {
 	mod, err := this.getModule(session, params)
 	if err != nil {
 		return nil, err

@@ -18,20 +18,20 @@ import (
 	"context"
 	"database/sql"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -76,8 +76,8 @@ func (manager *SDBInstanceDatabaseManager) GetContextManagers() [][]db.IModelMan
 	}
 }
 
-func (manager *SDBInstanceDatabaseManager) ResourceScope() rbacutils.TRbacScope {
-	return rbacutils.ScopeProject
+func (manager *SDBInstanceDatabaseManager) ResourceScope() rbacscope.TRbacScope {
+	return rbacscope.ScopeProject
 }
 
 func (self *SDBInstanceDatabase) GetOwnerId() mcclient.IIdentityProvider {
@@ -101,15 +101,15 @@ func (manager *SDBInstanceDatabaseManager) FetchOwnerId(ctx context.Context, dat
 	return db.FetchProjectInfo(ctx, data)
 }
 
-func (manager *SDBInstanceDatabaseManager) FilterByOwner(q *sqlchemy.SQuery, userCred mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
-	if userCred != nil {
+func (manager *SDBInstanceDatabaseManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	if owner != nil {
 		sq := DBInstanceManager.Query("id")
 		switch scope {
-		case rbacutils.ScopeProject:
-			sq = sq.Equals("tenant_id", userCred.GetProjectId())
+		case rbacscope.ScopeProject:
+			sq = sq.Equals("tenant_id", owner.GetProjectId())
 			return q.In("dbinstance_id", sq.SubQuery())
-		case rbacutils.ScopeDomain:
-			sq = sq.Equals("domain_id", userCred.GetProjectDomainId())
+		case rbacscope.ScopeDomain:
+			sq = sq.Equals("domain_id", owner.GetProjectDomainId())
 			return q.In("dbinstance_id", sq.SubQuery())
 		}
 	}
@@ -213,7 +213,7 @@ func (manager *SDBInstanceDatabaseManager) ValidateCreateData(ctx context.Contex
 	if len(input.DBInstance) == 0 {
 		return nil, httperrors.NewMissingParameterError("dbinstance")
 	}
-	_instance, err := DBInstanceManager.FetchByIdOrName(userCred, input.DBInstance)
+	_instance, err := DBInstanceManager.FetchByIdOrName(ctx, userCred, input.DBInstance)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, httperrors.NewResourceNotFoundError("failed to found dbinstance %s", input.DBInstance)
@@ -257,7 +257,7 @@ func (self *SDBInstanceDatabase) PostCreate(ctx context.Context, userCred mcclie
 }
 
 func (self *SDBInstanceDatabase) StartDBInstanceDatabaseCreateTask(ctx context.Context, userCred mcclient.TokenCredential, params *jsonutils.JSONDict, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_DATABASE_CREATING, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_DATABASE_CREATING, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceDatabaseCreateTask", self, userCred, params, parentTaskId, "", nil)
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
@@ -375,7 +375,7 @@ func (manager *SDBInstanceDatabaseManager) SyncDBInstanceDatabases(ctx context.C
 	}
 
 	for i := 0; i < len(removed); i++ {
-		err := removed[i].Purge(ctx, userCred)
+		err := removed[i].RealDelete(ctx, userCred)
 		if err != nil {
 			result.DeleteError(err)
 		} else {
@@ -451,7 +451,7 @@ func (self *SDBInstanceDatabase) CustomizeDelete(ctx context.Context, userCred m
 }
 
 func (self *SDBInstanceDatabase) StartDBInstanceDatabaseDeleteTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_DATABASE_DELETING, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_DATABASE_DELETING, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceDatabaseDeleteTask", self, userCred, nil, parentTaskId, "", nil)
 	if err != nil {
 		return err
@@ -489,7 +489,7 @@ func (manager *SDBInstanceDatabaseManager) InitializeData() error {
 		return errors.Wrapf(err, "db.FetchModelObjects")
 	}
 	for i := range databases {
-		err = databases[i].Purge(context.Background(), nil)
+		err = databases[i].RealDelete(context.Background(), nil)
 		if err != nil {
 			return errors.Wrapf(err, "purge %s", databases[i].Id)
 		}

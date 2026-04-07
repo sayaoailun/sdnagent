@@ -19,11 +19,13 @@ import (
 	"fmt" // "strings"
 	"time"
 
-	"github.com/golang-plus/errors"
-
+	"yunion.io/x/cloudmux/pkg/apis/compute"
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/tristate"
+	"yunion.io/x/pkg/util/billing"
 	"yunion.io/x/sqlchemy"
 
 	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
@@ -31,11 +33,9 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/compute/baremetal"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/billing"
 	"yunion.io/x/onecloud/pkg/util/logclient"
 )
 
@@ -120,12 +120,12 @@ func (self *SGuest) doPrepaidRecycleNoLock(ctx context.Context, userCred mcclien
 	guestdisks, _ := self.GetGuestDisks()
 
 	storageInfo := make([]baremetal.BaremetalStorage, 0)
-	totalSize := 0
+	totalSize := int64(0)
 	for i := 0; i < len(guestdisks); i += 1 {
 		disk := guestdisks[i].GetDisk()
 		storage, _ := disk.GetStorage()
 
-		totalSize += disk.DiskSize
+		totalSize += int64(disk.DiskSize)
 
 		if len(fakeHost.StorageType) == 0 {
 			fakeHost.StorageType = storage.StorageType
@@ -181,22 +181,29 @@ func (self *SGuest) doPrepaidRecycleNoLock(ctx context.Context, userCred mcclien
 	}
 
 	for i := 0; i < len(guestnics); i += 1 {
-		var nicType string
+		var nicType compute.TNicType
 		if i == 0 {
 			nicType = api.NIC_TYPE_ADMIN
 		}
+		ifname := fmt.Sprintf("eth%d", i)
+		brname := fmt.Sprintf("br%d", i)
+		net, err := guestnics[i].GetNetwork()
+		if err != nil {
+			return errors.Wrapf(err, "GetNetwork")
+		}
 		err = fakeHost.addNetif(ctx, userCred,
 			guestnics[i].MacAddr,
-			guestnics[i].GetNetwork().WireId,
+			1,
+			net.WireId,
 			"",
 			1000,
 			nicType,
-			int8(i),
+			i,
 			tristate.True,
 			1500,
 			false,
-			fmt.Sprintf("eth%d", i),
-			fmt.Sprintf("br%d", i),
+			&ifname,
+			&brname,
 			false,
 			false)
 		if err != nil {
@@ -220,7 +227,7 @@ func (self *SGuest) doPrepaidRecycleNoLock(ctx context.Context, userCred mcclien
 					msg := "inconsistent storage !!!!"
 					log.Errorf(msg)
 					fakeHost.RealDelete(ctx, userCred)
-					return errors.New(msg)
+					return errors.Wrap(httperrors.ErrConflict, msg)
 				}
 			}
 		}
@@ -396,7 +403,7 @@ func doUndoPrepaidRecycleNoLock(ctx context.Context, userCred mcclient.TokenCred
 	if host.RealExternalId != server.ExternalId {
 		msg := "host and server external id not match!!!!"
 		log.Errorf(msg)
-		return errors.New(msg)
+		return errors.Wrap(httperrors.ErrConflict, msg)
 	}
 
 	q := HostManager.Query()
@@ -416,12 +423,12 @@ func doUndoPrepaidRecycleNoLock(ctx context.Context, userCred mcclient.TokenCred
 	if oHostCnt == 0 {
 		msg := "orthordox host not found???"
 		log.Errorf(msg)
-		return errors.New(msg)
+		return errors.Wrap(httperrors.ErrConflict, msg)
 	}
 	if oHostCnt > 1 {
 		msg := fmt.Sprintf("more than 1 (%d) orthordox host found???", oHostCnt)
 		log.Errorf(msg)
-		return errors.New(msg)
+		return errors.Wrap(httperrors.ErrConflict, msg)
 	}
 
 	oHost := SHost{}
@@ -431,7 +438,7 @@ func doUndoPrepaidRecycleNoLock(ctx context.Context, userCred mcclient.TokenCred
 	if err != nil {
 		msg := fmt.Sprintf("fail to query orthordox host %s", err)
 		log.Errorf(msg)
-		return errors.New(msg)
+		return errors.Wrap(err, msg)
 	}
 
 	guestdisks, _ := server.GetGuestDisks()
@@ -445,7 +452,7 @@ func doUndoPrepaidRecycleNoLock(ctx context.Context, userCred mcclient.TokenCred
 			if oHostStorage == nil {
 				msg := fmt.Sprintf("oHost.GetHoststorageByExternalId not found %s", storage.ExternalId)
 				log.Errorf(msg)
-				return errors.New(msg)
+				return errors.Wrap(httperrors.ErrConflict, msg)
 			}
 		}
 	}
@@ -462,7 +469,7 @@ func doUndoPrepaidRecycleNoLock(ctx context.Context, userCred mcclient.TokenCred
 	})
 	if err != nil {
 		log.Errorf("fail to recover vm hostId %s", err)
-		return err
+		return errors.Wrap(err, "Update")
 	}
 
 	for i := 0; i < len(guestdisks); i += 1 {
@@ -474,7 +481,7 @@ func doUndoPrepaidRecycleNoLock(ctx context.Context, userCred mcclient.TokenCred
 			if oHostStorage == nil {
 				msg := fmt.Sprintf("oHost.GetHoststorageByExternalId not found %s", storage.ExternalId)
 				log.Errorf(msg)
-				return errors.New(msg)
+				return errors.Wrap(httperrors.ErrConflict, msg)
 			}
 			oStorage := oHostStorage.GetStorage()
 			_, err = db.Update(disk, func() error {
@@ -532,7 +539,7 @@ func (self *SHost) BorrowIpAddrsFromGuest(ctx context.Context, userCred mcclient
 			return err
 		}
 
-		netif := self.GetNetInterface(guestnics[i].MacAddr)
+		netif := self.GetNetInterface(guestnics[i].MacAddr, 1)
 		if netif == nil {
 			msg := fmt.Sprintf("fail to find netinterface for mac %s", guestnics[i].MacAddr)
 			log.Errorf(msg)
@@ -564,11 +571,11 @@ func (host *SHost) SetGuestCreateNetworkAndDiskParams(ctx context.Context, userC
 		return nil, errors.Wrapf(err, "ivm.GetIDisks")
 	}
 
-	netifs := host.GetNetInterfaces()
+	netifs := host.GetHostNetInterfaces()
 	netIdx := 0
 	input.Networks = make([]*api.NetworkConfig, 0)
 	for i := 0; i < len(netifs); i += 1 {
-		hn := netifs[i].GetBaremetalNetwork()
+		hn := netifs[i].GetHostNetwork()
 		if hn != nil {
 			err := host.DisableNetif(ctx, userCred, &netifs[i], true)
 			if err != nil {
@@ -724,7 +731,17 @@ func (self *SHost) PerformRenewPrepaidRecycle(ctx context.Context, userCred mccl
 		return nil, httperrors.NewInputParameterError("invalid duration %s: %s", durationStr, err)
 	}
 
-	if !GetDriver(api.HOSTTYPE_HYPERVISOR[self.HostType]).IsSupportedBillingCycle(bc) {
+	hostDriver, err := self.GetHostDriver()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetHostDriver")
+	}
+
+	driver, err := GetDriver(hostDriver.GetHypervisor(), hostDriver.GetProvider())
+	if err != nil {
+		return nil, err
+	}
+
+	if !driver.IsSupportedBillingCycle(bc) {
 		return nil, httperrors.NewInputParameterError("unsupported duration %s", durationStr)
 	}
 

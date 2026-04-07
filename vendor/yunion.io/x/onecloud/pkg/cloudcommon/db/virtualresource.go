@@ -16,30 +16,28 @@ package db
 
 import (
 	"context"
-	"strings"
-	"time"
+	"database/sql"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
-	"yunion.io/x/pkg/util/timeutils"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
-	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/policy"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/logclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
 type SVirtualResourceBaseManager struct {
 	SStatusStandaloneResourceBaseManager
 	SProjectizedResourceBaseManager
+	SPendingDeletedBaseManager
 }
 
 func NewVirtualResourceBaseManager(dt interface{}, tableName string, keyword string, keywordPlural string) SVirtualResourceBaseManager {
@@ -52,6 +50,7 @@ func NewVirtualResourceBaseManager(dt interface{}, tableName string, keyword str
 type SVirtualResourceBase struct {
 	SStatusStandaloneResourceBase
 	SProjectizedResourceBase
+	SPendingDeletedBase
 
 	// 云上同步资源是否在本地被更改过配置, local: 更改过, cloud: 未更改过
 	// example: local
@@ -60,10 +59,6 @@ type SVirtualResourceBase struct {
 	// 是否是系统资源
 	IsSystem bool `nullable:"true" default:"false" list:"admin" create:"optional" json:"is_system"`
 
-	// 资源放入回收站时间
-	PendingDeletedAt time.Time `json:"pending_deleted_at" list:"user" update:"admin"`
-	// 资源是否处于回收站中
-	PendingDeleted bool `nullable:"false" default:"false" index:"true" get:"user" list:"user" json:"pending_deleted"`
 	// 资源是否被冻结
 	Freezed bool `nullable:"false" default:"false" get:"user" list:"user" json:"freezed"`
 }
@@ -75,17 +70,6 @@ func (model *SVirtualResourceBase) IsOwner(userCred mcclient.TokenCredential) bo
 func (manager *SVirtualResourceBaseManager) GetIVirtualModelManager() IVirtualModelManager {
 	return manager.GetVirtualObject().(IVirtualModelManager)
 }
-
-/*func (manager *SVirtualResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery, owner mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
-	q = manager.SProjectizedResourceBaseManager.FilterByOwner(q, owner, scope)
-	return q
-}
-*/
-
-/*func (manager *SVirtualResourceBaseManager) FilterByName(q *sqlchemy.SQuery, name string) *sqlchemy.SQuery {
-	q = manager.SStatusStandaloneResourceBaseManager.FilterByName(q, name)
-	return q
-}*/
 
 func (manager *SVirtualResourceBaseManager) GetPropertyStatistics(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) (*apis.StatusStatistic, error) {
 	im, ok := manager.GetVirtualObject().(IModelManager)
@@ -127,6 +111,27 @@ func (manager *SVirtualResourceBaseManager) GetPropertyStatistics(ctx context.Co
 		})
 	}
 	return result, nil
+}
+
+func (manager *SVirtualResourceBaseManager) CustomizedTotalCount(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, totalQ *sqlchemy.SQuery) (int, jsonutils.JSONObject, error) {
+	results := struct {
+		apis.TotalCountBase
+		StatusInfo []apis.StatusStatisticStatusInfo
+	}{}
+
+	err := totalQ.First(&results.TotalCountBase)
+	if err != nil && errors.Cause(err) != sql.ErrNoRows {
+		return -1, nil, errors.Wrapf(err, "First")
+	}
+
+	totalSQ := totalQ.ResetFields().SubQuery()
+	statQ := totalSQ.Query(totalSQ.Field("status"), sqlchemy.COUNT("total_count", totalSQ.Field("id")), sqlchemy.SUM("pending_deleted_count", totalSQ.Field("pending_deleted")))
+	statQ = statQ.GroupBy(totalSQ.Field("status"))
+	err = statQ.All(&results.StatusInfo)
+	if err != nil {
+		return -1, nil, errors.Wrapf(err, "status query")
+	}
+	return results.Count, jsonutils.Marshal(results), nil
 }
 
 func (manager *SVirtualResourceBaseManager) GetPropertyProjectStatistics(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) ([]apis.ProjectStatistic, error) {
@@ -187,7 +192,7 @@ func (manager *SVirtualResourceBaseManager) GetPropertyDomainStatistics(ctx cont
 	return result, q.All(&result)
 }
 
-func (manager *SVirtualResourceBaseManager) FilterByHiddenSystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
+func (manager *SVirtualResourceBaseManager) FilterByHiddenSystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	q = manager.SStatusStandaloneResourceBaseManager.FilterByHiddenSystemAttributes(q, userCred, query, scope)
 
 	isSystem := jsonutils.QueryBoolean(query, "system", false)
@@ -224,40 +229,18 @@ func (model *SVirtualResourceBase) SetProjectInfo(ctx context.Context, userCred 
 	return err
 }
 
-func (manager *SVirtualResourceBaseManager) FilterBySystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
+func (manager *SVirtualResourceBaseManager) FilterBySystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	q = manager.SStatusStandaloneResourceBaseManager.FilterBySystemAttributes(q, userCred, query, scope)
-
-	var pendingDelete string
-	if query != nil {
-		pendingDelete, _ = query.GetString("pending_delete")
-	}
-	pendingDeleteLower := strings.ToLower(pendingDelete)
-	if pendingDeleteLower == "all" || pendingDeleteLower == "any" || utils.ToBool(pendingDeleteLower) {
-		var isAllow bool
-		allowScope, result := policy.PolicyManager.AllowScope(userCred, consts.GetServiceType(), manager.KeywordPlural(), policy.PolicyActionList, "pending_delete")
-		if result.Result.IsAllow() && !scope.HigherThan(allowScope) {
-			isAllow = true
-		}
-		if !isAllow {
-			pendingDeleteLower = ""
-		}
-	}
-
-	if pendingDeleteLower == "all" || pendingDeleteLower == "any" {
-	} else if utils.ToBool(pendingDeleteLower) {
-		q = q.IsTrue("pending_deleted")
-	} else {
-		q = q.Filter(sqlchemy.OR(sqlchemy.IsNull(q.Field("pending_deleted")), sqlchemy.IsFalse(q.Field("pending_deleted"))))
-	}
+	q = manager.SPendingDeletedBaseManager.FilterBySystemAttributes(manager.GetIStandaloneModelManager(), q, userCred, query, scope)
 	return q
 }
 
-func (manager *SVirtualResourceBaseManager) FetchByName(userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
-	return FetchByName(manager, userCred, idStr)
+func (manager *SVirtualResourceBaseManager) FetchByName(ctx context.Context, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
+	return FetchByName(ctx, manager, userCred, idStr)
 }
 
-func (manager *SVirtualResourceBaseManager) FetchByIdOrName(userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
-	return FetchByIdOrName(manager, userCred, idStr)
+func (manager *SVirtualResourceBaseManager) FetchByIdOrName(ctx context.Context, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
+	return FetchByIdOrName(ctx, manager, userCred, idStr)
 }
 
 func (manager *SVirtualResourceBaseManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input apis.VirtualResourceCreateInput) (apis.VirtualResourceCreateInput, error) {
@@ -291,7 +274,7 @@ func (model *SVirtualResourceBase) PostCreate(ctx context.Context, userCred mccl
 		log.Errorf("unable to GetTenantCache: %s", err.Error())
 		return
 	}
-	err = InheritFromTo(ctx, project, model)
+	err = InheritFromTo(ctx, userCred, project, model)
 	if err != nil {
 		log.Errorf("unable to inherit class metadata from poject %s: %s", project.GetId(), err.Error())
 	}
@@ -348,7 +331,8 @@ func (model *SVirtualResourceBase) PerformFreeze(ctx context.Context, userCred m
 	if err != nil {
 		return nil, err
 	}
-	OpsLog.LogEvent(model, ACT_FREEZE, "perform freeze", userCred)
+	vm := model.GetIVirtualModel()
+	OpsLog.LogEvent(model, ACT_FREEZE, vm.GetShortDesc(ctx), userCred)
 	logclient.AddActionLogWithContext(ctx, model, logclient.ACT_FREEZE, "perform freeze", userCred, true)
 	return nil, nil
 }
@@ -364,7 +348,8 @@ func (model *SVirtualResourceBase) PerformUnfreeze(ctx context.Context, userCred
 	if err != nil {
 		return nil, err
 	}
-	OpsLog.LogEvent(model, ACT_UNFREEZE, "perform unfreeze", userCred)
+	vm := model.GetIVirtualModel()
+	OpsLog.LogEvent(model, ACT_UNFREEZE, vm.GetShortDesc(ctx), userCred)
 	logclient.AddActionLogWithContext(ctx, model, logclient.ACT_UNFREEZE, "perform unfreeze", userCred, true)
 	return nil, nil
 }
@@ -394,16 +379,16 @@ func (model *SVirtualResourceBase) PerformChangeOwner(ctx context.Context, userC
 		return nil, nil
 	}
 
-	var requireScope rbacutils.TRbacScope
+	var requireScope rbacscope.TRbacScope
 	if ownerId.GetProjectDomainId() != model.DomainId {
 		// change domain, do check
 		candidates := model.GetIVirtualModel().GetChangeOwnerCandidateDomainIds()
 		if len(candidates) > 0 && !utils.IsInStringArray(ownerId.GetProjectDomainId(), candidates) {
 			return nil, errors.Wrap(httperrors.ErrForbidden, "target domain not in change owner candidate list")
 		}
-		requireScope = rbacutils.ScopeSystem
+		requireScope = rbacscope.ScopeSystem
 	} else {
-		requireScope = rbacutils.ScopeDomain
+		requireScope = rbacscope.ScopeDomain
 	}
 
 	allowScope, policyTags := policy.PolicyManager.AllowScope(userCred, consts.GetServiceType(), model.KeywordPlural(), policy.PolicyActionPerform, "change-owner")
@@ -416,16 +401,18 @@ func (model *SVirtualResourceBase) PerformChangeOwner(ctx context.Context, userC
 		return nil, errors.Wrap(err, "objectConfirmPolicyTags")
 	}
 
-	q := manager.Query().Equals("name", model.GetName())
-	q = manager.FilterByOwner(q, ownerId, manager.NamespaceScope())
-	q = manager.FilterBySystemAttributes(q, nil, nil, manager.ResourceScope())
-	q = q.NotEquals("id", model.GetId())
-	cnt, err := q.CountWithError()
-	if err != nil {
-		return nil, httperrors.NewInternalServerError("check name duplication error: %s", err)
-	}
-	if cnt > 0 {
-		return nil, httperrors.NewDuplicateNameError("name", model.GetName())
+	if !consts.GetChangeOwnerAutoRename() {
+		q := manager.Query().Equals("name", model.GetName())
+		q = manager.FilterByOwner(ctx, q, manager, userCred, ownerId, manager.NamespaceScope())
+		q = manager.FilterBySystemAttributes(q, nil, nil, manager.ResourceScope())
+		q = q.NotEquals("id", model.GetId())
+		cnt, err := q.CountWithError()
+		if err != nil {
+			return nil, httperrors.NewInternalServerError("check name duplication error: %s", err)
+		}
+		if cnt > 0 {
+			return nil, httperrors.NewDuplicateNameError("name", model.GetName())
+		}
 	}
 	former, _ := TenantCacheManager.FetchTenantById(ctx, model.ProjectId)
 	if former == nil {
@@ -465,7 +452,12 @@ func (model *SVirtualResourceBase) PerformChangeOwner(ctx context.Context, userC
 	// cancel usage
 	model.cleanModelUsages(ctx, userCred)
 
+	oldName := model.Name
 	_, err = Update(model, func() error {
+		model.Name, err = GenerateName(ctx, manager, ownerId, oldName)
+		if err != nil {
+			return err
+		}
 		model.DomainId = ownerId.GetProjectDomainId()
 		model.ProjectId = ownerId.GetProjectId()
 		model.ProjectSrc = string(apis.OWNER_SOURCE_LOCAL)
@@ -473,6 +465,10 @@ func (model *SVirtualResourceBase) PerformChangeOwner(ctx context.Context, userC
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "Update")
+	}
+
+	if oldName != model.Name {
+		model.SetMetadata(ctx, "old_name", oldName, userCred)
 	}
 
 	// add usage
@@ -510,35 +506,18 @@ func (model *SVirtualResourceBase) PerformChangeOwner(ctx context.Context, userC
 }
 
 func (model *SVirtualResourceBase) DoPendingDelete(ctx context.Context, userCred mcclient.TokenCredential) error {
-	return model.MarkPendingDelete(userCred)
-}
-
-func (model *SVirtualResourceBase) MarkPendingDelete(userCred mcclient.TokenCredential) error {
 	if !model.PendingDeleted {
-		diff, err := Update(model, func() error {
-			model.PendingDeleted = true
-			model.PendingDeletedAt = timeutils.UtcNow()
-			return nil
-		})
-		if err != nil {
-			log.Errorf("MarkPendingDelete update fail %s", err)
-			return err
-		}
-		OpsLog.LogEvent(model, ACT_PENDING_DELETE, diff, userCred)
-		logclient.AddSimpleActionLog(model, logclient.ACT_PENDING_DELETE, "", userCred, true)
+		return model.SPendingDeletedBase.MarkPendingDelete(model.GetIStandaloneModel(), ctx, userCred, "")
 	}
 	return nil
 }
 
 func (model *SVirtualResourceBase) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
-	if !model.PendingDeleted {
-		model.DoPendingDelete(ctx, userCred)
+	err := model.DoPendingDelete(ctx, userCred)
+	if err != nil {
+		return errors.Wrap(err, "DoPendingDelete")
 	}
 	return DeleteModel(ctx, userCred, model.GetIVirtualModel())
-}
-
-func (model *SVirtualResourceBase) AllowPerformCancelDelete(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) bool {
-	return false
 }
 
 func (model *SVirtualResourceBase) PerformCancelDelete(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {
@@ -553,11 +532,13 @@ func (model *SVirtualResourceBase) PerformCancelDelete(ctx context.Context, user
 }
 
 func (model *SVirtualResourceBase) DoCancelPendingDelete(ctx context.Context, userCred mcclient.TokenCredential) error {
-	err := model.CancelPendingDelete(ctx, userCred)
-	if err == nil {
-		OpsLog.LogEvent(model, ACT_CANCEL_DELETE, model.GetShortDesc(ctx), userCred)
+	if model.PendingDeleted && !model.Deleted {
+		err := model.SPendingDeletedBase.MarkCancelPendingDelete(model.GetIStandaloneModel(), ctx, userCred)
+		if err != nil {
+			return errors.Wrap(err, "MarkCancelPendingDelete")
+		}
 	}
-	return err
+	return nil
 }
 
 func (model *SVirtualResourceBase) VirtualModelManager() IVirtualModelManager {
@@ -568,50 +549,25 @@ func (model *SVirtualResourceBase) GetIVirtualModel() IVirtualModel {
 	return model.GetVirtualObject().(IVirtualModel)
 }
 
-func (model *SVirtualResourceBase) CancelPendingDelete(ctx context.Context, userCred mcclient.TokenCredential) error {
-	if model.PendingDeleted && !model.Deleted {
-		err := model.MarkCancelPendingDelete(ctx, userCred)
-		if err != nil {
-			return errors.Wrap(err, "MarkCancelPendingDelete")
-		}
-	}
-	return nil
-}
-
-func (model *SVirtualResourceBase) MarkCancelPendingDelete(ctx context.Context, userCred mcclient.TokenCredential) error {
-	manager := model.GetModelManager()
-	ownerId := model.GetOwnerId()
-
-	lockman.LockRawObject(ctx, manager.Keyword(), "name")
-	defer lockman.ReleaseRawObject(ctx, manager.Keyword(), "name")
-
-	newName, err := GenerateName(ctx, manager, ownerId, model.Name)
-	if err != nil {
-		return errors.Wrapf(err, "GenerateNam")
-	}
-	diff, err := Update(model, func() error {
-		model.Name = newName
-		model.PendingDeleted = false
-		model.PendingDeletedAt = time.Time{}
-		return nil
-	})
-	if err != nil {
-		return errors.Wrapf(err, "MarkCancelPendingDelete.Update")
-	}
-	OpsLog.LogEvent(model, ACT_CANCEL_DELETE, diff, userCred)
-	return nil
-}
-
 func (model *SVirtualResourceBase) GetShortDesc(ctx context.Context) *jsonutils.JSONDict {
 	desc := model.SStatusStandaloneResourceBase.GetShortDesc(ctx)
 	desc.Add(jsonutils.NewString(model.ProjectId), "owner_tenant_id")
 	tc, _ := TenantCacheManager.FetchTenantById(ctx, model.ProjectId)
 	if tc != nil {
 		desc.Add(jsonutils.NewString(tc.GetName()), "owner_tenant")
-		metadata, _ := GetVisiableMetadata(ctx, tc, nil)
+		metadata, _ := GetVisibleMetadata(ctx, tc, nil)
 		desc.Set("project_tags", jsonutils.Marshal(metadata))
 	}
 	return desc
+}
+
+func (model *SVirtualResourceBase) SetProjectSrc(src apis.TOwnerSource) {
+	if model.ProjectSrc != string(src) {
+		Update(model, func() error {
+			model.ProjectSrc = string(apis.OWNER_SOURCE_CLOUD)
+			return nil
+		})
+	}
 }
 
 func (model *SVirtualResourceBase) SyncCloudProjectId(userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider) {
@@ -626,16 +582,6 @@ func (model *SVirtualResourceBase) SyncCloudProjectId(userCred mcclient.TokenCre
 			OpsLog.LogEvent(model, ACT_SYNC_OWNER, diff, userCred)
 		}
 	}
-}
-
-// GetPendingDeleted implements IPendingDeltable
-func (model *SVirtualResourceBase) GetPendingDeleted() bool {
-	return model.PendingDeleted
-}
-
-// GetPendingDeletedAt implements IPendingDeltable
-func (model *SVirtualResourceBase) GetPendingDeletedAt() time.Time {
-	return model.PendingDeletedAt
 }
 
 func (manager *SVirtualResourceBaseManager) OrderByExtraFields(ctx context.Context, q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query apis.VirtualResourceListInput) (*sqlchemy.SQuery, error) {
@@ -742,6 +688,7 @@ func (manager *SVirtualResourceBaseManager) GetPropertyProjectTagValueTree(
 		manager.GetIVirtualModelManager(),
 		"project",
 		"tenant_id",
+		"",
 		ctx,
 		userCred,
 		query,

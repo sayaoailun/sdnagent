@@ -19,13 +19,17 @@ import (
 )
 
 const (
-	MODELARTS_POOL_STATUS_RUNNING       = "running"
-	MODELARTS_POOL_STATUS_ABNORMAL      = "abnormal"
-	MODELARTS_POOL_STATUS_CREATING      = "creating"
-	MODELARTS_POOL_STATUS_DELETING      = "deleting"
-	MODELARTS_POOL_STATUS_CHANGE_CONFIG = "change_config"
-	MODELARTS_POOL_STATUS_ERROR         = "error"
-	MODELARTS_POOL_STATUS_UNKNOWN       = "unknown"
+	MODELARTS_POOL_STATUS_RUNNING              = "running"
+	MODELARTS_POOL_STATUS_ABNORMAL             = "abnormal"
+	MODELARTS_POOL_STATUS_CREATING             = "creating"
+	MODELARTS_POOL_STATUS_CREATE_FAILED        = "create_failed"
+	MODELARTS_POOL_STATUS_DELETING             = "deleting"
+	MODELARTS_POOL_STATUS_DELETE_FAILED        = "delete_failed"
+	MODELARTS_POOL_STATUS_CHANGE_CONFIG        = "change_config"
+	MODELARTS_POOL_STATUS_CHANGE_CONFIG_FAILED = "change_config_failed"
+	MODELARTS_POOL_STATUS_ERROR                = "error"
+	MODELARTS_POOL_STATUS_UNKNOWN              = "unknown"
+	MODELARTS_POOL_STATUS_TIMEOUT              = "timeout"
 )
 
 type ModelartsPoolCreateInput struct {
@@ -35,7 +39,8 @@ type ModelartsPoolCreateInput struct {
 	CloudregionResourceInput
 	CloudproviderResourceInput
 
-	NodeCount int
+	NodeCount int    `json:"node_count"`
+	Cidr      string `json:"cidr"`
 }
 
 type ModelartsPoolUpdateInput struct {
@@ -68,7 +73,8 @@ func (self ModelartsPoolDetails) GetMetricTags() map[string]string {
 		"account":             self.Account,
 		"external_id":         self.ExternalId,
 	}
-	return ret
+
+	return AppendMetricTags(ret, self.MetadataResourceInfo, self.ProjectizedResourceInfo)
 }
 
 type ModelartsPoolListInput struct {

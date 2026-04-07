@@ -19,9 +19,9 @@ import (
 	"net/http"
 
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/appctx"
 
 	api "yunion.io/x/onecloud/pkg/apis/identity"
-	"yunion.io/x/onecloud/pkg/appctx"
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -30,7 +30,7 @@ import (
 
 var (
 	GUEST_USER  = "guest"
-	GUEST_TOKEN = "guest_token"
+	GUEST_TOKEN = rbacutils.GUEST_TOKEN // "guest_token"
 	GuestToken  = mcclient.SSimpleToken{
 		User:  GUEST_USER,
 		Token: GUEST_TOKEN,

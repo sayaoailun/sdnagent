@@ -17,23 +17,29 @@ package models
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
+	"sync"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
 	"yunion.io/x/sqlchemy"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/apis/billing"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/policy"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
+	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
+	"yunion.io/x/onecloud/pkg/util/yunionmeta"
 )
 
 type SElasticcacheSkuManager struct {
@@ -183,67 +189,6 @@ func (manager *SElasticcacheSkuManager) GetSkuCountByRegion(regionId string) (in
 
 	return q.CountWithError()
 }
-
-/*func (manager *SElasticcacheSkuManager) FetchCustomizeColumns(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, objs []db.IModel, fields stringutils2.SSortedStrings) []*jsonutils.JSONDict {
-	regions := map[string]string{}
-	for i := range objs {
-		cloudregionId := objs[i].(*SElasticcacheSku).CloudregionId
-		if _, ok := regions[cloudregionId]; !ok {
-			regions[cloudregionId] = cloudregionId
-		}
-	}
-
-	regionIds := []string{}
-	for k, _ := range regions {
-		regionIds = append(regionIds, regions[k])
-	}
-
-	if len(regionIds) == 0 {
-		return nil
-	}
-
-	regionObjs := []SCloudregion{}
-	err := CloudregionManager.Query().In("id", regionIds).All(&regionObjs)
-	if err != nil {
-		log.Errorf("elasticcacheSkuManager.FetchCustomizeColumns %s", err)
-		return nil
-	}
-
-	for i := range regionObjs {
-		regionObj := regionObjs[i]
-		regions[regionObj.Id] = regionObj.Name
-	}
-
-	ret := []*jsonutils.JSONDict{}
-	for i := range objs {
-		cloudregionId := objs[i].(*SElasticcacheSku).CloudregionId
-
-		fileds := jsonutils.NewDict()
-		fileds.Set("region", jsonutils.NewString(regions[cloudregionId]))
-		if region, err := db.FetchById(CloudregionManager, cloudregionId); err == nil {
-			fileds.Set("region_external_id", jsonutils.NewString(region.(*SCloudregion).ExternalId))
-			segs := strings.Split(region.(*SCloudregion).ExternalId, "/")
-			if len(segs) >= 2 {
-				fileds.Set("region_ext_id", jsonutils.NewString(segs[1]))
-			}
-		}
-
-		zoneId := objs[i].(*SElasticcacheSku).ZoneId
-		if len(zoneId) > 0 {
-			if zone, err := db.FetchById(ZoneManager, zoneId); err == nil {
-				fileds.Set("zone_external_id", jsonutils.NewString(zone.(*SZone).ExternalId))
-				segs := strings.Split(zone.(*SZone).ExternalId, "/")
-				if len(segs) >= 3 {
-					fileds.Set("zone_ext_id", jsonutils.NewString(segs[2]))
-				}
-			}
-		}
-
-		ret = append(ret, fileds)
-	}
-
-	return ret
-}*/
 
 // 弹性缓存套餐规格列表
 func (manager *SElasticcacheSkuManager) ListItemFilter(
@@ -411,13 +356,24 @@ func (manager *SElasticcacheSkuManager) FetchSkusByRegion(regionID string) ([]SE
 	return skus, nil
 }
 
-func (manager *SElasticcacheSkuManager) SyncElasticcacheSkus(ctx context.Context, userCred mcclient.TokenCredential, region *SCloudregion, extSkuMeta *SSkuResourcesMeta) compare.SyncResult {
-	lockman.LockRawObject(ctx, "elastic-cache-skus", region.Id)
-	defer lockman.ReleaseRawObject(ctx, "elastic-cache-skus", region.Id)
+func (self *SElasticcacheSku) GetElasticcacheCount() (int, error) {
+	q := ElasticcacheManager.Query().Equals("instance_type", self.Name).Equals("zone_id", self.ZoneId)
+	return q.CountWithError()
+}
+
+func (manager *SElasticcacheSkuManager) SyncElasticcacheSkus(ctx context.Context, userCred mcclient.TokenCredential, region *SCloudregion, xor bool) compare.SyncResult {
+	lockman.LockRawObject(ctx, manager.Keyword(), region.Id)
+	defer lockman.ReleaseRawObject(ctx, manager.Keyword(), region.Id)
 
 	syncResult := compare.SyncResult{}
 
-	extSkus, err := extSkuMeta.GetElasticCacheSkusByRegionExternalId(region.ExternalId)
+	meta, err := yunionmeta.FetchYunionmeta(ctx)
+	if err != nil {
+		return syncResult
+	}
+
+	extSkus := []SElasticcacheSku{}
+	err = meta.List(manager.Keyword(), region.ExternalId, &extSkus)
 	if err != nil {
 		syncResult.Error(err)
 		return syncResult
@@ -441,29 +397,47 @@ func (manager *SElasticcacheSkuManager) SyncElasticcacheSkus(ctx context.Context
 	}
 
 	for i := 0; i < len(removed); i += 1 {
-		err = removed[i].MarkAsSoldout(ctx)
+		if cnt, _ := removed[i].GetElasticcacheCount(); cnt > 0 {
+			err = removed[i].MarkAsSoldout(ctx)
+		} else {
+			err = db.RealDeleteModel(ctx, userCred, &removed[i])
+		}
 		if err != nil {
 			syncResult.DeleteError(err)
 		} else {
 			syncResult.Delete()
 		}
 	}
-	for i := 0; i < len(commondb); i += 1 {
-		err = commondb[i].syncWithCloudSku(ctx, userCred, commonext[i])
-		if err != nil {
-			syncResult.UpdateError(err)
-		} else {
-			syncResult.Update()
+	if !xor {
+		for i := 0; i < len(commondb); i += 1 {
+			err = commondb[i].syncWithCloudSku(ctx, userCred, commonext[i])
+			if err != nil {
+				syncResult.UpdateError(err)
+			} else {
+				syncResult.Update()
+			}
 		}
 	}
+	ch := make(chan struct{}, options.Options.SkuBatchSync)
+	defer close(ch)
+	var wg sync.WaitGroup
 	for i := 0; i < len(added); i += 1 {
-		err = manager.newFromCloudSku(ctx, userCred, added[i])
-		if err != nil {
-			syncResult.AddError(err)
-		} else {
+		ch <- struct{}{}
+		wg.Add(1)
+		go func(sku SElasticcacheSku) {
+			defer func() {
+				wg.Done()
+				<-ch
+			}()
+			err = region.newFromPublicCloudSku(ctx, userCred, sku.GetExternalId())
+			if err != nil {
+				syncResult.AddError(err)
+				return
+			}
 			syncResult.Add()
-		}
+		}(added[i])
 	}
+	wg.Wait()
 	return syncResult
 }
 
@@ -474,22 +448,58 @@ func (self *SElasticcacheSku) MarkAsSoldout(ctx context.Context) error {
 		return nil
 	})
 
-	return errors.Wrap(err, "ElasticcacheSku.MarkAsSoldout")
+	return errors.Wrap(err, "MarkAsSoldout")
 }
 
 func (self *SElasticcacheSku) syncWithCloudSku(ctx context.Context, userCred mcclient.TokenCredential, extSku SElasticcacheSku) error {
 	_, err := db.Update(self, func() error {
 		self.PrepaidStatus = extSku.PrepaidStatus
 		self.PostpaidStatus = extSku.PostpaidStatus
-		self.ZoneId = extSku.ZoneId
-		self.SlaveZoneId = extSku.SlaveZoneId
 		return nil
 	})
 	return err
 }
 
-func (manager *SElasticcacheSkuManager) newFromCloudSku(ctx context.Context, userCred mcclient.TokenCredential, extSku SElasticcacheSku) error {
-	return manager.TableSpec().Insert(ctx, &extSku)
+func (self *SCloudregion) newFromPublicCloudSku(ctx context.Context, userCred mcclient.TokenCredential, externalId string) error {
+	meta, err := yunionmeta.FetchYunionmeta(ctx)
+	if err != nil {
+		return err
+	}
+	zones, err := self.GetZones()
+	if err != nil {
+		return errors.Wrap(err, "GetZones")
+	}
+	zoneMaps := map[string]string{}
+	for _, zone := range zones {
+		zoneMaps[zone.ExternalId] = zone.Id
+	}
+
+	skuUrl := self.getMetaUrl(meta.ElasticCacheBase, externalId)
+	sku := &SElasticcacheSku{}
+	sku.SetModelManager(ElasticcacheSkuManager, sku)
+	err = meta.Get(skuUrl, sku)
+	if err != nil {
+		return errors.Wrapf(err, "Get")
+	}
+	sku.Status = api.SkuStatusAvailable
+	sku.CloudregionId = self.Id
+	sku.Provider = self.Provider
+	if len(sku.ZoneId) > 0 {
+		zoneId := yunionmeta.GetZoneIdBySuffix(zoneMaps, sku.ZoneId)
+		if len(zoneId) == 0 {
+			return errors.Wrapf(err, "empty zoneId for %s", sku.ZoneId)
+		}
+		sku.ZoneId = zoneId
+	}
+	if len(sku.SlaveZoneId) > 0 {
+		zoneId := yunionmeta.GetZoneIdBySuffix(zoneMaps, sku.SlaveZoneId)
+		if len(zoneId) == 0 {
+			return errors.Wrapf(err, "empty zoneId for %s", sku.SlaveZoneId)
+		}
+		sku.SlaveZoneId = zoneId
+	}
+
+	return ElasticcacheSkuManager.TableSpec().Insert(ctx, sku)
 }
 
 func (manager *SElasticcacheSkuManager) GetPropertyInstanceSpecs(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) (jsonutils.JSONObject, error) {
@@ -631,7 +641,7 @@ func (manager *SElasticcacheSkuManager) PerformActionSync(ctx context.Context, u
 	}
 
 	for _, v := range keyV {
-		if err := v.Validate(data); err != nil {
+		if err := v.Validate(ctx, data); err != nil {
 			return nil, err
 		}
 	}
@@ -682,4 +692,172 @@ func (manager *SElasticcacheSkuManager) PerformSyncSkus(ctx context.Context, use
 
 func (manager *SElasticcacheSkuManager) GetPropertySyncTasks(ctx context.Context, userCred mcclient.TokenCredential, query api.SkuTaskQueryInput) (jsonutils.JSONObject, error) {
 	return GetPropertySkusSyncTasks(ctx, userCred, query)
+}
+
+func (self *SCloudregion) SyncPrivateCloudCacheSkus(ctx context.Context, userCred mcclient.TokenCredential, iskus []cloudprovider.ICloudElasticcacheSku) compare.SyncResult {
+	lockman.LockRawObject(ctx, self.Id, ElasticcacheSkuManager.Keyword())
+	defer lockman.ReleaseRawObject(ctx, self.Id, ElasticcacheSkuManager.Keyword())
+
+	result := compare.SyncResult{}
+
+	dbSkus, err := self.GetElasticcacheSkus()
+	if err != nil {
+		result.Error(err)
+		return result
+	}
+
+	removed := make([]SElasticcacheSku, 0)
+	commondb := make([]SElasticcacheSku, 0)
+	commonext := make([]cloudprovider.ICloudElasticcacheSku, 0)
+	added := make([]cloudprovider.ICloudElasticcacheSku, 0)
+
+	err = compare.CompareSets(dbSkus, iskus, &removed, &commondb, &commonext, &added)
+	if err != nil {
+		result.Error(err)
+		return result
+	}
+
+	for i := 0; i < len(removed); i += 1 {
+		err = removed[i].Delete(ctx, userCred)
+		if err != nil {
+			result.DeleteError(err)
+			continue
+		}
+		result.Delete()
+	}
+	for i := 0; i < len(added); i += 1 {
+		err = self.newFromCloudElasticcacheSku(ctx, userCred, added[i])
+		if err != nil {
+			result.AddError(err)
+		} else {
+			result.Add()
+		}
+	}
+	return result
+}
+
+func (self *SCloudregion) newFromCloudElasticcacheSku(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudElasticcacheSku) error {
+	sku := &SElasticcacheSku{}
+	sku.SetModelManager(ElasticcacheSkuManager, sku)
+	sku.Name = ext.GetName()
+	sku.InstanceSpec = ext.GetName()
+	sku.Status = apis.SKU_STATUS_AVAILABLE
+	sku.CloudregionId = self.Id
+	sku.ExternalId = ext.GetGlobalId()
+	sku.Provider = self.Provider
+	sku.EngineArch = ext.GetEngineArch()
+	sku.LocalCategory = ext.GetLocalCategory()
+	sku.PrepaidStatus = ext.GetPrepaidStatus()
+	sku.PostpaidStatus = ext.GetPostpaidStatus()
+	sku.Engine = ext.GetEngine()
+	sku.EngineVersion = ext.GetEngineVersion()
+	sku.CpuArch = ext.GetCpuArch()
+	sku.StorageType = ext.GetStorageType()
+	sku.MemorySizeMB = ext.GetMemorySizeMb()
+	sku.PerformanceType = ext.GetPerformanceType()
+	sku.NodeType = ext.GetNodeType()
+	sku.DiskSizeGB = ext.GetDiskSizeGb()
+	sku.ShardNum = ext.GetShardNum()
+	sku.MaxShardNum = ext.GetMaxShardNum()
+	sku.ReplicasNum = ext.GetReplicasNum()
+	sku.MaxReplicasNum = ext.GetMaxReplicasNum()
+	sku.MaxClients = ext.GetMaxClients()
+	sku.MaxConnections = ext.GetMaxConnections()
+	sku.MaxInBandwidthMb = ext.GetMaxInBandwidthMb()
+	sku.MaxMemoryMB = ext.GetMaxMemoryMb()
+	sku.QPS = ext.GetQps()
+
+	zones, err := self.GetZones()
+	if err != nil {
+		return errors.Wrapf(err, "GetZones")
+	}
+	zoneId := ext.GetZoneId()
+	slaveZoneId := ext.GetSlaveZoneId()
+	for i := range zones {
+		if len(zoneId) > 0 && strings.HasSuffix(zones[i].ExternalId, zoneId) {
+			sku.ZoneId = zones[i].Id
+		}
+		if len(slaveZoneId) > 0 && strings.HasSuffix(zones[i].ExternalId, slaveZoneId) {
+			sku.SlaveZoneId = zones[i].Id
+		}
+	}
+
+	return ElasticcacheSkuManager.TableSpec().Insert(ctx, sku)
+}
+
+// 全量同步elasticcache sku列表.
+func SyncElasticCacheSkus(ctx context.Context, userCred mcclient.TokenCredential, isStart bool) {
+	if isStart {
+		cnt, err := CloudaccountManager.Query().IsTrue("is_public_cloud").CountWithError()
+		if err != nil && err != sql.ErrNoRows {
+			log.Debugf("SyncElasticCacheSkus %s.sync skipped...", err)
+			return
+		} else if cnt == 0 {
+			log.Debugf("SyncElasticCacheSkus no public cloud.sync skipped...")
+			return
+		}
+
+		cnt, err = ElasticcacheSkuManager.Query().Limit(1).CountWithError()
+		if err != nil && err != sql.ErrNoRows {
+			log.Errorf("SyncElasticCacheSkus.QueryElasticcacheSku %s", err)
+			return
+		} else if cnt > 0 {
+			log.Debugf("SyncElasticCacheSkus synced skus, skip...")
+			return
+		}
+	}
+	cloudregions := fetchSkuSyncCloudregions()
+	if len(cloudregions) == 0 {
+		return
+	}
+
+	meta, err := yunionmeta.FetchYunionmeta(ctx)
+	if err != nil {
+		log.Errorf("FetchYunionmeta %v", err)
+		return
+	}
+
+	index, err := meta.Index(ElasticcacheSkuManager.Keyword())
+	if err != nil {
+		log.Errorf("get cache sku index error: %v", err)
+		return
+	}
+
+	for i := range cloudregions {
+		region := &cloudregions[i]
+
+		if !region.GetDriver().IsSupportedElasticcache() {
+			continue
+		}
+
+		skuMeta := &SElasticcacheSku{}
+		skuMeta.SetModelManager(ElasticcacheSkuManager, skuMeta)
+		skuMeta.Id = region.ExternalId
+
+		oldMd5 := db.Metadata.GetStringValue(ctx, skuMeta, db.SKU_METADAT_KEY, userCred)
+		newMd5, ok := index[region.ExternalId]
+		if !ok || newMd5 == yunionmeta.EMPTY_MD5 || len(oldMd5) > 0 && newMd5 == oldMd5 {
+			continue
+		}
+
+		db.Metadata.SetValue(ctx, skuMeta, db.SKU_METADAT_KEY, newMd5, userCred)
+
+		result := ElasticcacheSkuManager.SyncElasticcacheSkus(ctx, userCred, region, false)
+		notes := fmt.Sprintf("SyncElasticCacheSkusByRegion %s result: %s", region.Name, result.Result())
+		log.Debugf(notes)
+	}
+}
+
+// 同步Region elasticcache sku列表.
+func SyncElasticCacheSkusByRegion(ctx context.Context, userCred mcclient.TokenCredential, region *SCloudregion, xor bool) error {
+	if !region.GetDriver().IsSupportedElasticcache() {
+		notes := fmt.Sprintf("SyncElasticCacheSkusByRegion %s not support elasticcache", region.Name)
+		log.Infof(notes)
+		return nil
+	}
+
+	result := ElasticcacheSkuManager.SyncElasticcacheSkus(ctx, userCred, region, xor)
+	notes := fmt.Sprintf("SyncElasticCacheSkusByRegion %s result: %s", region.Name, result.Result())
+	log.Infof(notes)
+	return nil
 }

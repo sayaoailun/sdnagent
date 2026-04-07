@@ -22,13 +22,13 @@ import (
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/appctx"
 	"yunion.io/x/pkg/util/stringutils"
 	"yunion.io/x/pkg/util/timeutils"
 	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/logger"
-	"yunion.io/x/onecloud/pkg/appctx"
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -128,7 +128,10 @@ func AddActionLogWithStartable2(task IStartable, model IObject, action string, i
 // }
 
 func addLog(model IObject, action string, iNotes interface{}, userCred mcclient.TokenCredential, success bool, startTime time.Time, module IModule, severity api.TEventSeverity, kind api.TEventKind) {
-	if !consts.OpsLogEnabled() {
+	// avoid log loop
+	if !consts.OpsLogEnabled() && utils.IsInStringArray(action, []string{
+		ACT_CREATE,
+	}) {
 		return
 	}
 	if ok, _ := utils.InStringArray(model.Keyword(), BLACK_LIST_OBJ_TYPE); ok {
@@ -171,6 +174,7 @@ func addLog(model IObject, action string, iNotes interface{}, userCred mcclient.
 	logentry.Add(jsonutils.NewString(userCred.GetProjectDomain()), "project_domain")
 	logentry.Add(jsonutils.NewString(strings.Join(userCred.GetRoles(), ",")), "roles")
 	logentry.Add(jsonutils.NewString(userCred.GetLoginIp()), "ip")
+	logentry.Add(jsonutils.NewBool(userCred.IsSystemAccount()), "is_system_account")
 
 	service := consts.GetServiceType()
 	if len(service) > 0 {
@@ -238,7 +242,9 @@ type logTask struct {
 }
 
 func (t *logTask) Run() {
-	s := DefaultSessionGenerator(context.Background(), t.userCred, "")
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, appctx.APP_CONTEXT_KEY_APPNAME, consts.GetServiceType())
+	s := DefaultSessionGenerator(ctx, t.userCred, "")
 	_, err := t.api.Create(s, t.logentry)
 	if err != nil {
 		log.Errorf("create action log %s failed %s", t.logentry, err)

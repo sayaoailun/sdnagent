@@ -15,6 +15,7 @@
 package clickhouse
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/tristate"
+	"yunion.io/x/pkg/util/stringutils"
 	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/sqlchemy"
@@ -43,6 +45,16 @@ func (click *SClickhouseBackend) Name() sqlchemy.DBBackendName {
 
 func (click *SClickhouseBackend) CaseInsensitiveLikeString() string {
 	return "ILIKE"
+}
+
+func (click *SClickhouseBackend) RegexpWhereClause(cond *sqlchemy.SRegexpConition) string {
+	var buf bytes.Buffer
+	buf.WriteString("match(")
+	buf.WriteString(cond.GetLeft().Reference())
+	buf.WriteString(", ")
+	buf.WriteString(sqlchemy.VarConditionWhereClause(cond.GetRight()))
+	buf.WriteString(")")
+	return buf.String()
 }
 
 // CanUpdate returns wether the backend supports update
@@ -92,6 +104,17 @@ func (click *SClickhouseBackend) UpdateSQLTemplate() string {
 	return "ALTER TABLE `{{ .Table }}` UPDATE {{ .Columns }} WHERE {{ .Conditions }}"
 }
 
+func MySQLExtraOptions(hostport, database, table, user, passwd string) sqlchemy.TableExtraOptions {
+	return sqlchemy.TableExtraOptions{
+		EXTRA_OPTION_ENGINE_KEY:                    EXTRA_OPTION_ENGINE_VALUE_MYSQL,
+		EXTRA_OPTION_CLICKHOUSE_MYSQL_HOSTPORT_KEY: hostport,
+		EXTRA_OPTION_CLICKHOUSE_MYSQL_DATABASE_KEY: database,
+		EXTRA_OPTION_CLICKHOUSE_MYSQL_TABLE_KEY:    table,
+		EXTRA_OPTION_CLICKHOUSE_MYSQL_USERNAME_KEY: user,
+		EXTRA_OPTION_CLICKHOUSE_MYSQL_PASSWORD_KEY: passwd,
+	}
+}
+
 func (click *SClickhouseBackend) GetCreateSQLs(ts sqlchemy.ITableSpec) []string {
 	cols := make([]string, 0)
 	primaries := make([]string, 0)
@@ -117,35 +140,51 @@ func (click *SClickhouseBackend) GetCreateSQLs(ts sqlchemy.ITableSpec) []string 
 			}
 		}
 	}
-	createSql := fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s` (\n%s\n) ENGINE MergeTree", ts.Name(), strings.Join(cols, ",\n"))
-	if len(orderbys) == 0 {
-		orderbys = primaries
-	}
-	if len(partitions) > 0 {
-		createSql += fmt.Sprintf("\nPARTITION BY (%s)", strings.Join(partitions, ", "))
-	}
-	if len(primaries) > 0 {
-		createSql += fmt.Sprintf("\nPRIMARY KEY (%s)", strings.Join(primaries, ", "))
-		newOrderBys := make([]string, len(primaries))
-		copy(newOrderBys, primaries)
-		for _, f := range orderbys {
-			if !utils.IsInStringArray(f, newOrderBys) {
-				newOrderBys = append(newOrderBys, f)
-			}
+	createSql := fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s` (\n%s\n) ENGINE = ", ts.Name(), strings.Join(cols, ",\n"))
+	extraOpts := ts.GetExtraOptions()
+	engine := extraOpts.Get(EXTRA_OPTION_ENGINE_KEY)
+	switch engine {
+	case EXTRA_OPTION_ENGINE_VALUE_MYSQL:
+		// mysql
+		createSql += fmt.Sprintf("MySQL('%s', '%s', '%s', '%s', '%s')",
+			extraOpts.Get(EXTRA_OPTION_CLICKHOUSE_MYSQL_HOSTPORT_KEY),
+			extraOpts.Get(EXTRA_OPTION_CLICKHOUSE_MYSQL_DATABASE_KEY),
+			extraOpts.Get(EXTRA_OPTION_CLICKHOUSE_MYSQL_TABLE_KEY),
+			extraOpts.Get(EXTRA_OPTION_CLICKHOUSE_MYSQL_USERNAME_KEY),
+			extraOpts.Get(EXTRA_OPTION_CLICKHOUSE_MYSQL_PASSWORD_KEY),
+		)
+	default:
+		// mergetree
+		createSql += "MergeTree()"
+		if len(orderbys) == 0 {
+			orderbys = primaries
 		}
-		orderbys = newOrderBys
+		if len(partitions) > 0 {
+			createSql += fmt.Sprintf("\nPARTITION BY (%s)", strings.Join(partitions, ", "))
+		}
+		if len(primaries) > 0 {
+			createSql += fmt.Sprintf("\nPRIMARY KEY (%s)", strings.Join(primaries, ", "))
+			newOrderBys := make([]string, len(primaries))
+			copy(newOrderBys, primaries)
+			for _, f := range orderbys {
+				if !utils.IsInStringArray(f, newOrderBys) {
+					newOrderBys = append(newOrderBys, f)
+				}
+			}
+			orderbys = newOrderBys
+		}
+		if len(orderbys) > 0 {
+			createSql += fmt.Sprintf("\nORDER BY (%s)", strings.Join(orderbys, ", "))
+		} else {
+			createSql += "\nORDER BY tuple()"
+		}
+		if ttlCol != nil {
+			ttlCount, ttlUnit := ttlCol.GetTTL()
+			createSql += fmt.Sprintf("\nTTL `%s` + INTERVAL %d %s", ttlCol.Name(), ttlCount, ttlUnit)
+		}
+		// set default time zone of table to UTC
+		createSql += "\nSETTINGS index_granularity=8192"
 	}
-	if len(orderbys) > 0 {
-		createSql += fmt.Sprintf("\nORDER BY (%s)", strings.Join(orderbys, ", "))
-	} else {
-		createSql += fmt.Sprintf("\nORDER BY tuple()")
-	}
-	if ttlCol != nil {
-		ttlCount, ttlUnit := ttlCol.GetTTL()
-		createSql += fmt.Sprintf("\nTTL `%s` + INTERVAL %d %s", ttlCol.Name(), ttlCount, ttlUnit)
-	}
-	// set default time zone of table to UTC
-	createSql += "\nSETTINGS index_granularity=8192"
 	return []string{
 		createSql,
 	}
@@ -173,7 +212,7 @@ func (click *SClickhouseBackend) FetchTableColumnSpecs(ts sqlchemy.ITableSpec) (
 	if err != nil {
 		return nil, errors.Wrap(err, "show create table")
 	}
-	primaries, orderbys, partition, ttl := parseCreateTable(defStr)
+	primaries, orderbys, partitions, ttl := parseCreateTable(defStr)
 	var ttlCfg sColumnTTL
 	if len(ttl) > 0 {
 		ttlCfg, err = parseTTLExpression(ttl)
@@ -189,8 +228,10 @@ func (click *SClickhouseBackend) FetchTableColumnSpecs(ts sqlchemy.ITableSpec) (
 			if utils.IsInStringArray(clickSpec.Name(), orderbys) {
 				clickSpec.SetOrderBy(true)
 			}
-			if strings.Contains(partition, clickSpec.Name()) {
-				clickSpec.SetPartitionBy(partition)
+			for _, part := range partitions {
+				if stringutils.ContainsWord(part, clickSpec.Name()) {
+					clickSpec.SetPartitionBy(part)
+				}
 			}
 			if ttlCfg.ColName == clickSpec.Name() {
 				clickSpec.SetTTL(ttlCfg.Count, ttlCfg.Unit)
@@ -202,9 +243,24 @@ func (click *SClickhouseBackend) FetchTableColumnSpecs(ts sqlchemy.ITableSpec) (
 }
 
 func (click *SClickhouseBackend) GetColumnSpecByFieldType(table *sqlchemy.STableSpec, fieldType reflect.Type, fieldname string, tagmap map[string]string, isPointer bool) sqlchemy.IColumnSpec {
+	extraOpts := table.GetExtraOptions()
+	engine := extraOpts.Get(EXTRA_OPTION_ENGINE_KEY)
+	isMySQLEngine := false
+	switch engine {
+	case EXTRA_OPTION_ENGINE_VALUE_MYSQL:
+		isMySQLEngine = true
+	}
+	colSpec := click.getColumnSpecByFieldTypeInternal(table, fieldType, fieldname, tagmap, isPointer)
+	if isMySQLEngine && colSpec.IsPrimary() {
+		colSpec.SetPrimary(false)
+	}
+	return colSpec
+}
+
+func (click *SClickhouseBackend) getColumnSpecByFieldTypeInternal(table *sqlchemy.STableSpec, fieldType reflect.Type, fieldname string, tagmap map[string]string, isPointer bool) sqlchemy.IColumnSpec {
 	switch fieldType {
 	case tristate.TriStateType:
-		col := NewTristateColumn(fieldname, tagmap, isPointer)
+		col := NewTristateColumn(table.Name(), fieldname, tagmap, isPointer)
 		return &col
 	case gotypes.TimeType:
 		col := NewDateTimeColumn(fieldname, tagmap, isPointer)
@@ -254,6 +310,9 @@ func (click *SClickhouseBackend) GetColumnSpecByFieldType(table *sqlchemy.STable
 			return &col
 		}
 		col := NewFloatColumn(fieldname, "Float64", tagmap, isPointer)
+		return &col
+	case reflect.Map, reflect.Slice:
+		col := NewCompoundColumn(fieldname, tagmap, isPointer)
 		return &col
 	}
 	if fieldType.Implements(gotypes.ISerializableType) {

@@ -15,8 +15,6 @@
 package seclib2
 
 import (
-	"fmt"
-
 	"github.com/tredoe/osutil/user/crypt/sha512_crypt"
 	"golang.org/x/crypto/bcrypt"
 
@@ -24,9 +22,7 @@ import (
 )
 
 func GeneratePassword(passwd string) (string, error) {
-	salt := seclib.RandomPassword(8)
-	sha512Crypt := sha512_crypt.New()
-	return sha512Crypt.Generate([]byte(passwd), []byte(fmt.Sprintf("$6$%s", salt)))
+	return seclib.GeneratePassword(passwd)
 }
 
 func VerifyPassword(passwd string, hash string) error {

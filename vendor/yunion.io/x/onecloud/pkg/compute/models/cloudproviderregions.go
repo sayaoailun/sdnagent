@@ -128,7 +128,9 @@ func (manager *SCloudproviderregionManager) FetchCustomizeColumns(
 		rows[i].JointResourceBaseDetails = jointRows[i]
 		rows[i].CloudregionResourceInfo = regionRows[i]
 		rows[i].Capabilities, _ = objs[i].(*SCloudproviderregion).getCapabilities()
-		managerIds[i] = objs[i].(*SCloudproviderregion).CloudproviderId
+		cpr := objs[i].(*SCloudproviderregion)
+		managerIds[i] = cpr.CloudproviderId
+		rows[i].LastSyncCost = cpr.GetLastSyncCost()
 	}
 
 	managers := make(map[string]SCloudprovider)
@@ -436,7 +438,7 @@ func (self *SCloudproviderregion) DoSync(ctx context.Context, userCred mcclient.
 			syncRange.DeepSync = true
 		}
 	}
-	log.Debugf("need to do deep sync? ... %v", syncRange.DeepSync)
+	log.Debugf("need to do deep sync? ... %v, xor? ... %v", syncRange.DeepSync, syncRange.Xor)
 
 	if localRegion.isManaged() {
 		remoteRegion, err := driver.GetIRegionById(localRegion.ExternalId)
@@ -619,4 +621,19 @@ func (manager *SCloudproviderregionManager) ListItemExportKeys(ctx context.Conte
 	}
 
 	return q, nil
+}
+
+func (manager *SCloudproviderregionManager) FetchCloudproviderRegions(filter func(q *sqlchemy.SQuery) (*sqlchemy.SQuery, error)) ([]SCloudproviderregion, error) {
+	q := manager.Query()
+	var err error
+	q, err = filter(q)
+	if err != nil {
+		return nil, errors.Wrap(err, "filter")
+	}
+	ret := make([]SCloudproviderregion, 0)
+	err = db.FetchModelObjects(manager, q, &ret)
+	if err != nil {
+		return nil, errors.Wrap(err, "FetchModelObjects")
+	}
+	return ret, nil
 }

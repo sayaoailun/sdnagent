@@ -93,10 +93,11 @@ type AlertCondition struct {
 }
 
 type AlertQuery struct {
-	Model        MetricQuery `json:"model"`
-	DataSourceId string      `json:"data_source_id"`
-	From         string      `json:"from"`
-	To           string      `json:"to"`
+	Model MetricQuery `json:"model"`
+	From  string      `json:"from"`
+	To    string      `json:"to"`
+	// 查询结果 reducer，执行 p95 这些操作
+	ResultReducer *Condition `json:"result_reducer"`
 }
 
 type AlertCreateInput struct {
@@ -156,6 +157,7 @@ type AlertListInput struct {
 	apis.StatusStandaloneResourceListInput
 	// 以报警是否启用/禁用过滤列表
 	// Enabled *bool `json:"enabled"`
+	MonitorResourceId []string `json:"monitor_resource_id"`
 }
 
 type AlertDetails struct {
@@ -179,24 +181,30 @@ type ResultLogEntry struct {
 
 // EvalMatch represents the series violating the threshold.
 type EvalMatch struct {
-	Condition string            `json:"condition"`
-	Value     *float64          `json:"value"`
-	ValueStr  string            `json:"value_str"`
-	Metric    string            `json:"metric"`
-	Tags      map[string]string `json:"tags"`
-	Unit      string            `json:"unit"`
+	Condition    string               `json:"condition"`
+	Value        *float64             `json:"value"`
+	ValueStr     string               `json:"value_str"`
+	Metric       string               `json:"metric"`
+	Tags         map[string]string    `json:"tags"`
+	Unit         string               `json:"unit"`
+	AlertDetails jsonutils.JSONObject `json:"alert_details"`
 }
 
 type AlertTestRunOutput struct {
 	apis.Meta
 
-	Firing         bool              `json:"firing"`
-	EvalMatches    []*EvalMatch      `json:"eval_matches"`
-	Logs           []*ResultLogEntry `json:"logs"`
-	Error          error             `json:"error"`
-	ConditionEvals string            `json:"condition_evals"`
-	StartTime      time.Time         `json:"start_time"`
-	EndTime        time.Time         `json:"end_time"`
+	Firing             bool              `json:"firing"`
+	IsTestRun          bool              `json:"is_test_run"`
+	IsDebug            bool              `json:"is_debug"`
+	EvalMatches        []*EvalMatch      `json:"eval_matches"`
+	AlertOKEvalMatches []*EvalMatch      `json:"alert_ok_eval_matches"`
+	Logs               []*ResultLogEntry `json:"logs"`
+	Error              error             `json:"error"`
+	ConditionEvals     string            `json:"condition_evals"`
+	StartTime          time.Time         `json:"start_time"`
+	EndTime            time.Time         `json:"end_time"`
+	NoDataFound        bool              `json:"no_data_found"`
+	PrevAlertState     string            `json:"prev_alert_state"`
 }
 
 type AlertPauseInput struct {

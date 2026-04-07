@@ -28,9 +28,7 @@ import (
 	"yunion.io/x/pkg/utils"
 
 	compute_apis "yunion.io/x/onecloud/pkg/apis/compute"
-	identity_apis "yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
-	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
@@ -38,7 +36,6 @@ import (
 	ansible_modules "yunion.io/x/onecloud/pkg/mcclient/modules/ansible"
 	compute_modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	"yunion.io/x/onecloud/pkg/util/ansible"
-	"yunion.io/x/onecloud/pkg/util/logclient"
 )
 
 type SLoadbalancerAgentDeployment struct {
@@ -138,11 +135,13 @@ func (lbagent *SLoadbalancerAgent) deploy(ctx context.Context, userCred mcclient
 	case compute_apis.DeployMethodCopy:
 		// glob for rpms
 		basenames := []string{
-			"packages/telegraf",
-			"packages/gobetween",
-			"packages/keepalived",
-			"packages/haproxy",
-			"updates/yunion-lbagent",
+			"telegraf",
+			"gobetween",
+			"keepalived",
+			"haproxy",
+			"openvswitch",
+			"openvswitch-ovn-host",
+			"yunion-lbagent",
 		}
 		mods := []ansible.Module{}
 		for _, basename := range basenames {
@@ -247,7 +246,7 @@ func (lbagent *SLoadbalancerAgent) validateHost(ctx context.Context, userCred mc
 	case regutils.MatchIP4Addr(name):
 	case strings.HasPrefix(name, "host:"):
 		name = strings.TrimSpace(name[len("host:"):])
-		obj, err := db.FetchByIdOrName(HostManager, userCred, name)
+		obj, err := db.FetchByIdOrName(ctx, HostManager, userCred, name)
 		if err != nil {
 			return httperrors.NewNotFoundError("find host %s: %v", name, err)
 		}
@@ -259,12 +258,16 @@ func (lbagent *SLoadbalancerAgent) validateHost(ctx context.Context, userCred mc
 		name = name[len("server:"):]
 		fallthrough
 	default:
-		obj, err := db.FetchByIdOrName(GuestManager, userCred, name)
+		obj, err := db.FetchByIdOrName(ctx, GuestManager, userCred, name)
 		if err != nil {
 			return httperrors.NewNotFoundError("find guest %s: %v", name, err)
 		}
 		guest := obj.(*SGuest)
-		if utils.IsInStringArray(guest.Hypervisor, compute_apis.PUBLIC_CLOUD_HYPERVISORS) {
+		region, err := guest.GetRegion()
+		if err != nil {
+			return errors.Wrapf(err, "GetRegion")
+		}
+		if utils.IsInStringArray(region.Provider, compute_apis.PUBLIC_CLOUD_PROVIDERS) {
 			return httperrors.NewBadRequestError("lbagent cannot be deployed on public guests")
 		}
 		if guest.Status != compute_apis.VM_RUNNING {
@@ -287,12 +290,13 @@ func (lbagent *SLoadbalancerAgent) validateHost(ctx context.Context, userCred mc
 	return nil
 }
 
-func (lbagent *SLoadbalancerAgent) PerformDeploy(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	input := &compute_apis.LoadbalancerAgentDeployInput{}
-	if err := data.Unmarshal(input); err != nil {
-		return nil, httperrors.NewBadRequestError("unmarshal input: %v", err)
-	}
-	host := input.Host
+func (lbagent *SLoadbalancerAgent) PerformDeploy(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+	input *compute_apis.LoadbalancerAgentDeployInput,
+) (*compute_apis.LoadbalancerAgentDeployInput, error) {
+	/*host := input.Host
 	for _, k := range []string{"user", "pass", "proj"} {
 		if v, ok := host.GetVar(k); !ok {
 			return nil, httperrors.NewBadRequestError("host missing %s field", k)
@@ -310,10 +314,9 @@ func (lbagent *SLoadbalancerAgent) PerformDeploy(ctx context.Context, userCred m
 		if !token.HasSystemAdminPrivilege() {
 			return nil, httperrors.NewBadRequestError("user must have system admin privileges")
 		}
-		authURL, err = token.GetServiceURL(
+		s := cli.NewSession(ctx, options.Options.Region, "", identity_apis.EndpointInterfacePublic, token)
+		authURL, err = s.GetServiceURL(
 			identity_apis.SERVICE_TYPE,
-			options.Options.Region,
-			"",
 			identity_apis.EndpointInterfacePublic)
 		if err != nil {
 			return nil, httperrors.NewClientError("get %s service %s url: %v",
@@ -354,7 +357,8 @@ func (lbagent *SLoadbalancerAgent) PerformDeploy(ctx context.Context, userCred m
 	}); err != nil {
 		return nil, err
 	}
-	return nil, err
+	return nil, err*/
+	return nil, errors.Wrap(httperrors.ErrNotSupported, "deprecated")
 }
 
 func (lbagent *SLoadbalancerAgent) updateOrCreatePbModel(ctx context.Context,
@@ -371,7 +375,7 @@ func (lbagent *SLoadbalancerAgent) updateOrCreatePbModel(ctx context.Context,
 }
 
 func (lbagent *SLoadbalancerAgent) PerformUndeploy(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	deployment := lbagent.Deployment
+	/*deployment := lbagent.Deployment
 	if deployment == nil || deployment.Host == "" {
 		return nil, httperrors.NewConflictError("No previous deployment info available")
 	}
@@ -399,7 +403,8 @@ func (lbagent *SLoadbalancerAgent) PerformUndeploy(ctx context.Context, userCred
 	}); err != nil {
 		return nil, err
 	}
-	return nil, nil
+	return nil, nil*/
+	return nil, errors.Wrap(httperrors.ErrNotSupported, "deprecated")
 }
 
 const (
@@ -424,15 +429,7 @@ api_list_batch_size = 2048
 	yunionRepoTmpl = `
 [yunion]
 name=Packages for Yunion- $basearch
-baseurl={{ repo_base_url }}/updates
-failovermethod=priority
-enabled=1
-gpgcheck=0
-sslverify={{ repo_sslverify }}
-
-[yunion-extra]
-name=Extra Packages for Yunion - $basearch
-baseurl={{ repo_base_url }}/packages
+baseurl={{ repo_base_url }}
 failovermethod=priority
 enabled=1
 gpgcheck=0

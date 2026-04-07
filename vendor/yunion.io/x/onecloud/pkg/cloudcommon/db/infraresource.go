@@ -19,13 +19,13 @@ import (
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -47,15 +47,15 @@ func NewInfrasResourceBaseManager(
 
 type SInfrasResourceBase struct {
 	SDomainLevelResourceBase
-	SSharableBaseResource `"is_public=>create":"domain_optional" "public_scope=>create":"domain_optional"`
+	SSharableBaseResource `"is_public->create":"domain_optional" "public_scope->create":"domain_optional"`
 }
 
 func (manager *SInfrasResourceBaseManager) GetIInfrasModelManager() IInfrasModelManager {
 	return manager.GetVirtualObject().(IInfrasModelManager)
 }
 
-func (manager *SInfrasResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery, owner mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
-	return SharableManagerFilterByOwner(manager.GetIInfrasModelManager(), q, owner, scope)
+func (manager *SInfrasResourceBaseManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	return SharableManagerFilterByOwner(ctx, manager.GetIInfrasModelManager(), q, userCred, owner, scope)
 }
 
 func (model *SInfrasResourceBase) IsSharable(reqUsrId mcclient.IIdentityProvider) bool {
@@ -66,20 +66,12 @@ func (model *SInfrasResourceBase) IsShared() bool {
 	return SharableModelIsShared(model)
 }
 
-func (model *SInfrasResourceBase) AllowPerformPublic(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPublicDomainInput) bool {
-	return true
-}
-
 func (model *SInfrasResourceBase) PerformPublic(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPublicDomainInput) (jsonutils.JSONObject, error) {
 	err := SharablePerformPublic(model.GetIInfrasModel(), ctx, userCred, apis.PerformPublicProjectInput{PerformPublicDomainInput: input})
 	if err != nil {
 		return nil, errors.Wrap(err, "SharablePerformPublic")
 	}
 	return nil, nil
-}
-
-func (model *SInfrasResourceBase) AllowPerformPrivate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPrivateInput) bool {
-	return true
 }
 
 func (model *SInfrasResourceBase) PerformPrivate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPrivateInput) (jsonutils.JSONObject, error) {
@@ -203,7 +195,8 @@ func (model *SInfrasResourceBase) PerformChangeOwner(
 }
 
 func (model *SInfrasResourceBase) CustomizeCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) error {
-	SharableModelCustomizeCreate(model.GetIInfrasModel(), ctx, userCred, ownerId, query, data)
+	// 避免domain_id为空导致异常
+	defer SharableModelCustomizeCreate(model.GetIInfrasModel(), ctx, userCred, ownerId, query, data)
 	return model.SDomainLevelResourceBase.CustomizeCreate(ctx, userCred, ownerId, query, data)
 }
 
@@ -215,16 +208,16 @@ func (model *SInfrasResourceBase) Delete(ctx context.Context, userCred mcclient.
 func (model *SInfrasResourceBase) GetSharedInfo() apis.SShareInfo {
 	ret := apis.SShareInfo{}
 	ret.IsPublic = model.IsPublic
-	ret.PublicScope = rbacutils.String2ScopeDefault(model.PublicScope, rbacutils.ScopeNone)
+	ret.PublicScope = rbacscope.String2ScopeDefault(model.PublicScope, rbacscope.ScopeNone)
 	ret.SharedDomains = model.GetSharedDomains()
 	ret.SharedProjects = nil
 	// fix
 	if len(ret.SharedDomains) > 0 {
-		ret.PublicScope = rbacutils.ScopeDomain
+		ret.PublicScope = rbacscope.ScopeDomain
 		ret.SharedProjects = nil
 		ret.IsPublic = true
 	} else if !ret.IsPublic {
-		ret.PublicScope = rbacutils.ScopeNone
+		ret.PublicScope = rbacscope.ScopeNone
 	}
 	return ret
 }
@@ -248,7 +241,7 @@ func (model *SInfrasResourceBase) SyncShareState(ctx context.Context, userCred m
 		if model.PublicSrc != string(apis.OWNER_SOURCE_LOCAL) {
 			model.SaveSharedInfo(apis.OWNER_SOURCE_CLOUD, ctx, userCred, apis.SShareInfo{
 				IsPublic:    true,
-				PublicScope: rbacutils.ScopeSystem,
+				PublicScope: rbacscope.ScopeSystem,
 			})
 		}
 		return

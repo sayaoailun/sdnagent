@@ -25,18 +25,19 @@ import (
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/tristate"
 	"yunion.io/x/pkg/util/netutils"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/util/sets"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
 	"yunion.io/x/onecloud/pkg/cloudcommon/policy"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/logclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -117,7 +118,7 @@ func (sm *SGroupManager) ListItemFilter(
 
 	guestFilter := input.ServerId
 	if len(guestFilter) != 0 {
-		guestObj, err := GuestManager.FetchByIdOrName(userCred, guestFilter)
+		guestObj, err := GuestManager.FetchByIdOrName(ctx, userCred, guestFilter)
 		if err != nil {
 			return nil, err
 		}
@@ -153,7 +154,26 @@ func (sm *SGroupManager) OrderByExtraFields(
 	if err != nil {
 		return nil, errors.Wrap(err, "SZoneResourceBaseManager.OrderByExtraFields")
 	}
-
+	if db.NeedOrderQuery([]string{input.OrderByVips}) {
+		gnQ := GroupnetworkManager.Query()
+		gnQ = gnQ.AppendField(gnQ.Field("group_id"), sqlchemy.COUNT("vips", gnQ.Field("ip_addr")))
+		gnQ = gnQ.GroupBy("group_id")
+		gnSQ := gnQ.SubQuery()
+		q = q.LeftJoin(gnSQ, sqlchemy.Equals(gnSQ.Field("group_id"), q.Field("id")))
+		q.AppendField(q.QueryFields()...)
+		q.AppendField(gnSQ.Field("vips"))
+		q = db.OrderByFields(q, []string{input.OrderByVips}, []sqlchemy.IQueryField{q.Field("vips")})
+	}
+	if db.NeedOrderQuery([]string{input.OrderByGuestCount}) {
+		ggQ := GroupguestManager.Query()
+		ggQ = ggQ.AppendField(ggQ.Field("group_id"), sqlchemy.COUNT("guest_count"))
+		ggQ = ggQ.GroupBy("group_id")
+		ggSQ := ggQ.SubQuery()
+		q = q.LeftJoin(ggSQ, sqlchemy.Equals(ggSQ.Field("group_id"), q.Field("id")))
+		q.AppendField(q.QueryFields()...)
+		q.AppendField(ggSQ.Field("guest_count"))
+		q = db.OrderByFields(q, []string{input.OrderByGuestCount}, []sqlchemy.IQueryField{q.Field("guest_count")})
+	}
 	return q, nil
 }
 
@@ -365,7 +385,7 @@ func (group *SGroup) checkGuests(ctx context.Context, userCred mcclient.TokenCre
 	hostIdSet := sets.NewString()
 	for i := range guestIdArr {
 		guestIdStr, _ := guestIdArr[i].GetString()
-		model, err := GuestManager.FetchByIdOrName(userCred, guestIdStr)
+		model, err := GuestManager.FetchByIdOrName(ctx, userCred, guestIdStr)
 		if err == sql.ErrNoRows {
 			return nil, nil, httperrors.NewInputParameterError("no such model %s", guestIdStr)
 		}
@@ -415,7 +435,8 @@ func (group *SGroup) ClearAllScheDescCache() error {
 
 func (group *SGroup) clearSchedDescCache(hostIds []string) error {
 	var g errgroup.Group
-	for _, hostId := range hostIds {
+	for i := range hostIds {
+		hostId := hostIds[i]
 		g.Go(func() error {
 			return HostManager.ClearSchedDescCache(hostId)
 		})
@@ -504,7 +525,7 @@ func (net *SNetwork) GetRegionalQuotaKeys(ownerId mcclient.IIdentityProvider) (q
 	if region == nil {
 		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "no valid region")
 	}
-	return fetchRegionalQuotaKeys(rbacutils.ScopeProject, ownerId, region, provider), nil
+	return fetchRegionalQuotaKeys(rbacscope.ScopeProject, ownerId, region, provider), nil
 }
 
 func (grp *SGroup) PerformDetachnetwork(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input *api.GroupDetachNetworkInput) (*api.SGroup, error) {
@@ -524,21 +545,13 @@ func (grp *SGroup) PerformDetachnetwork(ctx context.Context, userCred mcclient.T
 		return nil, nil
 	}
 	for _, gn := range gns {
-		if len(input.IpAddr) == 0 || gn.IpAddr == input.IpAddr {
+		if len(input.IpAddr) == 0 || gn.IpAddr == input.IpAddr || gn.Ip6Addr == input.IpAddr {
 			if len(gn.EipId) > 0 {
 				logclient.AddSimpleActionLog(grp, logclient.ACT_DETACH_NETWORK, "eip associated", userCred, false)
 				return nil, errors.Wrap(httperrors.ErrInvalidStatus, "cannot detach network with eip")
 			}
 			// delete
-			notes := struct {
-				Network   string
-				NetworkId string
-				IpAddr    string
-			}{
-				Network:   net.Name,
-				NetworkId: net.Id,
-				IpAddr:    gn.IpAddr,
-			}
+			notes := gn.GetShortDesc(ctx)
 			err := gn.Detach(ctx, userCred)
 			if err != nil {
 				logclient.AddSimpleActionLog(grp, logclient.ACT_DETACH_NETWORK, notes, userCred, false)
@@ -557,7 +570,7 @@ func (grp *SGroup) PerformAttachnetwork(ctx context.Context, userCred mcclient.T
 	}
 
 	if len(input.NetworkId) > 0 {
-		netObj, err := NetworkManager.FetchByIdOrName(userCred, input.NetworkId)
+		netObj, err := NetworkManager.FetchByIdOrName(ctx, userCred, input.NetworkId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(NetworkManager.Keyword(), input.NetworkId)
@@ -585,6 +598,20 @@ func (grp *SGroup) PerformAttachnetwork(ctx context.Context, userCred mcclient.T
 			return nil, errors.Wrapf(httperrors.ErrInputParameter, "ip_addr %s not in range", input.IpAddr)
 		}
 	}
+	if (len(input.Ip6Addr) > 0 || input.RequireIPv6) && !net.IsSupportIPv6() {
+		return nil, errors.Wrap(httperrors.ErrInputParameter, "network is not ipv6 enabled")
+	}
+
+	if len(input.Ip6Addr) > 0 {
+		addr6, err := netutils.NewIPV6Addr(input.Ip6Addr)
+		if err != nil {
+			return nil, errors.Wrapf(httperrors.ErrInputParameter, "invalid ip6_addr %s", input.Ip6Addr)
+		}
+		if !net.getIPRange6().Contains(addr6) {
+			return nil, errors.Wrapf(httperrors.ErrInputParameter, "ip6_addr %s not in range", input.Ip6Addr)
+		}
+		input.Ip6Addr = addr6.String()
+	}
 
 	// check quota
 	var inicCnt, enicCnt int
@@ -609,18 +636,33 @@ func (grp *SGroup) PerformAttachnetwork(ctx context.Context, userCred mcclient.T
 	}
 	defer quotas.CancelPendingUsage(ctx, userCred, pendingUsage, pendingUsage, saveQuota)
 
-	ipAddr, err := net.GetFreeIP(ctx, userCred, nil, nil, input.IpAddr, input.AllocDir, input.Reserved != nil && *input.Reserved)
+	lockman.LockObject(ctx, net)
+	defer lockman.ReleaseObject(ctx, net)
+
+	ipAddr, err := net.GetFreeIP(ctx, userCred, nil, nil, input.IpAddr, input.AllocDir, input.Reserved != nil && *input.Reserved, api.AddressTypeIPv4)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "GetFreeIPv4")
 	}
 	if len(input.IpAddr) > 0 && ipAddr != input.IpAddr && input.RequireDesignatedIp != nil && *input.RequireDesignatedIp {
 		return nil, errors.Wrapf(httperrors.ErrConflict, "candidate ip %s is occupied!", input.IpAddr)
+	}
+
+	var ipAddr6 string
+	if len(input.Ip6Addr) > 0 || input.RequireIPv6 {
+		ipAddr6, err = net.GetFreeIP(ctx, userCred, nil, nil, input.Ip6Addr, input.AllocDir, input.Reserved != nil && *input.Reserved, api.AddressTypeIPv6)
+		if err != nil {
+			return nil, errors.Wrap(err, "GetFreeIPv6")
+		}
+		if len(input.Ip6Addr) > 0 && ipAddr6 != input.Ip6Addr && input.RequireDesignatedIp != nil && *input.RequireDesignatedIp {
+			return nil, errors.Wrapf(httperrors.ErrConflict, "candidate v6 ip %s is occupied!", input.Ip6Addr)
+		}
 	}
 
 	gn := SGroupnetwork{}
 	gn.NetworkId = net.Id
 	gn.GroupId = grp.Id
 	gn.IpAddr = ipAddr
+	gn.Ip6Addr = ipAddr6
 
 	gn.SetModelManager(GroupnetworkManager, &gn)
 
@@ -629,16 +671,8 @@ func (grp *SGroup) PerformAttachnetwork(ctx context.Context, userCred mcclient.T
 		return nil, errors.Wrap(err, "Insert")
 	}
 
-	notes := struct {
-		Network   string
-		NetworkId string
-		IpAddr    string
-	}{
-		Network:   net.Name,
-		NetworkId: net.Id,
-		IpAddr:    gn.IpAddr,
-	}
-	db.OpsLog.LogAttachEvent(ctx, grp, net, userCred, jsonutils.Marshal(notes))
+	notes := gn.GetShortDesc(ctx)
+	db.OpsLog.LogAttachEvent(ctx, grp, net, userCred, notes)
 	logclient.AddActionLogWithContext(ctx, grp, logclient.ACT_ATTACH_NETWORK, notes, userCred, true)
 
 	saveQuota = true
@@ -699,7 +733,7 @@ func (grp *SGroup) PerformAssociateEip(ctx context.Context, userCred mcclient.To
 	if len(eipStr) == 0 {
 		return nil, httperrors.NewMissingParameterError("eip_id")
 	}
-	eipObj, err := ElasticipManager.FetchByIdOrName(userCred, eipStr)
+	eipObj, err := ElasticipManager.FetchByIdOrName(ctx, userCred, eipStr)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, httperrors.NewResourceNotFoundError("eip %s not found", eipStr)
@@ -730,7 +764,7 @@ func (grp *SGroup) PerformAssociateEip(ctx context.Context, userCred mcclient.To
 		}
 	}
 
-	grp.SetStatus(userCred, api.INSTANCE_ASSOCIATE_EIP, "associate eip")
+	grp.SetStatus(ctx, userCred, api.INSTANCE_ASSOCIATE_EIP, "associate eip")
 
 	params := jsonutils.NewDict()
 	params.Add(jsonutils.NewString(grp.Id), "instance_id")
@@ -828,7 +862,7 @@ func (grp *SGroup) PerformDissociateEip(ctx context.Context, userCred mcclient.T
 		return nil, errors.Wrap(err, "eip is not accessible")
 	}
 
-	grp.SetStatus(userCred, api.INSTANCE_DISSOCIATE_EIP, "associate eip")
+	grp.SetStatus(ctx, userCred, api.INSTANCE_DISSOCIATE_EIP, "associate eip")
 
 	autoDelete := (input.AudoDelete != nil && *input.AudoDelete)
 

@@ -26,14 +26,14 @@ const (
 	tagValueCountKey = "__count__"
 )
 
-func tagValueKey(idx int) string {
+func TagValueKey(idx int) string {
 	return fmt.Sprintf("value%d", idx)
 }
 
 type sTagValueTreeNode struct {
 	Key   string           `json:"key"`
 	Value string           `json:"value"`
-	Count int              `json:"count"`
+	Count float64          `json:"count"`
 	Tags  tagutils.TTagSet `json:"tags"`
 
 	Children []*sTagValueTreeNode `json:"children"`
@@ -100,11 +100,11 @@ func constructTree(data []map[string]string, keys []string) *sTagValueTreeNode {
 }
 
 func processOneRow(node *sTagValueTreeNode, row map[string]string, keys []string) {
-	rowCount, _ := strconv.Atoi(row[tagValueCountKey])
+	rowCount, _ := strconv.ParseFloat(row[tagValueCountKey], 64)
 	node.Count += rowCount
 	for i := range keys {
 		key := keys[i]
-		value := row[tagValueKey(i)]
+		value := row[TagValueKey(i)]
 		child := node.findChild(key, value)
 		child.Count += rowCount
 		node = child

@@ -22,6 +22,7 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/netutils"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/util/regutils"
 	"yunion.io/x/sqlchemy"
 
@@ -30,10 +31,10 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-ignore
 type SLoadbalancernetworkManager struct {
 	db.SVirtualJointResourceBaseManager
 	SLoadbalancerResourceBaseManager
@@ -58,12 +59,14 @@ func init() {
 	})
 }
 
+// +onecloud:model-api-gen
 type SLoadbalancerNetwork struct {
 	db.SVirtualJointResourceBase
 
 	LoadbalancerId string `width:"36" charset:"ascii" nullable:"false" list:"user"`
 	NetworkId      string `width:"36" charset:"ascii" nullable:"false" list:"user"`
 	IpAddr         string `width:"16" charset:"ascii" list:"user"`
+	MacAddr        string `width:"32" charset:"ascii" nullable:"true" list:"user"`
 }
 
 func (manager *SLoadbalancernetworkManager) GetMasterFieldName() string {
@@ -98,11 +101,11 @@ type SLoadbalancerNetworkDeleteData struct {
 func (m *SLoadbalancernetworkManager) NewLoadbalancerNetwork(ctx context.Context, userCred mcclient.TokenCredential, req *SLoadbalancerNetworkRequestData) (*SLoadbalancerNetwork, error) {
 	networkMan := db.GetModelManager("network").(*SNetworkManager)
 	if networkMan == nil {
-		return nil, fmt.Errorf("failed getting network manager")
+		return nil, errors.Error("failed getting network manager")
 	}
 	im, err := networkMan.FetchById(req.NetworkId)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "fetch network %q", req.NetworkId)
 	}
 	network := im.(*SNetwork)
 	ln := &SLoadbalancerNetwork{
@@ -113,12 +116,20 @@ func (m *SLoadbalancernetworkManager) NewLoadbalancerNetwork(ctx context.Context
 
 	lockman.LockObject(ctx, network)
 	defer lockman.ReleaseObject(ctx, network)
-	usedMap := network.GetUsedAddresses()
-	recentReclaimed := map[string]bool{}
+	if req.Loadbalancer.NetworkType == api.LB_NETWORK_TYPE_VPC {
+		macAddr, err := GuestnetworkManager.GenerateMac("")
+		if err != nil {
+			return nil, errors.Wrapf(err, "generate macaddr")
+		}
+		ln.MacAddr = macAddr
+	}
+
+	usedMap := network.GetUsedAddresses(ctx)
+	var recentReclaimed map[string]bool
 	ipAddr, err := network.GetFreeIP(ctx, userCred,
-		usedMap, recentReclaimed, req.Address, req.strategy, req.reserved)
+		usedMap, recentReclaimed, req.Address, req.strategy, req.reserved, api.AddressTypeIPv4)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "find a free ip")
 	}
 	ln.IpAddr = ipAddr
 	err = m.TableSpec().Insert(ctx, ln)
@@ -126,7 +137,7 @@ func (m *SLoadbalancernetworkManager) NewLoadbalancerNetwork(ctx context.Context
 		// NOTE no need to free ipAddr as GetFreeIP has no side effect
 		return nil, err
 	}
-	return ln, err
+	return ln, nil
 }
 
 func (m *SLoadbalancernetworkManager) DeleteLoadbalancerNetwork(ctx context.Context, userCred mcclient.TokenCredential, req *SLoadbalancerNetworkDeleteData) error {
@@ -147,7 +158,7 @@ func (m *SLoadbalancernetworkManager) DeleteLoadbalancerNetwork(ctx context.Cont
 				req.loadbalancer.Id)
 			reservedIpMan := db.GetModelManager("reservedip").(*SReservedipManager)
 			network := ln.Network()
-			err := reservedIpMan.ReserveIP(userCred, network, ln.IpAddr, note)
+			err := reservedIpMan.ReserveIP(ctx, userCred, network, ln.IpAddr, note, api.AddressTypeIPv4)
 			if err != nil {
 				return err
 			}
@@ -179,6 +190,7 @@ func (m *SLoadbalancernetworkManager) syncLoadbalancerNetwork(ctx context.Contex
 	}
 	if len(lns) == 0 {
 		ln := &SLoadbalancerNetwork{LoadbalancerId: req.Loadbalancer.Id, NetworkId: req.NetworkId, IpAddr: req.Address}
+		ln.SetModelManager(LoadbalancernetworkManager, ln)
 		return m.TableSpec().Insert(ctx, ln)
 	}
 	for i := 0; i < len(lns); i++ {
@@ -255,7 +267,7 @@ func (manager *SLoadbalancernetworkManager) FetchCustomizeColumns(
 }
 
 func totalLBNicCount(
-	scope rbacutils.TRbacScope,
+	scope rbacscope.TRbacScope,
 	ownerId mcclient.IIdentityProvider,
 	rangeObjs []db.IStandaloneModel,
 	providers []string,
@@ -266,14 +278,13 @@ func totalLBNicCount(
 	lbnics := LoadbalancernetworkManager.Query().SubQuery()
 	q := lbnics.Query()
 	q = q.Join(lbs, sqlchemy.Equals(lbs.Field("id"), lbnics.Field("loadbalancer_id")))
-	q = q.Filter(sqlchemy.IsFalse(lbs.Field("pending_deleted")))
 
 	switch scope {
-	case rbacutils.ScopeSystem:
+	case rbacscope.ScopeSystem:
 		// do nothing
-	case rbacutils.ScopeDomain:
+	case rbacscope.ScopeDomain:
 		q = q.Filter(sqlchemy.Equals(lbs.Field("domain_id"), ownerId.GetProjectDomainId()))
-	case rbacutils.ScopeProject:
+	case rbacscope.ScopeProject:
 		q = q.Filter(sqlchemy.Equals(lbs.Field("tenant_id"), ownerId.GetProjectId()))
 	}
 	q = RangeObjectsFilter(q, rangeObjs, nil, lbs.Field("zone_id"), lbs.Field("manager_id"), nil, nil)
@@ -379,4 +390,16 @@ func (manager *SLoadbalancernetworkManager) ListItemExportKeys(ctx context.Conte
 	}
 
 	return q, nil
+}
+
+func (manager *SLoadbalancernetworkManager) FetchFirstByLbId(
+	ctx context.Context,
+	lbId string,
+) (*SLoadbalancerNetwork, error) {
+	ln := &SLoadbalancerNetwork{}
+	q := manager.Query().Equals("loadbalancer_id", lbId)
+	if err := q.First(ln); err != nil {
+		return nil, errors.Wrapf(err, "fetch loadbalancer network for loadbalancer %q", lbId)
+	}
+	return ln, nil
 }

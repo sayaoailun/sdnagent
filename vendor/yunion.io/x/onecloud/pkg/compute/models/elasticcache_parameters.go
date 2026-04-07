@@ -17,20 +17,20 @@ package models
 import (
 	"context"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
-	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
-	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -183,16 +183,16 @@ func (manager *SElasticcacheParameterManager) newFromCloudElasticcacheParameter(
 	return &parameter, nil
 }
 
-func (manager *SElasticcacheParameterManager) ResourceScope() rbacutils.TRbacScope {
-	return rbacutils.ScopeProject
+func (manager *SElasticcacheParameterManager) ResourceScope() rbacscope.TRbacScope {
+	return rbacscope.ScopeProject
 }
 
 func (manager *SElasticcacheParameterManager) FetchOwnerId(ctx context.Context, data jsonutils.JSONObject) (mcclient.IIdentityProvider, error) {
 	return elasticcacheSubResourceFetchOwnerId(ctx, data)
 }
 
-func (manager *SElasticcacheParameterManager) FilterByOwner(q *sqlchemy.SQuery, userCred mcclient.IIdentityProvider, scope rbacutils.TRbacScope) *sqlchemy.SQuery {
-	return elasticcacheSubResourceFetchOwner(q, userCred, scope)
+func (manager *SElasticcacheParameterManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	return elasticcacheSubResourceFetchOwner(ctx, q, ownerId, scope)
 }
 
 func (self *SElasticcacheParameter) GetOwnerId() mcclient.IIdentityProvider {
@@ -229,7 +229,7 @@ func (self *SElasticcacheParameter) PostUpdate(ctx context.Context, userCred mcc
 	paramsObj.Add(v, self.Name)
 	params.Add(paramsObj, "parameters")
 
-	self.SetStatus(userCred, api.ELASTIC_CACHE_PARAMETER_STATUS_UPDATING, "")
+	self.SetStatus(ctx, userCred, api.ELASTIC_CACHE_PARAMETER_STATUS_UPDATING, "")
 	if err := self.StartUpdateElasticcacheParameterTask(ctx, userCred, params, ""); err != nil {
 		log.Errorf("ElasticcacheParameter %s", err.Error())
 	}
@@ -243,10 +243,6 @@ func (self *SElasticcacheParameter) StartUpdateElasticcacheParameterTask(ctx con
 		return err
 	}
 	task.ScheduleRun(nil)
-	return nil
-}
-
-func (self *SElasticcacheParameter) ValidatePurgeCondition(ctx context.Context) error {
 	return nil
 }
 
