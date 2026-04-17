@@ -328,6 +328,14 @@ func (fm *FlowMan) waitDecr(ctx context.Context, n int32) {
 	atomic.AddInt32(&fm.waitCount, -n)
 }
 
+func (fm *FlowMan) DumpFlows(ctx context.Context) ([]*ovs.Flow, error) {
+	fs, err := fm.doDumpFlows(nil)
+	if err != nil {
+		return nil, err
+	}
+	return fs.Flows(), nil
+}
+
 func NewFlowMan(bridge string) *FlowMan {
 	flowSets := map[string]*utils.FlowSet{
 		THEMAN:   utils.NewFlowSet(),

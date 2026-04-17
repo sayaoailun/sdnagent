@@ -17,14 +17,16 @@ package server
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/digitalocean/go-openvswitch/ovs"
 	pb "yunion.io/x/sdnagent/pkg/agent/proto"
 )
 
 type openflowService struct {
-	agent *AgentServer
-	ofCli *ovs.OpenFlowService
+	pb.UnimplementedOpenflowServer // 嵌入 UnimplementedOpenflowServer
+	agent                          *AgentServer
+	ofCli                          *ovs.OpenFlowService
 }
 
 func newOpenflowService(agent *AgentServer) *openflowService {
@@ -83,6 +85,68 @@ func (s *openflowService) DumpBridgePort(ctx context.Context, in *pb.DumpBridgeP
 		PortStats: &pb.PortStats{
 			PortNo: uint32(ofPortStats.PortID),
 		},
+	}
+	return resp, nil
+}
+
+func (s *openflowService) DumpFlows(ctx context.Context, in *pb.DumpFlowsRequest) (*pb.DumpFlowsResponse, error) {
+	flowman := s.agent.GetFlowMan(in.Bridge)
+	flows, err := flowman.DumpFlows(ctx)
+	if err != nil {
+		resp := &pb.DumpFlowsResponse{
+			Code: 1,
+			Mesg: err.Error(),
+		}
+		return resp, nil
+	}
+
+	// 转换为 protobuf 消息
+	pbFlows := make([]*pb.Flow, len(flows))
+	for i, flow := range flows {
+		// 直接使用flow的字段构建protobuf消息
+		// 这样可以避免解析文本格式的问题
+		pbFlows[i] = &pb.Flow{
+			Cookie:   flow.Cookie,
+			Priority: uint32(flow.Priority),
+			Table:    uint32(flow.Table),
+			Matches:  "", // 暂时留空，后续可以通过其他方式填充
+			Actions:  "", // 暂时留空，后续可以通过其他方式填充
+		}
+
+		// 使用MarshalText方法获取完整的流表文本
+		txt, err := flow.MarshalText()
+		if err != nil {
+			resp := &pb.DumpFlowsResponse{
+				Code: 1,
+				Mesg: fmt.Sprintf("marshal flow error: %s", err),
+			}
+			return resp, nil
+		}
+
+		flowStr := string(txt)
+
+		// 提取actions部分
+		actionsIndex := strings.Index(flowStr, "actions=")
+		if actionsIndex != -1 {
+			actions := flowStr[actionsIndex+8:]
+			pbFlows[i].Actions = actions
+
+			// 提取matches部分（不包含actions）
+			matches := flowStr[:actionsIndex]
+			// 移除cookie、table、priority等字段，只保留匹配条件
+			matches = strings.Replace(matches, fmt.Sprintf("cookie=0x%x,", flow.Cookie), "", 1)
+			matches = strings.Replace(matches, fmt.Sprintf("table=%d,", flow.Table), "", 1)
+			matches = strings.Replace(matches, fmt.Sprintf("priority=%d,", flow.Priority), "", 1)
+			// 移除末尾的逗号
+			matches = strings.TrimSuffix(matches, ",")
+			pbFlows[i].Matches = matches
+		}
+	}
+
+	resp := &pb.DumpFlowsResponse{
+		Code:  0,
+		Mesg:  "ok",
+		Flows: pbFlows,
 	}
 	return resp, nil
 }

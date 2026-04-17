@@ -1,6 +1,7 @@
 syntax = "proto3";
 
 package pb;
+option go_package = "./;pb";
 
 // TODO add comment: idempotency
 
@@ -16,6 +17,7 @@ service Openflow {
 	rpc DelFlow (DelFlowRequest) returns (Response) {}
 	rpc SyncFlows (SyncFlowsRequest) returns (Response) {}
 	rpc DumpBridgePort (DumpBridgePortRequest) returns (DumpBridgePortResponse) {}
+	rpc DumpFlows (DumpFlowsRequest) returns (DumpFlowsResponse) {}
 }
 
 message Response {
@@ -76,4 +78,14 @@ message DumpBridgePortResponse {
 	uint32 code = 1;
 	string mesg = 2;
 	PortStats port_stats = 3;
+}
+
+message DumpFlowsRequest {
+    string bridge = 1;
+}
+
+message DumpFlowsResponse {
+    uint32 code = 1;
+    string mesg = 2;
+    repeated Flow flows = 3; // 流表列表
 }

@@ -7,9 +7,11 @@ export GO111MODULE:=on
 
 sdnagent:=$(BINDIR)/sdnagent
 sdncli:=$(BINDIR)/sdncli
+convert:=$(BINDIR)/convert
 bins:= \
 	$(sdnagent) \
-	$(sdncli)
+	$(sdncli) \
+	$(convert)
 
 all: $(bins)
 
@@ -24,10 +26,13 @@ $(sdncli):
 $(sdnagent):
 	$(GO_BUILD) -o $(BINDIR)/sdncli yunion.io/x/sdnagent/cmd/sdncli
 
+$(convert):
+	$(GO_BUILD) -o $(BINDIR)/convert yunion.io/x/sdnagent/cmd/convert
+
 proto-gen: pkg/agent/proto/agent.pb.go
 
 pkg/agent/proto/agent.pb.go: pkg/agent/proto/agent.proto
-	protoc -I pkg/agent/proto pkg/agent/proto/agent.proto --go_out=plugins=grpc:pkg/agent/proto
+	protoc -I pkg/agent/proto pkg/agent/proto/agent.proto --go_out=pkg/agent/proto --go-grpc_out=pkg/agent/proto
 
 pkg/agent/proto/agent_pb2.py: pkg/agent/proto/agent.proto
 	python -m grpc_tools.protoc -Ipkg/agent/proto --python_out=pkg/agent/proto --grpc_python_out=pkg/agent/proto pkg/agent/proto/agent.proto

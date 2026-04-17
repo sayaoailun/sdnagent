@@ -23,8 +23,9 @@ import (
 )
 
 type vSwitchService struct {
-	agent      *AgentServer
-	vSwitchCli *ovs.VSwitchService
+	pb.UnimplementedVSwitchServer // 嵌入 UnimplementedVSwitchServer
+	agent                         *AgentServer
+	vSwitchCli                    *ovs.VSwitchService
 }
 
 func newVSwitchService(agent *AgentServer) *vSwitchService {

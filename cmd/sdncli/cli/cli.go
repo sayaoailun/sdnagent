@@ -17,6 +17,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -52,7 +53,7 @@ func InitCmdFlags(cmd *cobra.Command) {
 		cmd.Flags().Uint32P("table", "t", 0, "flow table number")
 		cmd.Flags().StringP("matches", "m", "", "flow match conditions")
 		cmd.Flags().StringP("actions", "a", "normal", "flow actions")
-	case "syncFlows":
+	case "syncFlows", "dumpFlows":
 		cmd.Flags().StringP("bridge", "b", "br0", "bridge")
 	case "dumpBridgePort":
 		cmd.Flags().StringP("bridge", "b", "br0", "bridge")
@@ -106,6 +107,36 @@ func DoCmd(cmd *cobra.Command) {
 		}
 		resp, err := c.Openflow.SyncFlows(context.Background(), req)
 		handleResponse(resp, err, "syncFlows failure: %s")
+	case "dumpFlows":
+		req := &pb.DumpFlowsRequest{
+			Bridge: bridge,
+		}
+		resp, err := c.Openflow.DumpFlows(context.Background(), req)
+		ok := handleResponse(resp, err, "dumpFlows failure: %s")
+		if ok {
+			for _, flow := range resp.Flows {
+				// 构建ovs-ofctl格式的输出
+				parts := []string{}
+				// 添加table
+				parts = append(parts, fmt.Sprintf("table=%d", flow.Table))
+
+				// 添加priority
+				parts = append(parts, fmt.Sprintf("priority=%d", flow.Priority))
+
+				// 添加matches，移除idle_timeout
+				matches := strings.Replace(flow.Matches, "idle_timeout=0", "", -1)
+				matches = strings.TrimSuffix(strings.TrimPrefix(matches, ","), ",")
+				if matches != "" {
+					parts = append(parts, matches)
+				}
+
+				// 构建actions部分
+				actions := flow.Actions
+
+				// 输出完整格式，确保字段间有空格
+				fmt.Printf("%s actions=%s\n", strings.Join(parts, ", "), actions)
+			}
+		}
 	case "dumpBridgePort":
 		port := flagSetMustGet(cmd.Flags().GetString("port")).(string)
 		req := &pb.DumpBridgePortRequest{
