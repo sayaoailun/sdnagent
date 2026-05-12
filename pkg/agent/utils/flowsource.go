@@ -300,19 +300,30 @@ func (g *Guest) FlowsMapForNic(nic *GuestNIC) ([]*ovs.Flow, error) {
 		)
 	}
 	flows = append(flows,
-		// dhcpv4 from VM to host
-		F(0, 28400, T("in_port={{.PortNo}},ip,udp,tp_src=68,tp_dst=67"), T("mod_tp_dst:{{.DHCPServerPort}},local")),
-		// dhcpv4 from host to VM
-		F(0, 28300, T("in_port=LOCAL,dl_dst={{.MAC}},ip,udp,tp_src={{.DHCPServerPort}},tp_dst=68"), T("mod_tp_src:67,output:{{.PortNo}}")),
-		// dhcpv6 from VM to host
-		F(0, 28400, T("in_port={{.PortNo}},ipv6,udp6,tp_src=546,tp_dst=547"), T("mod_tp_dst:{{.DHCPServerPort6}},local")),
-		// dhcpv6 from host to VM
-		F(0, 28300, T("in_port=LOCAL,dl_dst={{.MAC}},ipv6,udp6,tp_src={{.DHCPServerPort6}},tp_dst=546"), T("mod_tp_src:547,output:{{.PortNo}}")),
-		// ra from VM to host
-		// ra advertisement from host to VM
 		// allow any other traffic from host to vm
 		F(0, 26700, T("in_port={{.PortNoPhy}},dl_dst={{.MAC}},{{._dl_vlan}}"), "normal"),
 	)
+
+	// DHCP response rules are always needed
+	flows = append(flows,
+		// dhcpv4 from host to VM
+		F(0, 28300, T("in_port=LOCAL,dl_dst={{.MAC}},ip,udp,tp_src={{.DHCPServerPort}},tp_dst=68"), T("mod_tp_src:67,output:{{.PortNo}}")),
+		// dhcpv6 from host to VM
+		F(0, 28300, T("in_port=LOCAL,dl_dst={{.MAC}},ipv6,udp6,tp_src={{.DHCPServerPort6}},tp_dst=546"), T("mod_tp_src:547,output:{{.PortNo}}")),
+	)
+
+	// DHCP request rules: only forward to local when SrcMacCheck is enabled
+	if g.SrcMacCheck() {
+		// Strict mode: DHCP requests go to local DHCP server
+		flows = append(flows,
+			// dhcpv4 from VM to host
+			F(0, 28400, T("in_port={{.PortNo}},ip,udp,tp_src=68,tp_dst=67"), T("mod_tp_dst:{{.DHCPServerPort}},local")),
+			// dhcpv6 from VM to host
+			F(0, 28400, T("in_port={{.PortNo}},ipv6,udp6,tp_src=546,tp_dst=547"), T("mod_tp_dst:{{.DHCPServerPort6}},local")),
+		)
+	}
+	// When SrcMacCheck is disabled: no DHCP request rules added
+	// DHCP requests will pass through normal forwarding to physical network
 	if !g.SrcMacCheck() {
 		flows = append(flows, F(0, 24670, T("in_port={{.PortNo}}"), "normal"))
 		if nic.EnableIPv6() {
