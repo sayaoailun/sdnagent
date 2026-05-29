@@ -55,27 +55,32 @@ func (hcn *HostConfigNetwork) IPMAC() (net.IP, net.HardwareAddr, error) {
 	if hcn.mac == nil {
 		iface, err := net.InterfaceByName(hcn.Bridge)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("interface %s not found: %w", hcn.Bridge, err)
 		}
 		addrs, err := iface.Addrs()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("get addresses for %s failed: %w", hcn.Bridge, err)
 		}
+		hasIPv4 := false
 		for _, addr := range addrs {
 			if ipnet, ok := addr.(*net.IPNet); ok {
 				ip := ipnet.IP.To4()
 				if ip != nil {
 					hcn.IP = ip
+					hasIPv4 = true
 					break
 				}
 			}
 		}
 		hcn.mac = iface.HardwareAddr
+		if !hasIPv4 {
+			log.Warningf("bridge %s has no IPv4 address, available addresses: %v", hcn.Bridge, addrs)
+		}
 	}
 	if hcn.IP != nil && hcn.mac != nil {
 		return hcn.IP, hcn.mac, nil
 	}
-	return nil, nil, fmt.Errorf("cannot find proper ip/mac")
+	return nil, nil, fmt.Errorf("cannot find proper ip/mac for bridge %s (IP=%v, MAC=%v)", hcn.Bridge, hcn.IP, hcn.mac)
 }
 
 type HostConfig struct {
